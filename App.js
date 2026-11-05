@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { View, StyleSheet, ActivityIndicator, Text } from 'react-native';
+import { View, StyleSheet, ActivityIndicator, Text, TouchableOpacity } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
@@ -15,6 +15,8 @@ import CustomerSupportScreen from './src/screens/CustomerSupportScreen';
 import { supabase } from './src/lib/supabase';
 import ErrorBoundary from './src/components/ErrorBoundary';
 
+const FRESH_SIGNUP_KEY = 'intent_fresh_signup';
+
 const ROUTE_TO_PATH = {
   AuthPortal: '/auth',
   SignupOnboarding: '/onboarding',
@@ -29,7 +31,9 @@ const ROUTE_TO_PATH = {
 
 const PROTECTED_ROUTES = ['Discovery', 'ActiveChats', 'ChatDetail', 'Dates', 'Profile', 'SettingsPortal', 'CustomerSupport'];
 
-// FIX 1: Strip ?query and #hash — was keeping ?user=[object Object] in the URL
+// Production: /onboarding is also auth-required, but handled separately so we can show a different bounce
+const AUTH_REQUIRED_ROUTES = [...PROTECTED_ROUTES, 'SignupOnboarding'];
+
 const pathToRoute = (pathname) => {
   const raw = (pathname || '/').split('?')[0].split('#')[0];
   const p = raw.replace(/\/$/, '') || '/';
@@ -51,214 +55,182 @@ const routeToPath = (name, params = {}) => {
   return path;
 };
 
-// FIX 3 + OLD ACCOUNT FIX: Check profile, auto-create from metadata if old account
-const hasProfile = async (userId) => {
-  if (!userId) return false;
+// PRODUCTION: Pure read-only check. No upsert, no auto-create, no fake data.
+// Returns { exists: boolean, error: string | null }
+const checkProfileExists = async (userId) => {
+  if (!userId) return { exists: false, error: null };
   try {
     const { data, error } = await supabase.from('profiles').select('id').eq('id', userId).maybeSingle();
-    if (error) {
-      console.warn('[App] hasProfile check failed:', error.message);
-      return false;
-    }
-    return !!data;
+    if (error) return { exists: false, error: error.message };
+    return { exists: !!data, error: null };
   } catch (e) {
-    console.warn('[App] hasProfile threw:', e?.message);
-    return false;
+    return { exists: false, error: e?.message || 'Profile check failed' };
   }
 };
 
-// For old accounts: no profiles row, but auth.users exists.
-// Build a minimal profile from user_metadata (or email) so old users are NOT forced through full onboarding.
-const ensureProfileForOldAccount = async (user) => {
-  if (!user?.id) return false;
-  if (await hasProfile(user.id)) return true;
-
-  const meta = user.user_metadata || {};
-  const emailName = user.email?.split('@')[0] || 'Intent User';
-  const fullName = meta.full_name || meta.name || emailName;
-  const ageNum = parseInt(meta.age, 10);
-  const safeAge = !isNaN(ageNum) && ageNum >= 18 && ageNum <= 100 ? ageNum : 25;
-
-  const profile = {
-    id: user.id,
-    email: user.email || null,
-    full_name: fullName,
-    age: safeAge,
-    city: meta.city || 'Accra',
-    country: meta.country || 'Ghana',
-    bio: meta.bio || '',
-    intent: meta.intent || 'Long-term Relationship 💍',
-    avatar_url: meta.avatar_url || meta.photo || null,
-    gender: meta.gender || 'Woman',
-    seeking: meta.seeking || 'Men',
-    photos: meta.photo || meta.avatar_url ? [meta.photo || meta.avatar_url] : [],
-  };
-
-  const { error } = await supabase.from('profiles').upsert(profile, { onConflict: 'id' });
-  if (error) {
-    console.warn('[App] auto-create profile failed:', error.message);
-    return false;
-  }
-  console.log('[App] auto-created profile for old account:', user.email);
-  return true;
+const readFreshSignupFlag = () => {
+  try {
+    if (typeof window !== 'undefined') return window.sessionStorage?.getItem(FRESH_SIGNUP_KEY) === '1';
+  } catch {}
+  return false;
+};
+const consumeFreshSignupFlag = () => {
+  try { if (typeof window !== 'undefined') window.sessionStorage?.removeItem(FRESH_SIGNUP_KEY); } catch {}
+};
+const clearFreshSignupFlag = () => {
+  try { if (typeof window !== 'undefined') window.sessionStorage?.removeItem(FRESH_SIGNUP_KEY); } catch {}
 };
 
 export default function App() {
   const [isLoading, setIsLoading] = useState(true);
+  const [bootError, setBootError] = useState('');
   const [session, setSession] = useState(null);
   const [stack, setStack] = useState([{ name: 'AuthPortal', params: {} }]);
   const isPoppingRef = useRef(false);
   const sessionRef = useRef(null);
-  const profileCacheRef = useRef({}); // userId -> true/false, avoids re-query on every Back
-  const justSignedUpRef = useRef(false); // true only for the 30s after a fresh signUp from AuthPortal
+  const profileCacheRef = useRef({}); // userId -> true/false, cleared on sign-out / profile save
+  const bootAttemptRef = useRef(0);
 
   const current = stack[stack.length - 1];
   const currentRoute = current.name;
 
-  useEffect(() => {
-    sessionRef.current = session;
-  }, [session]);
+  useEffect(() => { sessionRef.current = session; }, [session]);
+
+  // Called by Onboarding after successful save — lets App.js know profile now exists without re-query
+  const markProfileComplete = useCallback((userId) => {
+    if (userId) profileCacheRef.current[userId] = true;
+    clearFreshSignupFlag();
+  }, []);
 
   const getProfileExists = useCallback(async (user) => {
     if (!user?.id) return false;
     if (profileCacheRef.current[user.id] !== undefined) return profileCacheRef.current[user.id];
-    const exists = await hasProfile(user.id);
+    const { exists, error } = await checkProfileExists(user.id);
+    if (error) throw new Error(error);
     profileCacheRef.current[user.id] = exists;
     return exists;
   }, []);
 
-  const clearProfileCache = useCallback((userId) => {
-    if (userId) delete profileCacheRef.current[userId];
-  }, []);
+  // --- Boot: session + profile + initial URL once ---
+  const boot = useCallback(async () => {
+    bootAttemptRef.current += 1;
+    setIsLoading(true);
+    setBootError('');
+    try {
+      const { data, error: sessionError } = await supabase.auth.getSession();
+      if (sessionError) throw sessionError;
+      const sess = data?.session || null;
+      setSession(sess);
+      sessionRef.current = sess;
 
-  // --- Boot: read session + profile + initial URL once ---
-  useEffect(() => {
-    let mounted = true;
-    (async () => {
+      let initial = null;
       try {
-        const { data } = await supabase.auth.getSession();
-        if (!mounted) return;
-        const sess = data?.session || null;
-        setSession(sess);
-        sessionRef.current = sess;
-
-        let initial = null;
-        try {
-          if (typeof window !== 'undefined' && window.location?.pathname) {
-            initial = pathToRoute(window.location.pathname);
-          }
-        } catch {}
-
-        if (!sess) {
-          if (initial && (PROTECTED_ROUTES.includes(initial.name) || initial.name === 'SignupOnboarding')) {
-            initial = { name: 'AuthPortal', params: {} };
-          }
-          if (!initial) initial = { name: 'AuthPortal', params: {} };
-        } else {
-          // Has session -> OLD ACCOUNT FIX: auto-create profile if missing, don't force onboarding on refresh
-          const profileExists = await ensureProfileForOldAccount(sess.user);
-          profileCacheRef.current[sess.user.id] = profileExists;
-          if (!mounted) return;
-
-          if (!profileExists) {
-            // Only if auto-create failed (e.g. RLS / table missing) -> onboarding
-            initial = { name: 'SignupOnboarding', params: {} };
-          } else {
-            if (!initial) initial = { name: 'Discovery', params: {} };
-            if (initial.name === 'AuthPortal') initial = { name: 'Discovery', params: {} };
-            if (initial.name === 'SignupOnboarding') {
-              // Returning user with profile who lands on /onboarding via URL -> Discovery
-              // UNLESS they just signed up seconds ago (handled by justSignedUpRef in listener)
-              initial = { name: 'Discovery', params: {} };
-            }
-          }
+        if (typeof window !== 'undefined' && window.location?.pathname) {
+          initial = pathToRoute(window.location.pathname);
         }
+      } catch {}
 
-        try {
-          if (typeof window !== 'undefined') {
-            window.history.replaceState(null, '', routeToPath(initial.name, initial.params));
-          }
-        } catch {}
-        setStack([initial]);
-        setIsLoading(false);
-      } catch {
-        if (mounted) setIsLoading(false);
+      if (!sess) {
+        if (initial && AUTH_REQUIRED_ROUTES.includes(initial.name)) {
+          initial = { name: 'AuthPortal', params: {} };
+        }
+        if (!initial) initial = { name: 'AuthPortal', params: {} };
+      } else {
+        // Logged in — must have a real profiles row to enter Discovery / protected routes
+        const { exists, error: profileError } = await checkProfileExists(sess.user.id);
+        if (profileError) throw new Error(`Could not load your profile: ${profileError}`);
+        profileCacheRef.current[sess.user.id] = exists;
+
+        if (!exists) {
+          // PRODUCTION: No fake profile. Real onboarding required.
+          initial = { name: 'SignupOnboarding', params: {} };
+        } else {
+          if (!initial) initial = { name: 'Discovery', params: {} };
+          if (initial.name === 'AuthPortal') initial = { name: 'Discovery', params: {} };
+          if (initial.name === 'SignupOnboarding') initial = { name: 'Discovery', params: {} };
+          // Otherwise keep deep link (e.g. /chats, /chat/xxx) — user has a profile, allowed
+        }
       }
-    })();
-    return () => { mounted = false; };
+
+      try {
+        if (typeof window !== 'undefined') {
+          window.history.replaceState(null, '', routeToPath(initial.name, initial.params));
+        }
+      } catch {}
+      setStack([initial]);
+      setIsLoading(false);
+    } catch (e) {
+      setBootError(e.message || 'Could not load Intent. Check your connection and try again.');
+      setIsLoading(false);
+    }
   }, []);
 
-  // --- FIX 2 + FIX 3: Single source of truth for auth ---
+  useEffect(() => { boot(); }, [boot]);
+
+  // --- Single source of truth for auth ---
   useEffect(() => {
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, sess) => {
+      if (event === 'SIGNED_UP') {
+        // Fresh signup marker — AuthPortal already sets it before signUp, this is a backup
+        try { if (typeof window !== 'undefined') window.sessionStorage?.setItem(FRESH_SIGNUP_KEY, '1'); } catch {}
+        return;
+      }
       if (event === 'SIGNED_IN' && sess) {
         setSession(sess);
         sessionRef.current = sess;
 
-        // Fresh signup from AuthPortal: AuthPortal sets justSignedUpRef via sessionStorage flag
-        // We check it so a brand-new user still goes to Onboarding, not auto-created Discovery
-        let isFreshSignup = false;
-        try {
-          if (typeof window !== 'undefined' && window.sessionStorage?.getItem('intent_fresh_signup') === '1') {
-            isFreshSignup = true;
-            window.sessionStorage.removeItem('intent_fresh_signup');
-          }
-        } catch {}
-        if (justSignedUpRef.current) {
-          isFreshSignup = true;
-          justSignedUpRef.current = false;
-        }
+        // If we are in Demo preview (no real session normally, but SIGNED_IN fired), don't yank Demo
+        const topNow = stack[stack.length - 1];
+        if (topNow?.params?.isDemo) return;
 
-        if (isFreshSignup) {
-          // Brand-new user -> MUST do onboarding, do NOT auto-create profile
+        const isFresh = readFreshSignupFlag();
+        if (isFresh) {
+          consumeFreshSignupFlag();
           profileCacheRef.current[sess.user.id] = false;
           setStack((prev) => {
             const topName = prev[prev.length - 1]?.name;
             if (topName === 'SignupOnboarding') return prev;
-            if (topName === 'AuthPortal' || topName === 'SignupOnboarding') {
-              return [{ name: 'SignupOnboarding', params: {} }];
-            }
-            return prev;
+            return [{ name: 'SignupOnboarding', params: {} }];
           });
           return;
         }
 
-        // Old / returning account -> ensure profile exists (auto-create if needed)
-        const profileExists = await ensureProfileForOldAccount(sess.user);
-        profileCacheRef.current[sess.user.id] = profileExists;
-
-        setStack((prev) => {
-          const top = prev[prev.length - 1];
-          const topName = top?.name;
-          if (top?.params?.isDemo) return prev;
-
-          if (!profileExists) {
-            if (topName === 'SignupOnboarding') return prev;
-            return [{ name: 'SignupOnboarding', params: {} }];
-          }
-          if (topName === 'AuthPortal' || topName === 'SignupOnboarding') {
-            return [{ name: 'Discovery', params: {} }];
-          }
-          return prev;
-        });
+        // Returning user — check real profile, no auto-create
+        try {
+          const exists = await getProfileExists(sess.user);
+          setStack((prev) => {
+            const top = prev[prev.length - 1];
+            const topName = top?.name;
+            if (top?.params?.isDemo) return prev;
+            if (!exists) {
+              if (topName === 'SignupOnboarding') return prev;
+              return [{ name: 'SignupOnboarding', params: {} }];
+            }
+            if (topName === 'AuthPortal' || topName === 'SignupOnboarding') {
+              return [{ name: 'Discovery', params: {} }];
+            }
+            return prev;
+          });
+        } catch (e) {
+          setBootError(`Could not load your profile: ${e.message}`);
+        }
+        return;
       }
       if (event === 'SIGNED_OUT') {
         setSession(null);
         sessionRef.current = null;
         profileCacheRef.current = {};
-        justSignedUpRef.current = false;
+        clearFreshSignupFlag();
         setStack([{ name: 'AuthPortal', params: {} }]);
       }
-      if (event === 'SIGNED_UP') {
-        // Supabase fires SIGNED_UP before SIGNED_IN for new accounts - mark it
-        justSignedUpRef.current = true;
-        try {
-          if (typeof window !== 'undefined') window.sessionStorage?.setItem('intent_fresh_signup', '1');
-        } catch {}
+      if (event === 'TOKEN_REFRESHED' && sess) {
+        setSession(sess);
+        sessionRef.current = sess;
       }
     });
     return () => subscription.unsubscribe();
-  }, []);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [getProfileExists]);
 
   // --- Browser Back / Forward ---
   useEffect(() => {
@@ -267,29 +239,35 @@ export default function App() {
       const parsed = pathToRoute(window.location.pathname);
       if (!parsed) return;
 
-      // Logged-out -> bounce to Auth
-      if (!sessionRef.current && (PROTECTED_ROUTES.includes(parsed.name) || parsed.name === 'SignupOnboarding')) {
+      // Logged out -> Auth, no protected / onboarding via Back
+      if (!sessionRef.current && AUTH_REQUIRED_ROUTES.includes(parsed.name)) {
         isPoppingRef.current = true;
         setStack([{ name: 'AuthPortal', params: {} }]);
         setTimeout(() => { isPoppingRef.current = false; }, 50);
         return;
       }
 
-      // Logged-in but no profile + trying to go to Discovery/etc via Back -> bounce to Onboarding
-      // (only for fresh signups - old accounts auto-create profile, so this rarely triggers)
-      if (sessionRef.current && parsed.name !== 'SignupOnboarding') {
-        const exists = profileCacheRef.current[sessionRef.current.user.id] ?? (await getProfileExists(sessionRef.current.user));
-        if (!exists) {
-          // Check if it's a fresh signup still in onboarding flow
-          const currentTop = stack[stack.length - 1]?.name;
-          if (currentTop === 'SignupOnboarding') {
+      // Logged in but no profile -> any Back to protected route bounces to Onboarding
+      if (sessionRef.current && PROTECTED_ROUTES.includes(parsed.name)) {
+        try {
+          const exists = await getProfileExists(sessionRef.current.user);
+          if (!exists) {
+            const currentTop = stack[stack.length - 1]?.name;
+            if (currentTop === 'SignupOnboarding') {
+              isPoppingRef.current = true;
+              setStack([{ name: 'SignupOnboarding', params: {} }]);
+              try { window.history.pushState(null, '', '/onboarding'); } catch {}
+              setTimeout(() => { isPoppingRef.current = false; }, 50);
+              return;
+            }
             isPoppingRef.current = true;
             setStack([{ name: 'SignupOnboarding', params: {} }]);
-            // Push onboarding URL back so Back doesn't loop
-            try { window.history.pushState(null, '', '/onboarding'); } catch {}
             setTimeout(() => { isPoppingRef.current = false; }, 50);
             return;
           }
+        } catch {
+          // If profile check fails on Back, stay — don't leak protected screen
+          return;
         }
       }
 
@@ -307,7 +285,7 @@ export default function App() {
     return () => window.removeEventListener('popstate', onPop);
   }, [stack, getProfileExists]);
 
-  // --- Keep URL in sync — skip push when change CAME from browser Back ---
+  // --- Keep URL in sync ---
   useEffect(() => {
     if (isLoading) return;
     try {
@@ -320,62 +298,63 @@ export default function App() {
     } catch {}
   }, [currentRoute, current.params, isLoading]);
 
+  const guardProtected = useCallback((name, params = {}) => {
+    if (!PROTECTED_ROUTES.includes(name)) return false;
+    if (params?.isDemo) return false; // Demo preview allowed
+    if (!sessionRef.current) return true; // no session -> block, go to Auth
+    const cached = profileCacheRef.current[sessionRef.current.user.id];
+    if (cached === false) return true; // no profile -> block, go to Onboarding
+    return false; // cached true or unknown -> allow, App will verify on next auth event if needed
+  }, []);
+
   const navigate = useCallback((name, params = {}) => {
-    // Guard: don't let any screen navigate to protected route if no profile and not Demo / not Onboarding
-    if (PROTECTED_ROUTES.includes(name) && !params?.isDemo && sessionRef.current) {
-      const cached = profileCacheRef.current[sessionRef.current.user.id];
-      if (cached === false) {
-        setStack([{ name: 'SignupOnboarding', params: {} }]);
-        return;
-      }
+    if (guardProtected(name, params)) {
+      if (!sessionRef.current) setStack([{ name: 'AuthPortal', params: {} }]);
+      else setStack([{ name: 'SignupOnboarding', params: {} }]);
+      return;
     }
     setStack((prev) => {
       const top = prev[prev.length - 1];
       if (top?.name === name && JSON.stringify(top?.params || {}) === JSON.stringify(params)) return prev;
       return [...prev, { name, params }];
     });
-  }, []);
+  }, [guardProtected]);
 
   const reset = useCallback((opts) => {
     if (typeof opts === 'string') {
-      // Guard reset('Discovery') when no profile
-      if (PROTECTED_ROUTES.includes(opts) && sessionRef.current) {
-        const cached = profileCacheRef.current[sessionRef.current.user.id];
-        if (cached === false) {
-          setStack([{ name: 'SignupOnboarding', params: {} }]);
-          return;
-        }
+      if (guardProtected(opts, {})) {
+        if (!sessionRef.current) setStack([{ name: 'AuthPortal', params: {} }]);
+        else setStack([{ name: 'SignupOnboarding', params: {} }]);
+        return;
       }
       setStack([{ name: opts, params: {} }]);
       return;
     }
     const routes = opts?.routes || opts;
     if (Array.isArray(routes) && routes.length) {
-      // If resetting to Discovery but no profile -> Onboarding
       const first = routes[0];
-      if (first && PROTECTED_ROUTES.includes(first.name) && !first.params?.isDemo && sessionRef.current) {
-        const cached = profileCacheRef.current[sessionRef.current.user.id];
-        if (cached === false) {
-          setStack([{ name: 'SignupOnboarding', params: {} }]);
-          return;
-        }
+      if (first && guardProtected(first.name, first.params || {})) {
+        if (!sessionRef.current) setStack([{ name: 'AuthPortal', params: {} }]);
+        else setStack([{ name: 'SignupOnboarding', params: {} }]);
+        return;
       }
       setStack(routes.map((r) => ({ name: r.name, params: r.params || {} })));
     } else if (opts?.name) {
+      if (guardProtected(opts.name, opts.params || {})) {
+        if (!sessionRef.current) setStack([{ name: 'AuthPortal', params: {} }]);
+        else setStack([{ name: 'SignupOnboarding', params: {} }]);
+        return;
+      }
       setStack([{ name: opts.name, params: opts.params || {} }]);
     }
-  }, []);
+  }, [guardProtected]);
 
   const goBack = useCallback(() => {
-    // FIX: Onboarding Back must NOT go to Discovery via history.back()
-    // If current is Onboarding and no profile, stay. Onboarding screen handles its own Back UI.
     const top = stack[stack.length - 1];
+    // Onboarding with no profile must NOT use history.back() to Discovery
     if (top?.name === 'SignupOnboarding') {
       const cached = sessionRef.current ? profileCacheRef.current[sessionRef.current.user.id] : undefined;
-      if (cached === false) {
-        return; // block - Onboarding's own handleBack will show "Leave setup?" dialog
-      }
-      // If profile exists (old account editing), allow normal back to Discovery
+      if (cached === false) return;
     }
     try {
       if (typeof window !== 'undefined' && window.history.length > 1) {
@@ -399,6 +378,8 @@ export default function App() {
       return copy;
     }),
     getState: () => ({ routes: stack, index: stack.length - 1 }),
+    // Exposed for Onboarding to mark profile complete without a re-query race
+    markProfileComplete,
   };
 
   if (isLoading) {
@@ -408,6 +389,24 @@ export default function App() {
         <Text style={styles.loadingText}>INTENT</Text>
         <ActivityIndicator color="#F97316" style={{ marginTop: 16 }} />
       </View>
+    );
+  }
+
+  if (bootError) {
+    return (
+      <SafeAreaProvider>
+        <View style={styles.errorWrap}>
+          <Text style={styles.loadingLogo}>I</Text>
+          <Text style={styles.errorTitle}>Couldn’t load Intent</Text>
+          <Text style={styles.errorText}>{bootError}</Text>
+          <TouchableOpacity style={styles.retryBtn} onPress={boot}>
+            <Text style={styles.retryText}>Try Again</Text>
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.secondaryBtn} onPress={() => { setBootError(''); setStack([{ name: 'AuthPortal', params: {} }]); }}>
+            <Text style={styles.secondaryText}>Go to Sign In</Text>
+          </TouchableOpacity>
+        </View>
+      </SafeAreaProvider>
     );
   }
 
@@ -422,13 +421,13 @@ export default function App() {
           <View key={`${currentRoute}-${JSON.stringify(current.params || {})}`} style={styles.inner}>
             {currentRoute === 'AuthPortal' && <AuthPortalScreen {...screenProps} session={session} />}
             {currentRoute === 'SignupOnboarding' && <SignupOnboardingScreen {...screenProps} session={session} />}
-            {currentRoute === 'Discovery' && <DiscoveryScreen {...screenProps} />}
-            {currentRoute === 'ActiveChats' && <ActiveChatsScreen {...screenProps} />}
-            {currentRoute === 'ChatDetail' && <ChatDetailScreen {...screenProps} />}
-            {currentRoute === 'Dates' && <DatesScreen {...screenProps} />}
-            {currentRoute === 'Profile' && <ProfileScreen {...screenProps} />}
-            {currentRoute === 'SettingsPortal' && <SettingsPortalScreen {...screenProps} />}
-            {currentRoute === 'CustomerSupport' && <CustomerSupportScreen {...screenProps} />}
+            {currentRoute === 'Discovery' && <DiscoveryScreen {...screenProps} session={session} />}
+            {currentRoute === 'ActiveChats' && <ActiveChatsScreen {...screenProps} session={session} />}
+            {currentRoute === 'ChatDetail' && <ChatDetailScreen {...screenProps} session={session} />}
+            {currentRoute === 'Dates' && <DatesScreen {...screenProps} session={session} />}
+            {currentRoute === 'Profile' && <ProfileScreen {...screenProps} session={session} />}
+            {currentRoute === 'SettingsPortal' && <SettingsPortalScreen {...screenProps} session={session} />}
+            {currentRoute === 'CustomerSupport' && <CustomerSupportScreen {...screenProps} session={session} />}
           </View>
         </View>
       </ErrorBoundary>
@@ -442,4 +441,11 @@ const styles = StyleSheet.create({
   loadingText: { color: '#F8FAFC', fontWeight: '900', letterSpacing: 4, marginTop: 8 },
   outer: { flex: 1, backgroundColor: '#020617' },
   inner: { flex: 1, width: '100%', maxWidth: 480, backgroundColor: '#0F172A', alignSelf: 'center', overflow: 'hidden' },
+  errorWrap: { flex: 1, backgroundColor: '#0F172A', justifyContent: 'center', alignItems: 'center', paddingHorizontal: 24 },
+  errorTitle: { color: '#F8FAFC', fontSize: 18, fontWeight: '800', marginTop: 12 },
+  errorText: { color: '#94A3B8', fontSize: 14, textAlign: 'center', marginTop: 8, lineHeight: 20 },
+  retryBtn: { backgroundColor: '#F97316', paddingHorizontal: 24, paddingVertical: 12, borderRadius: 12, marginTop: 20 },
+  retryText: { color: '#fff', fontWeight: '800' },
+  secondaryBtn: { paddingHorizontal: 24, paddingVertical: 12, marginTop: 8 },
+  secondaryText: { color: '#FBBF24', fontWeight: '700' },
 });
