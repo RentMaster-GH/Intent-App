@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { StyleSheet, Text, View, TextInput, TouchableOpacity, KeyboardAvoidingView, Platform, Modal, FlatList, SafeAreaView, ScrollView, ActivityIndicator } from 'react-native';
 import { COUNTRIES } from '../data/countries';
 import { supabase } from '../lib/supabase';
@@ -79,46 +79,6 @@ const getPasswordStrength = (pw) => {
   return { label: 'Strong', color: '#22C55E' };
 };
 
-// Production web: Chrome ignores RN autoComplete="off" on password fields.
-// This DOM-level killer runs on every render + via MutationObserver.
-const killChromeAutofill = () => {
-  if (typeof document === 'undefined') return;
-  try {
-    document.querySelectorAll('form').forEach((f) => f.setAttribute('autocomplete', 'off'));
-    // Decoy inputs to absorb Chrome's autofill — Chrome fills the first username/password it finds
-    if (!document.getElementById('intent-decoy')) {
-      const decoy = document.createElement('div');
-      decoy.id = 'intent-decoy';
-      decoy.setAttribute('aria-hidden', 'true');
-      decoy.style.cssText = 'position:absolute;opacity:0;height:0;width:0;overflow:hidden;pointer-events:none;';
-      decoy.innerHTML = '<input type="text" name="username" autocomplete="username" tabindex="-1" /><input type="password" name="password" autocomplete="current-password" tabindex="-1" />';
-      document.body.appendChild(decoy);
-    }
-    // Real password fields: random name + readonly-until-focus + new-password
-    document.querySelectorAll('input[type="password"]').forEach((el) => {
-      // Skip decoy
-      if (el.closest('#intent-decoy')) return;
-      el.setAttribute('autocomplete', 'new-password');
-      // Random name each time so Chrome can't match to saved login for this origin
-      if (!el.dataset.intentProtected) {
-        el.dataset.intentProtected = '1';
-        el.setAttribute('name', `intent-pw-${Math.random().toString(36).slice(2, 10)}`);
-        el.setAttribute('readonly', 'true');
-        el.addEventListener('focus', () => { try { el.removeAttribute('readonly'); } catch {} }, { once: false });
-        el.addEventListener('click', () => { try { el.removeAttribute('readonly'); } catch {} }, { once: false });
-      }
-      // If Chrome re-adds readonly or autocomplete, force again
-      el.setAttribute('data-lpignore', 'true');
-      el.setAttribute('data-1p-ignore', 'true');
-    });
-    // Email field: keep as username so Chrome doesn't treat it as login email + password pair
-    document.querySelectorAll('input[type="email"], input[inputmode="email"]').forEach((el) => {
-      if (el.closest('#intent-decoy')) return;
-      el.setAttribute('autocomplete', 'username');
-    });
-  } catch {}
-};
-
 export default function AuthPortalScreen({ navigation }) {
   const [authMode, setAuthMode] = useState('signin');
   const [inputIdentifier, setInputIdentifier] = useState('');
@@ -164,8 +124,6 @@ export default function AuthPortalScreen({ navigation }) {
   const [otpPhone, setOtpPhone] = useState('');
   const [otpVerifying, setOtpVerifying] = useState(false);
   const [resendCooldown, setResendCooldown] = useState(0);
-  const passwordRef = useRef(null);
-  const confirmRef = useRef(null);
 
   useEffect(() => {
     if (Platform.OS === 'web' && typeof document !== 'undefined') {
@@ -180,19 +138,6 @@ export default function AuthPortalScreen({ navigation }) {
     clearFreshSignupFlag();
   }, []);
 
-  // Chrome autofill killer — runs on mount + every state change + via observer
-  useEffect(() => {
-    if (Platform.OS !== 'web' || typeof document === 'undefined') return;
-    killChromeAutofill();
-    const interval = setInterval(killChromeAutofill, 500);
-    let observer = null;
-    try {
-      observer = new MutationObserver(() => killChromeAutofill());
-      observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['autocomplete', 'name'] });
-    } catch {}
-    return () => { clearInterval(interval); try { observer?.disconnect(); } catch {} };
-  }, [authMode, modalVisible, forgotModalVisible, otpModalVisible, showPassword, showConfirmPassword]);
-
   useEffect(() => {
     if (resendCooldown <= 0) return;
     const t = setTimeout(() => setResendCooldown((c) => c - 1), 1000);
@@ -206,8 +151,6 @@ export default function AuthPortalScreen({ navigation }) {
     setPassword('');
     setConfirmPassword('');
     if (mode === 'signin') clearFreshSignupFlag();
-    // Re-run killer after mode switch — new inputs mount
-    setTimeout(killChromeAutofill, 100);
   };
 
   const handleAuth = async () => {
@@ -383,22 +326,18 @@ export default function AuthPortalScreen({ navigation }) {
             <Text style={[styles.inputLabel, { marginTop: 14 }]}>Password</Text>
             <View style={styles.passwordInputWrapper}>
               <TextInput
-                ref={passwordRef}
                 style={styles.inputFlex}
                 placeholder="••••••••••••"
                 placeholderTextColor="#64748B"
                 secureTextEntry={!showPassword}
                 autoCapitalize="none"
                 autoCorrect={false}
-                autoComplete="off"
-                textContentType="none"
-                importantForAutofill="no"
-                name="intent-password"
+                autoComplete={authMode === 'signin' ? 'current-password' : 'new-password'}
+                textContentType={authMode === 'signin' ? 'password' : 'newPassword'}
                 returnKeyType="done"
                 blurOnSubmit={true}
                 value={password}
                 onChangeText={v => { setPassword(v); setErrorMessage(''); }}
-                onFocus={() => { if (Platform.OS === 'web' && typeof document !== 'undefined') { try { document.querySelectorAll('input[type="password"]').forEach((el) => el.removeAttribute('readonly')); } catch {} } }}
               />
               <TouchableOpacity style={styles.eyeButton} onPress={() => setShowPassword(!showPassword)}><Text style={{ fontSize: 18 }}>{showPassword ? '🙈' : '👁️'}</Text></TouchableOpacity>
             </View>
@@ -409,22 +348,18 @@ export default function AuthPortalScreen({ navigation }) {
                 <Text style={styles.inputLabel}>Confirm Password</Text>
                 <View style={styles.passwordInputWrapper}>
                   <TextInput
-                    ref={confirmRef}
                     style={styles.inputFlex}
                     placeholder="••••••••••••"
                     placeholderTextColor="#64748B"
                     secureTextEntry={!showConfirmPassword}
                     autoCapitalize="none"
                     autoCorrect={false}
-                    autoComplete="off"
-                    textContentType="none"
-                    importantForAutofill="no"
-                    name="intent-confirm-password"
+                    autoComplete="new-password"
+                    textContentType="newPassword"
                     returnKeyType="done"
                     blurOnSubmit={true}
                     value={confirmPassword}
                     onChangeText={v => { setConfirmPassword(v); setErrorMessage(''); }}
-                    onFocus={() => { if (Platform.OS === 'web' && typeof document !== 'undefined') { try { document.querySelectorAll('input[type="password"]').forEach((el) => el.removeAttribute('readonly')); } catch {} } }}
                   />
                   <TouchableOpacity style={styles.eyeButton} onPress={() => setShowConfirmPassword(!showConfirmPassword)}><Text style={{ fontSize: 18 }}>{showConfirmPassword ? '🙈' : '👁️'}</Text></TouchableOpacity>
                 </View>
