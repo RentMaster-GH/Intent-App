@@ -19,20 +19,26 @@ const clearFreshSignupFlag = () => {
   try { if (typeof window !== 'undefined') window.sessionStorage?.removeItem(FRESH_SIGNUP_KEY); } catch {}
 };
 
-// Extract email anywhere in string — fixes "+233 violetakaayye@gmail.com", pasted junk, spaces
+// Production: extract email anywhere in string — fixes "+233 violetakaayye@gmail.com", pasted junk, trailing spaces
 const extractEmail = (raw) => {
   if (!raw) return null;
   const m = String(raw).match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/);
   return m ? m[0].toLowerCase() : null;
 };
 
+const isValidEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email || '');
+
+// Production: never leak raw Supabase / DB errors to users
 const mapAuthError = (err) => {
   const msg = err?.message || 'Auth failed';
   const lower = msg.toLowerCase();
-  if (lower.includes('failed to fetch') || lower.includes('fetch') || lower.includes('network')) {
-    return 'Cannot reach Supabase. Check internet, or Supabase project is paused / keys missing. Try Demo Mode below.';
+  if (lower.includes('database error saving new user') || lower.includes('database error') || lower.includes('db error')) {
+    return 'We could not create your account — our database is temporarily unavailable. Please try again in a minute. If it persists, contact support.';
   }
-  if (lower.includes('user already registered') || lower.includes('already registered') || lower.includes('already exists')) {
+  if (lower.includes('failed to fetch') || lower.includes('fetch') || lower.includes('network')) {
+    return 'Cannot reach our servers. Check your internet and try again.';
+  }
+  if (lower.includes('user already registered') || lower.includes('already registered') || lower.includes('already exists') || lower.includes('user already exists')) {
     return 'That email already has an account. Tap Sign In above instead.';
   }
   if (lower.includes('invalid login credentials') || lower.includes('invalid email or password')) {
@@ -44,8 +50,11 @@ const mapAuthError = (err) => {
   if (lower.includes('invalid otp') || lower.includes('invalid code') || lower.includes('token')) {
     return 'Wrong code. Check the SMS / email and try again.';
   }
-  if (lower.includes('password') && lower.includes('6')) {
-    return 'Password must be at least 6 characters.';
+  if (lower.includes('password')) {
+    if (lower.includes('8') || lower.includes('6') || lower.includes('short') || lower.includes('weak')) {
+      return 'Password must be at least 8 characters.';
+    }
+    return 'Password is not valid. Use at least 8 characters.';
   }
   if (lower.includes('email') && lower.includes('invalid')) {
     return 'Please enter a valid email address.';
@@ -53,7 +62,23 @@ const mapAuthError = (err) => {
   if (lower.includes('phone')) {
     return 'Phone sign-in needs a valid number with country code. Try email instead.';
   }
-  return msg;
+  if (lower.includes('too many') || lower.includes('rate limit') || lower.includes('429')) {
+    return 'Too many attempts. Wait a minute and try again.';
+  }
+  return 'Something went wrong. Please try again.';
+};
+
+const getPasswordStrength = (pw) => {
+  if (!pw) return { label: '', color: '#64748B' };
+  if (pw.length < 8) return { label: 'Too short — use 8+ characters', color: '#EF4444' };
+  let score = 0;
+  if (/[a-z]/.test(pw)) score += 1;
+  if (/[A-Z]/.test(pw)) score += 1;
+  if (/[0-9]/.test(pw)) score += 1;
+  if (/[^A-Za-z0-9]/.test(pw)) score += 1;
+  if (score <= 2) return { label: 'Weak — add uppercase, number or symbol', color: '#F59E0B' };
+  if (score === 3) return { label: 'Good', color: '#22C55E' };
+  return { label: 'Strong', color: '#22C55E' };
 };
 
 export default function AuthPortalScreen({ navigation }) {
@@ -96,11 +121,11 @@ export default function AuthPortalScreen({ navigation }) {
   const [forgotModalVisible, setForgotModalVisible] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [forgotIdentifier, setForgotIdentifier] = useState('');
-  // OTP verify modal
   const [otpModalVisible, setOtpModalVisible] = useState(false);
   const [otpCode, setOtpCode] = useState('');
   const [otpPhone, setOtpPhone] = useState('');
   const [otpVerifying, setOtpVerifying] = useState(false);
+  const [resendCooldown, setResendCooldown] = useState(0);
 
   useEffect(() => {
     if (Platform.OS === 'web' && typeof document !== 'undefined') {
@@ -115,10 +140,18 @@ export default function AuthPortalScreen({ navigation }) {
     clearFreshSignupFlag();
   }, []);
 
+  useEffect(() => {
+    if (resendCooldown <= 0) return;
+    const t = setTimeout(() => setResendCooldown((c) => c - 1), 1000);
+    return () => clearTimeout(t);
+  }, [resendCooldown]);
+
   const switchMode = (mode) => {
     setAuthMode(mode);
     setErrorMessage('');
     setSuccessMessage('');
+    setPassword('');
+    setConfirmPassword('');
     if (mode === 'signin') clearFreshSignupFlag();
   };
 
@@ -134,16 +167,24 @@ export default function AuthPortalScreen({ navigation }) {
 
     try {
       if (isEmail) {
+        if (!isValidEmail(inputVal)) { setErrorMessage('Please enter a valid email address.'); setLoading(false); return; }
         if (!password) { setErrorMessage('Enter password.'); setLoading(false); return; }
-        if (password.length < 6) { setErrorMessage('Password must be at least 6 characters.'); setLoading(false); return; }
+        if (password.length < 8) { setErrorMessage('Password must be at least 8 characters.'); setLoading(false); return; }
         if (authMode === 'signup' && password !== confirmPassword) { setErrorMessage('Passwords do not match.'); setLoading(false); return; }
 
         if (authMode === 'signup') {
+          // Set flag BEFORE signUp — Supabase can fire SIGNED_IN synchronously inside signUp
           setFreshSignupFlag();
           const { data, error } = await supabase.auth.signUp({ email: inputVal, password });
-          if (error) { clearFreshSignupFlag(); throw error; }
+          if (error) {
+            clearFreshSignupFlag();
+            // Production: don't leave failed password in field for Chrome to save
+            setPassword(''); setConfirmPassword('');
+            throw error;
+          }
           if (!data?.session) {
             setSuccessMessage('Account created! Check your email to confirm, then Sign In.');
+            setPassword(''); setConfirmPassword('');
             setAuthMode('signin');
             setLoading(false);
             return;
@@ -155,20 +196,24 @@ export default function AuthPortalScreen({ navigation }) {
           const { error } = await supabase.auth.signInWithPassword({ email: inputVal, password });
           if (error) throw error;
           setSuccessMessage('Signed in! Loading...');
+          // App.js onAuthStateChange moves to Discovery / Onboarding — do NOT navigate here
         }
       } else {
-        // Phone OTP — send code, then show verify modal (do NOT navigate yet, no session)
+        // Phone OTP — send code, then show verify modal. Do NOT navigate yet, no session.
         const safeCountry = selectedCountry || FALLBACK_COUNTRY;
         const digits = inputVal.replace(/\D/g, '');
-        const formattedPhone = inputVal.startsWith('+') ? `+${digits}` : `${safeCountry.code}${digits}`;
-        if (digits.length < 9) { setErrorMessage('Enter a valid phone number (e.g. 55 000 0000).'); setLoading(false); return; }
+        // Strip leading 0 for local numbers: 055 -> 55, then prepend +233
+        const localDigits = digits.startsWith('0') ? digits.slice(1) : digits;
+        const formattedPhone = inputVal.startsWith('+') ? `+${digits}` : `${safeCountry.code}${localDigits}`;
+        if (localDigits.length < 9) { setErrorMessage('Enter a valid phone number (e.g. 55 000 0000).'); setLoading(false); return; }
         if (authMode === 'signup') setFreshSignupFlag(); else clearFreshSignupFlag();
         const { error } = await supabase.auth.signInWithOtp({ phone: formattedPhone });
         if (error) { if (authMode === 'signup') clearFreshSignupFlag(); throw error; }
         setOtpPhone(formattedPhone);
         setOtpCode('');
+        setResendCooldown(30);
         setOtpModalVisible(true);
-        setSuccessMessage(`OTP Sent to ${formattedPhone} — enter the 6-digit code below.`);
+        setSuccessMessage(`OTP sent to ${formattedPhone} — enter the 6-digit code below.`);
       }
     } catch (err) {
       setErrorMessage(mapAuthError(err));
@@ -177,7 +222,7 @@ export default function AuthPortalScreen({ navigation }) {
 
   const handleVerifyOtp = async () => {
     const code = otpCode.trim();
-    if (code.length < 4) { setErrorMessage('Enter the code sent to your phone.'); return; }
+    if (code.length < 6) { setErrorMessage('Enter the 6-digit code sent to your phone.'); return; }
     setOtpVerifying(true);
     setErrorMessage('');
     try {
@@ -186,21 +231,22 @@ export default function AuthPortalScreen({ navigation }) {
       if (!data?.session) throw new Error('No session after OTP. Try again.');
       setOtpModalVisible(false);
       setSuccessMessage('Verified! Launching...');
-      // Fresh phone signup -> Onboarding, returning -> let App.js move to Discovery
       if (authMode === 'signup') {
         navigation.navigate('SignupOnboarding', { fullPhone: otpPhone, isDemo: false });
       }
+      // Returning user: App.js moves to Discovery / Onboarding
     } catch (e) {
       setErrorMessage(mapAuthError(e));
     } finally { setOtpVerifying(false); }
   };
 
   const handleResendOtp = async () => {
-    if (!otpPhone) return;
+    if (!otpPhone || resendCooldown > 0) return;
     setOtpVerifying(true);
     try {
       const { error } = await supabase.auth.signInWithOtp({ phone: otpPhone });
       if (error) throw error;
+      setResendCooldown(30);
       setSuccessMessage(`New code sent to ${otpPhone}`);
     } catch (e) { setErrorMessage(mapAuthError(e)); } finally { setOtpVerifying(false); }
   };
@@ -209,20 +255,22 @@ export default function AuthPortalScreen({ navigation }) {
     const val = forgotIdentifier.trim();
     if (!val) { setErrorMessage('Enter email to reset.'); return; }
     const cleanEmail = extractEmail(val);
-    if (!cleanEmail) { setErrorMessage('Enter your email to receive a reset link.'); return; }
+    if (!cleanEmail || !isValidEmail(cleanEmail)) { setErrorMessage('Enter your email to receive a reset link.'); return; }
     setLoading(true);
     try {
       const { error } = await supabase.auth.resetPasswordForEmail(cleanEmail, {
         redirectTo: typeof window !== 'undefined' ? `${window.location.origin}/auth` : undefined,
       });
       if (error) throw error;
-      setSuccessMessage('Reset instructions sent. Check your email.');
+      setSuccessMessage('If an account exists for that email, reset instructions were sent. Check your inbox.');
       setForgotModalVisible(false);
+      setForgotIdentifier('');
     } catch (e) {
       setErrorMessage(mapAuthError(e));
     } finally { setLoading(false); }
   };
 
+  // Production: Demo is read-only preview. No Supabase writes, no fake session.
   const handleDemoMode = () => {
     clearFreshSignupFlag();
     navigation.reset({ index: 0, routes: [{ name: 'Discovery', params: { isDemo: true } }] });
@@ -234,6 +282,7 @@ export default function AuthPortalScreen({ navigation }) {
   const displayCountry = selectedCountry || FALLBACK_COUNTRY;
   const displayFlag = getDisplayFlag(displayCountry);
   const donorEmail = extractEmail(inputIdentifier);
+  const pwStrength = authMode === 'signup' ? getPasswordStrength(password) : { label: '', color: '#64748B' };
 
   return (
     <SafeAreaView style={styles.outerContainer}>
@@ -292,8 +341,11 @@ export default function AuthPortalScreen({ navigation }) {
                 secureTextEntry={!showPassword}
                 autoCapitalize="none"
                 autoCorrect={false}
-                autoComplete="current-password"
-                textContentType="password"
+                // PRODUCTION FIX: Never use current-password / new-password here — Chrome shows Saved Passwords popup (video 9-11s)
+                autoComplete="off"
+                textContentType="none"
+                importantForAutofill="no"
+                name="intent-password"
                 returnKeyType="done"
                 blurOnSubmit={true}
                 value={password}
@@ -301,6 +353,7 @@ export default function AuthPortalScreen({ navigation }) {
               />
               <TouchableOpacity style={styles.eyeButton} onPress={() => setShowPassword(!showPassword)}><Text style={{ fontSize: 18 }}>{showPassword ? '🙈' : '👁️'}</Text></TouchableOpacity>
             </View>
+            {authMode === 'signup' && pwStrength.label ? <Text style={[styles.strengthText, { color: pwStrength.color }]}>{pwStrength.label}</Text> : null}
 
             {authMode === 'signup' && (
               <View style={{ marginTop: 14 }}>
@@ -313,8 +366,11 @@ export default function AuthPortalScreen({ navigation }) {
                     secureTextEntry={!showConfirmPassword}
                     autoCapitalize="none"
                     autoCorrect={false}
-                    autoComplete="new-password"
-                    textContentType="newPassword"
+                    // PRODUCTION FIX: Same — blocks Chrome autofilling old saved password into Confirm
+                    autoComplete="off"
+                    textContentType="none"
+                    importantForAutofill="no"
+                    name="intent-confirm-password"
                     returnKeyType="done"
                     blurOnSubmit={true}
                     value={confirmPassword}
@@ -322,13 +378,14 @@ export default function AuthPortalScreen({ navigation }) {
                   />
                   <TouchableOpacity style={styles.eyeButton} onPress={() => setShowConfirmPassword(!showConfirmPassword)}><Text style={{ fontSize: 18 }}>{showConfirmPassword ? '🙈' : '👁️'}</Text></TouchableOpacity>
                 </View>
+                {confirmPassword && password !== confirmPassword ? <Text style={styles.mismatchText}>Passwords do not match</Text> : null}
               </View>
             )}
 
             {authMode === 'signin' && <TouchableOpacity style={{ alignSelf: 'flex-end', marginTop: 8 }} onPress={() => setForgotModalVisible(true)}><Text style={styles.forgotText}>Forgot password?</Text></TouchableOpacity>}
 
             <TouchableOpacity style={styles.button} onPress={handleAuth} disabled={loading}>{loading ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>{authMode === 'signin' ? 'Sign In to Intent' : 'Continue to Profile'}</Text>}</TouchableOpacity>
-            <TouchableOpacity style={styles.demoButton} onPress={handleDemoMode}><Text style={styles.demoButtonText}>⚡ Try Instant Demo Mode — No signup needed</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.demoButton} onPress={handleDemoMode}><Text style={styles.demoButtonText}>👀 Preview Demo — No account, no chats saved</Text></TouchableOpacity>
 
             <TouchableOpacity style={styles.donateBanner} onPress={() => setShowDonateModal(true)} activeOpacity={0.85}>
               <Text style={styles.donateBannerHeart}>💛</Text>
@@ -348,11 +405,11 @@ export default function AuthPortalScreen({ navigation }) {
           <TextInput style={styles.singleInput} placeholder="alex@example.com" placeholderTextColor="#64748B" value={forgotIdentifier} onChangeText={setForgotIdentifier} keyboardType="email-address" autoCapitalize="none" autoCorrect={false} autoComplete="username" textContentType="username" returnKeyType="done" blurOnSubmit={true} />
           <TouchableOpacity style={[styles.button, { marginTop: 16 }]} onPress={handleForgotPassword} disabled={loading}>{loading ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Send Reset Link</Text>}</TouchableOpacity><TouchableOpacity style={styles.cancelModalBtn} onPress={() => setForgotModalVisible(false)}><Text style={styles.cancelModalText}>Cancel & Return</Text></TouchableOpacity></View></View></Modal>
 
-        <Modal visible={otpModalVisible} animationType="fade" transparent><View style={styles.modalOverlay}><View style={[styles.modalContent, { maxHeight: 380 }]}><View style={styles.modalHeader}><Text style={styles.modalTitle}>Enter OTP Code</Text><TouchableOpacity onPress={() => setOtpModalVisible(false)}><Text style={{ fontSize: 20, color: '#94A3B8' }}>✕</Text></TouchableOpacity></View>
+        <Modal visible={otpModalVisible} animationType="fade" transparent><View style={styles.modalOverlay}><View style={[styles.modalContent, { maxHeight: 400 }]}><View style={styles.modalHeader}><Text style={styles.modalTitle}>Enter OTP Code</Text><TouchableOpacity onPress={() => setOtpModalVisible(false)}><Text style={{ fontSize: 20, color: '#94A3B8' }}>✕</Text></TouchableOpacity></View>
           <Text style={{ color: '#94A3B8', fontSize: 13, marginBottom: 16 }}>We sent a 6-digit code to {otpPhone}. Enter it below.</Text>
           <TextInput style={[styles.singleInput, { textAlign: 'center', fontSize: 22, letterSpacing: 6, fontWeight: '800' }]} placeholder="123456" placeholderTextColor="#64748B" value={otpCode} onChangeText={(v) => setOtpCode(v.replace(/[^0-9]/g, '').slice(0, 6))} keyboardType="number-pad" autoCapitalize="none" autoCorrect={false} autoComplete="one-time-code" textContentType="oneTimeCode" returnKeyType="done" maxLength={6} />
           <TouchableOpacity style={[styles.button, { marginTop: 16 }]} onPress={handleVerifyOtp} disabled={otpVerifying}>{otpVerifying ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Verify & Continue</Text>}</TouchableOpacity>
-          <TouchableOpacity style={styles.cancelModalBtn} onPress={handleResendOtp} disabled={otpVerifying}><Text style={styles.cancelModalText}>Resend Code</Text></TouchableOpacity>
+          <TouchableOpacity style={styles.cancelModalBtn} onPress={handleResendOtp} disabled={otpVerifying || resendCooldown > 0}><Text style={styles.cancelModalText}>{resendCooldown > 0 ? `Resend Code in ${resendCooldown}s` : 'Resend Code'}</Text></TouchableOpacity>
         </View></View></Modal>
 
         <EmpathDonateModal visible={showDonateModal} onClose={() => setShowDonateModal(false)} donorEmail={donorEmail} />
@@ -380,6 +437,8 @@ const styles = StyleSheet.create({
   inputFlex: { flex: 1, minWidth: 0, color: '#F8FAFC', fontSize: 15, paddingHorizontal: 10 },
   eyeButton: { padding: 6, marginLeft: 8 }, forgotText: { color: '#FBBF24', fontSize: 12, fontWeight: '600' },
   helperText: { color: '#475569', fontSize: 10, marginTop: 6, marginLeft: 4 },
+  strengthText: { fontSize: 11, marginTop: 6, fontWeight: '600' },
+  mismatchText: { color: '#FCA5A5', fontSize: 11, marginTop: 6, fontWeight: '600' },
   button: { backgroundColor: '#F97316', height: 54, borderRadius: 14, justifyContent: 'center', alignItems: 'center', marginTop: 20 }, buttonText: { color: '#FFF', fontSize: 16, fontWeight: '700' },
   demoButton: { backgroundColor: 'rgba(30,41,59,0.8)', height: 48, borderRadius: 14, justifyContent: 'center', alignItems: 'center', marginTop: 10, borderWidth: 1, borderColor: '#334155' }, demoButtonText: { color: '#FBBF24', fontSize: 13, fontWeight: '700', textAlign: 'center', paddingHorizontal: 8 },
   donateBanner: { flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(251,191,36,0.12)', padding: 12, borderRadius: 14, borderWidth: 1, borderColor: '#F59E0B', marginTop: 16, gap: 10 }, donateBannerHeart: { fontSize: 20 }, donateBannerTitle: { color: '#FBBF24', fontSize: 13, fontWeight: '800' }, donateBannerSub: { color: '#CBD5E1', fontSize: 11, marginTop: 1 },
