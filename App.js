@@ -51,6 +51,27 @@ const routeToPath = (name, params = {}) => {
   return path;
 };
 
+// FIX 3: Helper — does this user have a profiles row?
+const hasProfile = async (userId) => {
+  if (!userId) return false;
+  try {
+    const { data, error } = await supabase
+      .from('profiles')
+      .select('id')
+      .eq('id', userId)
+      .maybeSingle();
+    if (error) {
+      // Table missing / RLS error -> treat as no profile, but don't crash boot
+      console.warn('[App] hasProfile check failed:', error.message);
+      return false;
+    }
+    return !!data;
+  } catch (e) {
+    console.warn('[App] hasProfile threw:', e?.message);
+    return false;
+  }
+};
+
 export default function App() {
   const [isLoading, setIsLoading] = useState(true);
   const [session, setSession] = useState(null);
@@ -61,65 +82,95 @@ export default function App() {
   const current = stack[stack.length - 1];
   const currentRoute = current.name;
 
-  // Keep session in a ref so popstate / auth callbacks always see the latest value
-  // without re-subscribing and creating duplicate listeners.
   useEffect(() => {
     sessionRef.current = session;
   }, [session]);
 
-  // --- Boot: read session + initial URL once ---
+  // --- Boot: read session + profile + initial URL once ---
   useEffect(() => {
     let mounted = true;
-    supabase.auth.getSession().then(({ data }) => {
-      if (!mounted) return;
-      const sess = data?.session || null;
-      setSession(sess);
-      sessionRef.current = sess;
-
-      let initial = null;
+    (async () => {
       try {
-        if (typeof window !== 'undefined' && window.location?.pathname) {
-          initial = pathToRoute(window.location.pathname);
-        }
-      } catch {}
+        const { data } = await supabase.auth.getSession();
+        if (!mounted) return;
+        const sess = data?.session || null;
+        setSession(sess);
+        sessionRef.current = sess;
 
-      // FIX: Protected route without session -> Auth. Auth with session -> Discovery (unless already on /auth)
-      if (!sess && initial && PROTECTED_ROUTES.includes(initial.name)) {
-        initial = { name: 'AuthPortal', params: {} };
-      }
-      if (sess && initial?.name === 'AuthPortal' && window.location.pathname !== '/auth') {
-        initial = { name: 'Discovery', params: {} };
-      }
-      if (sess && !initial) initial = { name: 'Discovery', params: {} };
-      if (!sess && !initial) initial = { name: 'AuthPortal', params: {} };
+        let initial = null;
+        try {
+          if (typeof window !== 'undefined' && window.location?.pathname) {
+            initial = pathToRoute(window.location.pathname);
+          }
+        } catch {}
 
-      try {
-        if (typeof window !== 'undefined') {
-          window.history.replaceState(null, '', routeToPath(initial.name, initial.params));
+        // No session -> protected routes bounce to Auth. Onboarding without session also bounces to Auth
+        // (except Demo Mode which is handled via in-app navigation, not URL reload)
+        if (!sess) {
+          if (initial && (PROTECTED_ROUTES.includes(initial.name) || initial.name === 'SignupOnboarding')) {
+            initial = { name: 'AuthPortal', params: {} };
+          }
+          if (!initial) initial = { name: 'AuthPortal', params: {} };
+        } else {
+          // Has session -> check profile
+          const profileExists = await hasProfile(sess.user.id);
+          if (!mounted) return;
+
+          if (!profileExists) {
+            // FIX 3: New user, no profile yet -> force Onboarding, even if URL says /discovery
+            // Exception: if user is on /auth and just signed up, still go to Onboarding
+            initial = { name: 'SignupOnboarding', params: {} };
+          } else {
+            // Returning user with profile
+            if (!initial) initial = { name: 'Discovery', params: {} };
+            if (initial.name === 'AuthPortal') initial = { name: 'Discovery', params: {} };
+            if (initial.name === 'SignupOnboarding') initial = { name: 'Discovery', params: {} };
+            // If initial is a protected route, keep it (e.g. deep link to /chats)
+          }
         }
-      } catch {}
-      setStack([initial]);
-      setIsLoading(false);
-    }).catch(() => {
-      if (mounted) setIsLoading(false);
-    });
+
+        try {
+          if (typeof window !== 'undefined') {
+            window.history.replaceState(null, '', routeToPath(initial.name, initial.params));
+          }
+        } catch {}
+        setStack([initial]);
+        setIsLoading(false);
+      } catch {
+        if (mounted) setIsLoading(false);
+      }
+    })();
     return () => { mounted = false; };
   }, []);
 
-  // --- FIX 2: Single source of truth for auth ---
+  // --- FIX 2 + FIX 3: Single source of truth for auth ---
   // AuthPortal must NOT call navigation.reset() on sign-in.
   // It should just call supabase.auth.signInWithPassword() and let this listener move us.
-  // If both reset, you get 2 resets in 1 tick = Auth + Profile mounted together (ghost at 18s).
   useEffect(() => {
-    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, sess) => {
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, sess) => {
       if (event === 'SIGNED_IN' && sess) {
         setSession(sess);
         sessionRef.current = sess;
+
+        // FIX 3: Don't yank to Discovery if profile doesn't exist yet
+        const profileExists = await hasProfile(sess.user.id);
+
         setStack((prev) => {
-          const top = prev[prev.length - 1]?.name;
-          // Only auto-move if we are still on Auth / Onboarding.
-          // If user is already on Discovery/Profile/Chats, don't yank them.
-          if (top === 'AuthPortal' || top === 'SignupOnboarding') {
+          const top = prev[prev.length - 1];
+          const topName = top?.name;
+
+          // Demo mode: no session normally, but if SIGNED_IN fires while in Demo, don't yank
+          if (top?.params?.isDemo) return prev;
+
+          if (!profileExists) {
+            // New signup -> must complete onboarding
+            if (topName === 'SignupOnboarding') return prev; // already there, stay
+            return [{ name: 'SignupOnboarding', params: {} }];
+          }
+
+          // Profile exists -> only auto-move if still on Auth / Onboarding
+          // If user is already on Discovery/Profile/Chats, don't yank them
+          if (topName === 'AuthPortal' || topName === 'SignupOnboarding') {
             return [{ name: 'Discovery', params: {} }];
           }
           return prev;
@@ -141,8 +192,15 @@ export default function App() {
       const parsed = pathToRoute(window.location.pathname);
       if (!parsed) return;
 
-      // FIX: Logged-out user pressing Back to /profile or /discovery -> bounce to /auth, don't show Profile ghost
+      // FIX: Logged-out user pressing Back to /profile or /discovery -> bounce to /auth
       if (!sessionRef.current && PROTECTED_ROUTES.includes(parsed.name)) {
+        isPoppingRef.current = true;
+        setStack([{ name: 'AuthPortal', params: {} }]);
+        setTimeout(() => { isPoppingRef.current = false; }, 50);
+        return;
+      }
+      // Logged-out user pressing Back to /onboarding -> bounce to /auth
+      if (!sessionRef.current && parsed.name === 'SignupOnboarding') {
         isPoppingRef.current = true;
         setStack([{ name: 'AuthPortal', params: {} }]);
         setTimeout(() => { isPoppingRef.current = false; }, 50);
@@ -151,12 +209,10 @@ export default function App() {
 
       isPoppingRef.current = true;
       setStack((prev) => {
-        // If Back URL matches the previous entry, pop to it (normal Back behaviour)
         if (prev.length > 1) {
           const prevEntry = prev[prev.length - 2];
           if (prevEntry.name === parsed.name) return prev.slice(0, -1);
         }
-        // Otherwise treat the URL as a single-entry stack — kills ghost
         return [parsed];
       });
       setTimeout(() => { isPoppingRef.current = false; }, 50);
@@ -197,7 +253,6 @@ export default function App() {
   }, []);
 
   const goBack = useCallback(() => {
-    // In-app Back == browser Back, so history and stack stay in sync
     try {
       if (typeof window !== 'undefined' && window.history.length > 1) {
         window.history.back();
@@ -240,8 +295,6 @@ export default function App() {
       <ErrorBoundary>
         <View style={styles.outer}>
           <StatusBar style="light" />
-          {/* FIX 3: key={currentRoute} forces React to UNMOUNT the old screen.
-              Without this, React reuses the same View and the old screen can linger for 1 frame = ghost. */}
           <View key={`${currentRoute}-${JSON.stringify(current.params || {})}`} style={styles.inner}>
             {currentRoute === 'AuthPortal' && <AuthPortalScreen {...screenProps} session={session} />}
             {currentRoute === 'SignupOnboarding' && <SignupOnboardingScreen {...screenProps} session={session} />}
@@ -264,6 +317,5 @@ const styles = StyleSheet.create({
   loadingLogo: { fontSize: 32, fontWeight: '900', color: '#F97316' },
   loadingText: { color: '#F8FAFC', fontWeight: '900', letterSpacing: 4, marginTop: 8 },
   outer: { flex: 1, backgroundColor: '#020617' },
-  // FIX: 480px for ALL screens. Profile is now single-column, so it fits. No 860px widen hack.
   inner: { flex: 1, width: '100%', maxWidth: 480, backgroundColor: '#0F172A', alignSelf: 'center', overflow: 'hidden' },
 });
