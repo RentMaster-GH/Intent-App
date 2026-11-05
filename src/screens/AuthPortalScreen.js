@@ -7,7 +7,6 @@ import EmpathDonateModal from '../components/EmpathDonateModal';
 const FALLBACK_COUNTRY = { code: '+233', flag: '🇬🇭', name: 'Ghana' };
 const FRESH_SIGNUP_KEY = 'intent_fresh_signup';
 
-// FIX: Windows Chrome renders flag emojis as "GH" / "US" letters — use globe on web
 const getDisplayFlag = (country) => {
   if (Platform.OS === 'web') return '🌍';
   return country?.flag || '🌍';
@@ -20,7 +19,13 @@ const clearFreshSignupFlag = () => {
   try { if (typeof window !== 'undefined') window.sessionStorage?.removeItem(FRESH_SIGNUP_KEY); } catch {}
 };
 
-// FIX: Map "Failed to fetch" to an actionable message instead of a cryptic error
+// Extract email anywhere in string — fixes "+233 violetakaayye@gmail.com", pasted junk, spaces
+const extractEmail = (raw) => {
+  if (!raw) return null;
+  const m = String(raw).match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/);
+  return m ? m[0].toLowerCase() : null;
+};
+
 const mapAuthError = (err) => {
   const msg = err?.message || 'Auth failed';
   const lower = msg.toLowerCase();
@@ -33,14 +38,20 @@ const mapAuthError = (err) => {
   if (lower.includes('invalid login credentials') || lower.includes('invalid email or password')) {
     return 'Wrong email or password. Try again, or tap Forgot password?';
   }
-  if (lower.includes('email link is invalid') || lower.includes('expired')) {
-    return 'That link expired. Sign in again to get a new one.';
+  if (lower.includes('email link is invalid') || lower.includes('expired') || lower.includes('otp expired')) {
+    return 'That code/link expired. Request a new one.';
+  }
+  if (lower.includes('invalid otp') || lower.includes('invalid code') || lower.includes('token')) {
+    return 'Wrong code. Check the SMS / email and try again.';
   }
   if (lower.includes('password') && lower.includes('6')) {
     return 'Password must be at least 6 characters.';
   }
   if (lower.includes('email') && lower.includes('invalid')) {
     return 'Please enter a valid email address.';
+  }
+  if (lower.includes('phone')) {
+    return 'Phone sign-in needs a valid number with country code. Try email instead.';
   }
   return msg;
 };
@@ -85,6 +96,11 @@ export default function AuthPortalScreen({ navigation }) {
   const [forgotModalVisible, setForgotModalVisible] = useState(false);
   const [searchQuery, setSearchQuery] = useState('');
   const [forgotIdentifier, setForgotIdentifier] = useState('');
+  // OTP verify modal
+  const [otpModalVisible, setOtpModalVisible] = useState(false);
+  const [otpCode, setOtpCode] = useState('');
+  const [otpPhone, setOtpPhone] = useState('');
+  const [otpVerifying, setOtpVerifying] = useState(false);
 
   useEffect(() => {
     if (Platform.OS === 'web' && typeof document !== 'undefined') {
@@ -96,7 +112,6 @@ export default function AuthPortalScreen({ navigation }) {
         document.head.appendChild(style);
       }
     }
-    // If user lands back on Auth (e.g. signed out from Onboarding), clear stale fresh-signup flag
     clearFreshSignupFlag();
   }, []);
 
@@ -113,11 +128,9 @@ export default function AuthPortalScreen({ navigation }) {
     const rawInput = inputIdentifier.trim();
     if (!rawInput) { setErrorMessage('Please enter email or phone.'); setLoading(false); return; }
 
-    // FIX: User typed "+233 papastickle@gmail.com" — country prefix leaked into email field.
-    const isEmail = rawInput.includes('@');
-    const inputVal = isEmail ? rawInput.replace(/^\+\d{1,4}\s*/, '').trim() : rawInput;
-    const emailValid = isEmail ? /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(inputVal) : true;
-    if (isEmail && !emailValid) { setErrorMessage('Please enter a valid email address.'); setLoading(false); return; }
+    const extracted = extractEmail(rawInput);
+    const isEmail = !!extracted;
+    const inputVal = isEmail ? extracted : rawInput;
 
     try {
       if (isEmail) {
@@ -126,61 +139,79 @@ export default function AuthPortalScreen({ navigation }) {
         if (authMode === 'signup' && password !== confirmPassword) { setErrorMessage('Passwords do not match.'); setLoading(false); return; }
 
         if (authMode === 'signup') {
-          // FIX 3 + FRESH FLAG: Set flag BEFORE signUp, not after.
-          // Supabase can fire SIGNED_IN synchronously inside signUp(), and App.js reads the flag there.
           setFreshSignupFlag();
           const { data, error } = await supabase.auth.signUp({ email: inputVal, password });
           if (error) { clearFreshSignupFlag(); throw error; }
-
-          // Email Confirmations ON -> no session yet, user must confirm first
           if (!data?.session) {
             setSuccessMessage('Account created! Check your email to confirm, then Sign In.');
-            // Keep flag so after they confirm + sign in, App.js still knows? No — confirm flow goes via email link.
-            // Clear it: after confirmation they will Sign In as returning user, but they still have no profile.
-            // App.js auto-create would skip onboarding, so we KEEP the flag for the next sign-in.
-            // Do NOT navigate to Onboarding yet — no session to save a profile with.
             setAuthMode('signin');
             setLoading(false);
             return;
           }
-
           setSuccessMessage('Account Created! Launching setup...');
           navigation.navigate('SignupOnboarding', { email: inputVal, isDemo: false });
         } else {
-          // Sign In: NEVER a fresh signup
           clearFreshSignupFlag();
           const { error } = await supabase.auth.signInWithPassword({ email: inputVal, password });
           if (error) throw error;
           setSuccessMessage('Signed in! Loading...');
-          // DO NOT navigate / reset here. App.js onAuthStateChange moves to Discovery / Onboarding.
         }
       } else {
-        // Phone OTP
+        // Phone OTP — send code, then show verify modal (do NOT navigate yet, no session)
         const safeCountry = selectedCountry || FALLBACK_COUNTRY;
-        const formattedPhone = inputVal.startsWith('+') ? inputVal : `${safeCountry.code}${inputVal.replace(/\D/g, '')}`;
-        if (authMode === 'signup') {
-          // Phone signup is also a fresh signup -> must do onboarding after OTP verify
-          setFreshSignupFlag();
-        } else {
-          clearFreshSignupFlag();
-        }
+        const digits = inputVal.replace(/\D/g, '');
+        const formattedPhone = inputVal.startsWith('+') ? `+${digits}` : `${safeCountry.code}${digits}`;
+        if (digits.length < 9) { setErrorMessage('Enter a valid phone number (e.g. 55 000 0000).'); setLoading(false); return; }
+        if (authMode === 'signup') setFreshSignupFlag(); else clearFreshSignupFlag();
         const { error } = await supabase.auth.signInWithOtp({ phone: formattedPhone });
         if (error) { if (authMode === 'signup') clearFreshSignupFlag(); throw error; }
-        setSuccessMessage(`OTP Sent to ${formattedPhone}`);
-        navigation.navigate(authMode === 'signup' ? 'SignupOnboarding' : 'Discovery', { fullPhone: formattedPhone, isDemo: false });
+        setOtpPhone(formattedPhone);
+        setOtpCode('');
+        setOtpModalVisible(true);
+        setSuccessMessage(`OTP Sent to ${formattedPhone} — enter the 6-digit code below.`);
       }
     } catch (err) {
       setErrorMessage(mapAuthError(err));
     } finally { setLoading(false); }
   };
 
+  const handleVerifyOtp = async () => {
+    const code = otpCode.trim();
+    if (code.length < 4) { setErrorMessage('Enter the code sent to your phone.'); return; }
+    setOtpVerifying(true);
+    setErrorMessage('');
+    try {
+      const { data, error } = await supabase.auth.verifyOtp({ phone: otpPhone, token: code, type: 'sms' });
+      if (error) throw error;
+      if (!data?.session) throw new Error('No session after OTP. Try again.');
+      setOtpModalVisible(false);
+      setSuccessMessage('Verified! Launching...');
+      // Fresh phone signup -> Onboarding, returning -> let App.js move to Discovery
+      if (authMode === 'signup') {
+        navigation.navigate('SignupOnboarding', { fullPhone: otpPhone, isDemo: false });
+      }
+    } catch (e) {
+      setErrorMessage(mapAuthError(e));
+    } finally { setOtpVerifying(false); }
+  };
+
+  const handleResendOtp = async () => {
+    if (!otpPhone) return;
+    setOtpVerifying(true);
+    try {
+      const { error } = await supabase.auth.signInWithOtp({ phone: otpPhone });
+      if (error) throw error;
+      setSuccessMessage(`New code sent to ${otpPhone}`);
+    } catch (e) { setErrorMessage(mapAuthError(e)); } finally { setOtpVerifying(false); }
+  };
+
   const handleForgotPassword = async () => {
     const val = forgotIdentifier.trim();
-    if (!val) { setErrorMessage('Enter email or phone to reset.'); return; }
-    if (!val.includes('@')) { setErrorMessage('Enter your email to receive a reset link.'); return; }
+    if (!val) { setErrorMessage('Enter email to reset.'); return; }
+    const cleanEmail = extractEmail(val);
+    if (!cleanEmail) { setErrorMessage('Enter your email to receive a reset link.'); return; }
     setLoading(true);
     try {
-      const cleanEmail = val.replace(/^\+\d{1,4}\s*/, '').trim();
       const { error } = await supabase.auth.resetPasswordForEmail(cleanEmail, {
         redirectTo: typeof window !== 'undefined' ? `${window.location.origin}/auth` : undefined,
       });
@@ -192,7 +223,6 @@ export default function AuthPortalScreen({ navigation }) {
     } finally { setLoading(false); }
   };
 
-  // Demo is the ONLY place that should still reset() — it has no Supabase session
   const handleDemoMode = () => {
     clearFreshSignupFlag();
     navigation.reset({ index: 0, routes: [{ name: 'Discovery', params: { isDemo: true } }] });
@@ -203,6 +233,7 @@ export default function AuthPortalScreen({ navigation }) {
 
   const displayCountry = selectedCountry || FALLBACK_COUNTRY;
   const displayFlag = getDisplayFlag(displayCountry);
+  const donorEmail = extractEmail(inputIdentifier);
 
   return (
     <SafeAreaView style={styles.outerContainer}>
@@ -243,8 +274,8 @@ export default function AuthPortalScreen({ navigation }) {
                 keyboardType="email-address"
                 autoCapitalize="none"
                 autoCorrect={false}
-                autoComplete="email"
-                textContentType="emailAddress"
+                autoComplete="username"
+                textContentType="username"
                 returnKeyType="next"
                 value={inputIdentifier}
                 onChangeText={v => { setInputIdentifier(v); setErrorMessage(''); }}
@@ -313,11 +344,18 @@ export default function AuthPortalScreen({ navigation }) {
           <TextInput style={styles.searchInput} placeholder="Search United States, Ghana, UK, Nigeria..." placeholderTextColor="#64748B" value={searchQuery} onChangeText={setSearchQuery} autoCapitalize="none" autoCorrect={false} autoComplete="off" textContentType="none" returnKeyType="search" />
           <FlatList data={filteredCountries} keyExtractor={(item, i) => `${item.name}-${i}`} renderItem={({ item }) => (<TouchableOpacity style={styles.countryRow} onPress={() => { setSelectedCountry(item); setModalVisible(false); setSearchQuery(''); }}><Text style={styles.countryRowFlag}>{getDisplayFlag(item)}</Text><Text style={styles.countryRowName}>{item.name}</Text><Text style={styles.countryRowCode}>{item.code}</Text></TouchableOpacity>)} /></SafeAreaView></View></Modal>
 
-        <Modal visible={forgotModalVisible} animationType="fade" transparent><View style={styles.modalOverlay}><View style={[styles.modalContent, { maxHeight: 340 }]}><View style={styles.modalHeader}><Text style={styles.modalTitle}>Reset Password</Text><TouchableOpacity onPress={() => setForgotModalVisible(false)}><Text style={{ fontSize: 20, color: '#94A3B8' }}>✕</Text></TouchableOpacity></View><Text style={{ color: '#94A3B8', fontSize: 13, marginBottom: 16 }}>Enter email or phone to receive reset instructions — works globally.</Text>
-          <TextInput style={styles.singleInput} placeholder="alex@example.com or phone with country code" placeholderTextColor="#64748B" value={forgotIdentifier} onChangeText={setForgotIdentifier} keyboardType="email-address" autoCapitalize="none" autoCorrect={false} autoComplete="email" textContentType="emailAddress" returnKeyType="done" blurOnSubmit={true} />
+        <Modal visible={forgotModalVisible} animationType="fade" transparent><View style={styles.modalOverlay}><View style={[styles.modalContent, { maxHeight: 340 }]}><View style={styles.modalHeader}><Text style={styles.modalTitle}>Reset Password</Text><TouchableOpacity onPress={() => setForgotModalVisible(false)}><Text style={{ fontSize: 20, color: '#94A3B8' }}>✕</Text></TouchableOpacity></View><Text style={{ color: '#94A3B8', fontSize: 13, marginBottom: 16 }}>Enter email to receive reset instructions — works globally.</Text>
+          <TextInput style={styles.singleInput} placeholder="alex@example.com" placeholderTextColor="#64748B" value={forgotIdentifier} onChangeText={setForgotIdentifier} keyboardType="email-address" autoCapitalize="none" autoCorrect={false} autoComplete="username" textContentType="username" returnKeyType="done" blurOnSubmit={true} />
           <TouchableOpacity style={[styles.button, { marginTop: 16 }]} onPress={handleForgotPassword} disabled={loading}>{loading ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Send Reset Link</Text>}</TouchableOpacity><TouchableOpacity style={styles.cancelModalBtn} onPress={() => setForgotModalVisible(false)}><Text style={styles.cancelModalText}>Cancel & Return</Text></TouchableOpacity></View></View></Modal>
 
-        <EmpathDonateModal visible={showDonateModal} onClose={() => setShowDonateModal(false)} donorEmail={inputIdentifier.includes('@') ? inputIdentifier : undefined} />
+        <Modal visible={otpModalVisible} animationType="fade" transparent><View style={styles.modalOverlay}><View style={[styles.modalContent, { maxHeight: 380 }]}><View style={styles.modalHeader}><Text style={styles.modalTitle}>Enter OTP Code</Text><TouchableOpacity onPress={() => setOtpModalVisible(false)}><Text style={{ fontSize: 20, color: '#94A3B8' }}>✕</Text></TouchableOpacity></View>
+          <Text style={{ color: '#94A3B8', fontSize: 13, marginBottom: 16 }}>We sent a 6-digit code to {otpPhone}. Enter it below.</Text>
+          <TextInput style={[styles.singleInput, { textAlign: 'center', fontSize: 22, letterSpacing: 6, fontWeight: '800' }]} placeholder="123456" placeholderTextColor="#64748B" value={otpCode} onChangeText={(v) => setOtpCode(v.replace(/[^0-9]/g, '').slice(0, 6))} keyboardType="number-pad" autoCapitalize="none" autoCorrect={false} autoComplete="one-time-code" textContentType="oneTimeCode" returnKeyType="done" maxLength={6} />
+          <TouchableOpacity style={[styles.button, { marginTop: 16 }]} onPress={handleVerifyOtp} disabled={otpVerifying}>{otpVerifying ? <ActivityIndicator color="#fff" /> : <Text style={styles.buttonText}>Verify & Continue</Text>}</TouchableOpacity>
+          <TouchableOpacity style={styles.cancelModalBtn} onPress={handleResendOtp} disabled={otpVerifying}><Text style={styles.cancelModalText}>Resend Code</Text></TouchableOpacity>
+        </View></View></Modal>
+
+        <EmpathDonateModal visible={showDonateModal} onClose={() => setShowDonateModal(false)} donorEmail={donorEmail} />
       </KeyboardAvoidingView>
     </SafeAreaView>
   );
