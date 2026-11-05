@@ -5,6 +5,7 @@ import { supabase } from '../lib/supabase';
 import EmpathDonateModal from '../components/EmpathDonateModal';
 
 const FALLBACK_COUNTRY = { code: '+233', flag: '🇬🇭', name: 'Ghana' };
+const FRESH_SIGNUP_KEY = 'intent_fresh_signup';
 
 // FIX: Windows Chrome renders flag emojis as "GH" / "US" letters — use globe on web
 const getDisplayFlag = (country) => {
@@ -12,11 +13,34 @@ const getDisplayFlag = (country) => {
   return country?.flag || '🌍';
 };
 
+const setFreshSignupFlag = () => {
+  try { if (typeof window !== 'undefined') window.sessionStorage?.setItem(FRESH_SIGNUP_KEY, '1'); } catch {}
+};
+const clearFreshSignupFlag = () => {
+  try { if (typeof window !== 'undefined') window.sessionStorage?.removeItem(FRESH_SIGNUP_KEY); } catch {}
+};
+
 // FIX: Map "Failed to fetch" to an actionable message instead of a cryptic error
 const mapAuthError = (err) => {
   const msg = err?.message || 'Auth failed';
-  if (msg.includes('Failed to fetch') || msg.includes('fetch') || msg.includes('Network')) {
+  const lower = msg.toLowerCase();
+  if (lower.includes('failed to fetch') || lower.includes('fetch') || lower.includes('network')) {
     return 'Cannot reach Supabase. Check internet, or Supabase project is paused / keys missing. Try Demo Mode below.';
+  }
+  if (lower.includes('user already registered') || lower.includes('already registered') || lower.includes('already exists')) {
+    return 'That email already has an account. Tap Sign In above instead.';
+  }
+  if (lower.includes('invalid login credentials') || lower.includes('invalid email or password')) {
+    return 'Wrong email or password. Try again, or tap Forgot password?';
+  }
+  if (lower.includes('email link is invalid') || lower.includes('expired')) {
+    return 'That link expired. Sign in again to get a new one.';
+  }
+  if (lower.includes('password') && lower.includes('6')) {
+    return 'Password must be at least 6 characters.';
+  }
+  if (lower.includes('email') && lower.includes('invalid')) {
+    return 'Please enter a valid email address.';
   }
   return msg;
 };
@@ -30,7 +54,6 @@ export default function AuthPortalScreen({ navigation }) {
     const findByCode = (code) => list.find(c => c.code === code);
     const ghana = findByCode('+233') || FALLBACK_COUNTRY;
     try {
-      // FIX: Check timezone FIRST — browser language en-GB was wrongly returning UK
       if (Platform.OS === 'web' && typeof Intl !== 'undefined' && Intl.DateTimeFormat) {
         const tz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
         if (tz.includes('Accra')) return ghana;
@@ -73,49 +96,77 @@ export default function AuthPortalScreen({ navigation }) {
         document.head.appendChild(style);
       }
     }
+    // If user lands back on Auth (e.g. signed out from Onboarding), clear stale fresh-signup flag
+    clearFreshSignupFlag();
   }, []);
 
+  const switchMode = (mode) => {
+    setAuthMode(mode);
+    setErrorMessage('');
+    setSuccessMessage('');
+    if (mode === 'signin') clearFreshSignupFlag();
+  };
+
   const handleAuth = async () => {
-    // FIX: Prevent triple ghost — ignore double-tap / double submit
     if (loading) return;
     setErrorMessage(''); setSuccessMessage(''); setLoading(true);
     const rawInput = inputIdentifier.trim();
     if (!rawInput) { setErrorMessage('Please enter email or phone.'); setLoading(false); return; }
 
-    // FIX: User typed "+233 papastickle@gmail.com" — country prefix leaked into email field in video.
-    // If it contains @, it's an email — strip any leading +233 / +44 / +1 + spaces.
+    // FIX: User typed "+233 papastickle@gmail.com" — country prefix leaked into email field.
     const isEmail = rawInput.includes('@');
-    const inputVal = isEmail
-      ? rawInput.replace(/^\+\d{1,4}\s*/, '').trim()
-      : rawInput;
+    const inputVal = isEmail ? rawInput.replace(/^\+\d{1,4}\s*/, '').trim() : rawInput;
+    const emailValid = isEmail ? /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(inputVal) : true;
+    if (isEmail && !emailValid) { setErrorMessage('Please enter a valid email address.'); setLoading(false); return; }
 
     try {
       if (isEmail) {
         if (!password) { setErrorMessage('Enter password.'); setLoading(false); return; }
+        if (password.length < 6) { setErrorMessage('Password must be at least 6 characters.'); setLoading(false); return; }
         if (authMode === 'signup' && password !== confirmPassword) { setErrorMessage('Passwords do not match.'); setLoading(false); return; }
 
         if (authMode === 'signup') {
-          const { error } = await supabase.auth.signUp({ email: inputVal, password });
-          if (error) throw error;
+          // FIX 3 + FRESH FLAG: Set flag BEFORE signUp, not after.
+          // Supabase can fire SIGNED_IN synchronously inside signUp(), and App.js reads the flag there.
+          setFreshSignupFlag();
+          const { data, error } = await supabase.auth.signUp({ email: inputVal, password });
+          if (error) { clearFreshSignupFlag(); throw error; }
+
+          // Email Confirmations ON -> no session yet, user must confirm first
+          if (!data?.session) {
+            setSuccessMessage('Account created! Check your email to confirm, then Sign In.');
+            // Keep flag so after they confirm + sign in, App.js still knows? No — confirm flow goes via email link.
+            // Clear it: after confirmation they will Sign In as returning user, but they still have no profile.
+            // App.js auto-create would skip onboarding, so we KEEP the flag for the next sign-in.
+            // Do NOT navigate to Onboarding yet — no session to save a profile with.
+            setAuthMode('signin');
+            setLoading(false);
+            return;
+          }
+
           setSuccessMessage('Account Created! Launching setup...');
-          // FIX: Sign-up needs Onboarding, not Discovery. Use navigate (push), not reset.
-          // App.js onAuthStateChange would send SIGNED_IN -> Discovery and skip Onboarding.
-          // navigate() keeps Back working: Back from Onboarding -> Auth.
           navigation.navigate('SignupOnboarding', { email: inputVal, isDemo: false });
         } else {
+          // Sign In: NEVER a fresh signup
+          clearFreshSignupFlag();
           const { error } = await supabase.auth.signInWithPassword({ email: inputVal, password });
           if (error) throw error;
           setSuccessMessage('Signed in! Loading...');
-          // FIX: DO NOT navigate / reset here. App.js onAuthStateChange (SIGNED_IN) moves to Discovery.
-          // Calling reset() here + App.js resetting = 2 resets in 1 tick = Auth + Profile ghost at 18s.
+          // DO NOT navigate / reset here. App.js onAuthStateChange moves to Discovery / Onboarding.
         }
       } else {
+        // Phone OTP
         const safeCountry = selectedCountry || FALLBACK_COUNTRY;
         const formattedPhone = inputVal.startsWith('+') ? inputVal : `${safeCountry.code}${inputVal.replace(/\D/g, '')}`;
+        if (authMode === 'signup') {
+          // Phone signup is also a fresh signup -> must do onboarding after OTP verify
+          setFreshSignupFlag();
+        } else {
+          clearFreshSignupFlag();
+        }
         const { error } = await supabase.auth.signInWithOtp({ phone: formattedPhone });
-        if (error) throw error;
+        if (error) { if (authMode === 'signup') clearFreshSignupFlag(); throw error; }
         setSuccessMessage(`OTP Sent to ${formattedPhone}`);
-        // FIX: OTP has no session yet, so App.js won't move you. Use navigate, not reset.
         navigation.navigate(authMode === 'signup' ? 'SignupOnboarding' : 'Discovery', { fullPhone: formattedPhone, isDemo: false });
       }
     } catch (err) {
@@ -126,7 +177,6 @@ export default function AuthPortalScreen({ navigation }) {
   const handleForgotPassword = async () => {
     const val = forgotIdentifier.trim();
     if (!val) { setErrorMessage('Enter email or phone to reset.'); return; }
-    // FIX: Was fake success with no Supabase call. Now real reset.
     if (!val.includes('@')) { setErrorMessage('Enter your email to receive a reset link.'); return; }
     setLoading(true);
     try {
@@ -142,9 +192,11 @@ export default function AuthPortalScreen({ navigation }) {
     } finally { setLoading(false); }
   };
 
-  // FIX: Demo is the ONLY place that should still reset() — it has no Supabase session,
-  // so App.js onAuthStateChange will never fire for it.
-  const handleDemoMode = () => navigation.reset({ index: 0, routes: [{ name: 'Discovery', params: { isDemo: true } }] });
+  // Demo is the ONLY place that should still reset() — it has no Supabase session
+  const handleDemoMode = () => {
+    clearFreshSignupFlag();
+    navigation.reset({ index: 0, routes: [{ name: 'Discovery', params: { isDemo: true } }] });
+  };
 
   const listForFilter = COUNTRIES || [FALLBACK_COUNTRY];
   const filteredCountries = listForFilter.filter(c => c.name.toLowerCase().includes(searchQuery.toLowerCase()) || c.code.includes(searchQuery) || c.code.replace('+', '').includes(searchQuery));
@@ -164,10 +216,10 @@ export default function AuthPortalScreen({ navigation }) {
           </View>
 
           <View style={styles.modeTabContainer}>
-            <TouchableOpacity style={[styles.modeTab, authMode === 'signin' && styles.activeModeTab]} onPress={() => { setAuthMode('signin'); setErrorMessage(''); setSuccessMessage(''); }}>
+            <TouchableOpacity style={[styles.modeTab, authMode === 'signin' && styles.activeModeTab]} onPress={() => switchMode('signin')}>
               <Text style={[styles.modeTabText, authMode === 'signin' && styles.activeModeTabText]}>Sign In</Text>
             </TouchableOpacity>
-            <TouchableOpacity style={[styles.modeTab, authMode === 'signup' && styles.activeModeTab]} onPress={() => { setAuthMode('signup'); setErrorMessage(''); setSuccessMessage(''); }}>
+            <TouchableOpacity style={[styles.modeTab, authMode === 'signup' && styles.activeModeTab]} onPress={() => switchMode('signup')}>
               <Text style={[styles.modeTabText, authMode === 'signup' && styles.activeModeTabText]}>Create Account</Text>
             </TouchableOpacity>
           </View>
@@ -209,7 +261,6 @@ export default function AuthPortalScreen({ navigation }) {
                 secureTextEntry={!showPassword}
                 autoCapitalize="none"
                 autoCorrect={false}
-                // FIX: Was autoComplete="off" + textContentType="none" — Chrome turned it into plaintext on autofill
                 autoComplete="current-password"
                 textContentType="password"
                 returnKeyType="done"
@@ -231,7 +282,6 @@ export default function AuthPortalScreen({ navigation }) {
                     secureTextEntry={!showConfirmPassword}
                     autoCapitalize="none"
                     autoCorrect={false}
-                    // FIX: Same plaintext leak fix for confirm
                     autoComplete="new-password"
                     textContentType="newPassword"
                     returnKeyType="done"

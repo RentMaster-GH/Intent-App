@@ -1,4 +1,4 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   StyleSheet,
   Text,
@@ -16,6 +16,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { getAgeCategory } from '../utils/ageGroups';
 import { supabase } from '../lib/supabase';
 
+const FRESH_SIGNUP_KEY = 'intent_fresh_signup';
 const GENDER_OPTIONS = ['Woman', 'Man', 'Non-Binary'];
 const SEEKING_OPTIONS = ['Women', 'Men', 'Everyone'];
 const INTENT_OPTIONS = [
@@ -31,10 +32,17 @@ const DEFAULT_PHOTOS = [
   'https://images.unsplash.com/photo-1524504388940-b1c1722653e1?auto=format&fit=crop&q=80&w=800',
 ];
 
+const clearFreshSignupFlag = () => {
+  try { if (typeof window !== 'undefined') window.sessionStorage?.removeItem(FRESH_SIGNUP_KEY); } catch {}
+};
+
 export default function SignupOnboardingScreen({ navigation, route }) {
   const [step, setStep] = useState(1);
   const [saving, setSaving] = useState(false);
+  const [loadingProfile, setLoadingProfile] = useState(true);
   const [saveError, setSaveError] = useState('');
+  const [hasExistingProfile, setHasExistingProfile] = useState(false);
+  const [noSession, setNoSession] = useState(false);
 
   const [fullName, setFullName] = useState('');
   const [age, setAge] = useState('');
@@ -45,30 +53,91 @@ export default function SignupOnboardingScreen({ navigation, route }) {
   const [selectedIntent, setSelectedIntent] = useState(INTENT_OPTIONS[0]);
   const [bio, setBio] = useState('');
   const [photos, setPhotos] = useState([DEFAULT_PHOTOS[0]]);
-  const [pickedFiles, setPickedFiles] = useState({}); // slotIndex -> File (web only)
+  const [pickedFiles, setPickedFiles] = useState({});
+  const [uploadingPhoto, setUploadingPhoto] = useState(false);
 
   const fileInputRef = useRef(null);
   const activeSlotRef = useRef(0);
-
   const ageCategory = getAgeCategory(age);
+
+  // --- Prefill from existing profile / user_metadata (old account / refresh) ---
+  useEffect(() => {
+    let mounted = true;
+    (async () => {
+      try {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (!mounted) return;
+        if (!user) {
+          setNoSession(true);
+          setLoadingProfile(false);
+          return;
+        }
+        // If route passed email from AuthPortal, ignore - we use auth user
+        const { data: profile } = await supabase.from('profiles').select('*').eq('id', user.id).maybeSingle();
+        if (!mounted) return;
+        if (profile) {
+          setHasExistingProfile(true);
+          setFullName(profile.full_name || '');
+          setAge(profile.age ? String(profile.age) : '');
+          setCity(profile.city || 'Accra');
+          setCountry(profile.country || 'Ghana');
+          setGender(profile.gender || 'Woman');
+          setSeeking(profile.seeking || 'Men');
+          setSelectedIntent(profile.intent || INTENT_OPTIONS[0]);
+          setBio(profile.bio || '');
+          if (profile.photos?.length) setPhotos(profile.photos);
+          else if (profile.avatar_url) setPhotos([profile.avatar_url]);
+        } else {
+          // No profile yet - prefill from user_metadata if any
+          const meta = user.user_metadata || {};
+          if (meta.full_name || meta.name) setFullName(meta.full_name || meta.name);
+          if (meta.age) setAge(String(meta.age));
+          if (meta.city) setCity(meta.city);
+          if (meta.country) setCountry(meta.country);
+          if (meta.gender) setGender(meta.gender);
+          if (meta.seeking) setSeeking(meta.seeking);
+          if (meta.intent) setSelectedIntent(meta.intent);
+          if (meta.bio) setBio(meta.bio);
+          if (meta.avatar_url || meta.photo) setPhotos([meta.avatar_url || meta.photo]);
+        }
+      } catch (e) {
+        console.warn('[Onboarding] prefill failed:', e?.message);
+      } finally {
+        if (mounted) setLoadingProfile(false);
+      }
+    })();
+    return () => { mounted = false; };
+  }, []);
 
   const uploadPickedPhoto = async (userId, slotIndex) => {
     const file = pickedFiles[slotIndex];
-    if (!file) return photos[slotIndex];
+    const current = photos[slotIndex];
+    if (!file) return current;
     try {
-      const ext = file.name?.split('.').pop() || 'jpg';
+      const ext = file.name?.split('.').pop()?.toLowerCase() || 'jpg';
       const path = `${userId}/${slotIndex}-${Date.now()}.${ext}`;
       const { error: uploadError } = await supabase.storage
         .from('avatars')
         .upload(path, file, { upsert: true, contentType: file.type || 'image/jpeg' });
       if (uploadError) throw uploadError;
       const { data } = supabase.storage.from('avatars').getPublicUrl(path);
-      return data?.publicUrl || photos[slotIndex];
+      return data?.publicUrl || current;
     } catch (e) {
-      // Bucket missing / RLS -> fall back to default photo, don't block signup
-      console.warn('[Onboarding] photo upload failed, using default:', e.message);
-      return photos[slotIndex]?.startsWith('blob:') ? DEFAULT_PHOTOS[slotIndex % DEFAULT_PHOTOS.length] : photos[slotIndex];
+      console.warn('[Onboarding] photo upload failed, using fallback:', e.message);
+      return current?.startsWith('blob:') ? DEFAULT_PHOTOS[slotIndex % DEFAULT_PHOTOS.length] : current;
     }
+  };
+
+  const validateStep1 = () => {
+    if (!fullName.trim()) { setSaveError('Please enter your name.'); return false; }
+    if (fullName.trim().length < 2) { setSaveError('Name must be at least 2 characters.'); return false; }
+    const ageNum = parseInt(age, 10);
+    if (!age.trim() || isNaN(ageNum) || ageNum < 18 || ageNum > 100) {
+      setSaveError('Please enter a valid age between 18 and 100.'); return false;
+    }
+    if (!city.trim()) { setSaveError('Please enter your city.'); return false; }
+    setSaveError('');
+    return true;
   };
 
   const handleNext = async () => {
@@ -76,52 +145,50 @@ export default function SignupOnboardingScreen({ navigation, route }) {
     setSaveError('');
 
     if (step === 1) {
-      if (!fullName.trim()) {
-        Alert.alert('Details Required', 'Please enter your name to continue.');
-        return;
-      }
-      const ageNum = parseInt(age, 10);
-      if (!age.trim() || isNaN(ageNum) || ageNum < 18 || ageNum > 100) {
-        Alert.alert('Age Required', 'Please enter a valid age between 18 and 100.');
-        return;
-      }
-      if (!city.trim()) {
-        Alert.alert('City Required', 'Please enter your city.');
-        return;
-      }
+      if (!validateStep1()) return;
       setStep(2);
       return;
     }
 
     if (step === 2) {
-      if (!selectedIntent) {
-        Alert.alert('Intent Required', 'Please select your primary dating intent.');
-        return;
-      }
+      if (!selectedIntent) { setSaveError('Please select your primary dating intent.'); return; }
+      if (bio.length > 300) { setSaveError('Bio must be 300 characters or less.'); return; }
       setStep(3);
       return;
     }
 
-    // Step 3 -> Save to Supabase
+    // Step 3 -> Save (also called by Skip)
+    await saveProfile();
+  };
+
+  const saveProfile = async (skipPhotos = false) => {
     setSaving(true);
+    setSaveError('');
     try {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) {
-        Alert.alert('Not signed in', 'Please sign up again.');
+        setNoSession(true);
         setSaving(false);
         return;
       }
-
       const ageNum = parseInt(age, 10);
+      if (isNaN(ageNum) || ageNum < 18) throw new Error('You must be 18+ to use Intent.');
 
-      // Upload any locally picked photos first
-      const finalPhotos = [];
-      for (let i = 0; i < photos.length; i++) {
-        if (photos[i]) finalPhotos.push(await uploadPickedPhoto(user.id, i));
+      // Upload picked photos, or keep existing/defaults
+      let finalPhotos = [];
+      if (!skipPhotos) {
+        for (let i = 0; i < photos.length; i++) {
+          if (photos[i]) finalPhotos.push(await uploadPickedPhoto(user.id, i));
+        }
+        finalPhotos = finalPhotos.filter(Boolean);
+      } else {
+        // Skip: keep non-blob photos only, fallback to default if none
+        finalPhotos = photos.filter((p) => p && !p.startsWith('blob:'));
+        if (!finalPhotos.length) finalPhotos = [DEFAULT_PHOTOS[0]];
       }
       const mainPhoto = finalPhotos[0] || DEFAULT_PHOTOS[0];
 
-      // 1. Keep user_metadata in sync (ProfileScreen reads this)
+      // 1. Keep user_metadata in sync
       await supabase.auth.updateUser({
         data: {
           name: fullName.trim(),
@@ -139,7 +206,7 @@ export default function SignupOnboardingScreen({ navigation, route }) {
         },
       });
 
-      // 2. REAL persistence: upsert into profiles table
+      // 2. Persist to profiles table
       const { error: profileError } = await supabase
         .from('profiles')
         .upsert(
@@ -159,8 +226,10 @@ export default function SignupOnboardingScreen({ navigation, route }) {
           },
           { onConflict: 'id' }
         );
-
       if (profileError) throw profileError;
+
+      // 3. Clear fresh-signup flag so refresh goes to Discovery, not Onboarding
+      clearFreshSignupFlag();
 
       navigation.reset({
         index: 0,
@@ -169,18 +238,31 @@ export default function SignupOnboardingScreen({ navigation, route }) {
     } catch (e) {
       console.error('[Onboarding] save failed:', e);
       setSaveError(e.message || 'Could not save profile. Check internet / Supabase tables exist.');
-      Alert.alert('Could not save profile', e.message || 'Check internet / Supabase tables exist.');
     } finally {
       setSaving(false);
     }
   };
 
   const handleBack = () => {
-    if (step > 1) {
-      setStep(step - 1);
-    } else {
-      navigation.goBack();
+    if (step > 1) { setStep(step - 1); return; }
+    // Step 1 Back
+    if (hasExistingProfile) {
+      // Old account editing -> go back to Discovery, don't sign out
+      navigation.reset({ index: 0, routes: [{ name: 'Discovery', params: { isDemo: false } }] });
+      return;
     }
+    // Fresh signup, no profile yet -> confirm leave, sign out, clear flag
+    Alert.alert('Leave setup?', 'Your profile is not saved yet. Go back to Sign In?', [
+      { text: 'Stay', style: 'cancel' },
+      {
+        text: 'Sign In',
+        onPress: async () => {
+          clearFreshSignupFlag();
+          await supabase.auth.signOut();
+          navigation.reset({ index: 0, routes: [{ name: 'AuthPortal', params: {} }] });
+        },
+      },
+    ]);
   };
 
   const handlePickPhoto = (slotIndex) => {
@@ -195,36 +277,81 @@ export default function SignupOnboardingScreen({ navigation, route }) {
     }
   };
 
+  const handleRemovePhoto = (slotIndex) => {
+    const updated = [...photos];
+    updated.splice(slotIndex, 1);
+    if (!updated.length) updated.push(DEFAULT_PHOTOS[0]);
+    setPhotos(updated);
+    setPickedFiles((prev) => {
+      const next = { ...prev };
+      delete next[slotIndex];
+      return next;
+    });
+  };
+
   const handleFileChange = (e) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    // Validate type + size
+    if (!file.type?.startsWith('image/')) {
+      setSaveError('Please pick an image file (JPG / PNG).');
+      e.target.value = '';
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      setSaveError('Photo must be under 5MB.');
+      e.target.value = '';
+      return;
+    }
+    setSaveError('');
     const slot = activeSlotRef.current;
     const imageUrl = URL.createObjectURL(file);
     const updated = [...photos];
     updated[slot] = imageUrl;
     setPhotos(updated);
     setPickedFiles((prev) => ({ ...prev, [slot]: file }));
-    // Reset input so same file can be re-picked
     e.target.value = '';
   };
+
+  if (loadingProfile) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.centerBox}>
+          <ActivityIndicator color="#F97316" size="large" />
+          <Text style={styles.loadingText}>Loading your profile...</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  if (noSession) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <View style={styles.centerBox}>
+          <Text style={styles.stepTitle}>Please sign in first</Text>
+          <Text style={styles.stepSub}>You need an account before completing onboarding. If you just signed up, check your email to confirm, then sign in.</Text>
+          <TouchableOpacity
+            style={styles.nextButton}
+            onPress={() => navigation.reset({ index: 0, routes: [{ name: 'AuthPortal', params: {} }] })}
+          >
+            <Text style={styles.nextButtonText}>Go to Sign In</Text>
+          </TouchableOpacity>
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.container}>
       {Platform.OS === 'web' && (
-        <input
-          type="file"
-          ref={fileInputRef}
-          onChange={handleFileChange}
-          accept="image/*"
-          style={{ display: 'none' }}
-        />
+        <input type="file" ref={fileInputRef} onChange={handleFileChange} accept="image/*" style={{ display: 'none' }} />
       )}
 
       <View style={styles.topHeader}>
         <TouchableOpacity onPress={handleBack} style={styles.backButton}>
           <Ionicons name="arrow-back" size={22} color="#F8FAFC" />
         </TouchableOpacity>
-        <Text style={styles.headerTitle}>Step {step} of 3</Text>
+        <Text style={styles.headerTitle}>Step {step} of 3 {hasExistingProfile ? '• Edit' : ''}</Text>
         <View style={{ width: 30 }} />
       </View>
 
@@ -241,24 +368,10 @@ export default function SignupOnboardingScreen({ navigation, route }) {
             <Text style={styles.stepSub}>Let potential matches know who you are.</Text>
 
             <Text style={styles.label}>First Name</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="e.g. Sarah"
-              placeholderTextColor="#64748B"
-              value={fullName}
-              onChangeText={setFullName}
-            />
+            <TextInput style={styles.input} placeholder="e.g. Sarah" placeholderTextColor="#64748B" value={fullName} onChangeText={(v) => { setFullName(v); setSaveError(''); }} autoCapitalize="words" />
 
             <Text style={[styles.label, { marginTop: 16 }]}>Age (18-100)</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="e.g. 26"
-              placeholderTextColor="#64748B"
-              keyboardType="number-pad"
-              maxLength={3}
-              value={age}
-              onChangeText={(v) => setAge(v.replace(/[^0-9]/g, ''))}
-            />
+            <TextInput style={styles.input} placeholder="e.g. 26" placeholderTextColor="#64748B" keyboardType="number-pad" maxLength={3} value={age} onChangeText={(v) => { setAge(v.replace(/[^0-9]/g, '')); setSaveError(''); }} />
 
             {ageCategory ? (
               <View style={styles.categoryBadge}>
@@ -268,33 +381,15 @@ export default function SignupOnboardingScreen({ navigation, route }) {
             ) : null}
 
             <Text style={[styles.label, { marginTop: 16 }]}>City</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="e.g. Accra"
-              placeholderTextColor="#64748B"
-              value={city}
-              onChangeText={setCity}
-              autoCapitalize="words"
-            />
+            <TextInput style={styles.input} placeholder="e.g. Accra" placeholderTextColor="#64748B" value={city} onChangeText={setCity} autoCapitalize="words" />
 
             <Text style={[styles.label, { marginTop: 16 }]}>Country</Text>
-            <TextInput
-              style={styles.input}
-              placeholder="e.g. Ghana"
-              placeholderTextColor="#64748B"
-              value={country}
-              onChangeText={setCountry}
-              autoCapitalize="words"
-            />
+            <TextInput style={styles.input} placeholder="e.g. Ghana" placeholderTextColor="#64748B" value={country} onChangeText={setCountry} autoCapitalize="words" />
 
             <Text style={[styles.label, { marginTop: 16 }]}>I Identify As</Text>
             <View style={styles.chipRow}>
               {GENDER_OPTIONS.map((item) => (
-                <TouchableOpacity
-                  key={item}
-                  style={[styles.chip, gender === item && styles.activeChip]}
-                  onPress={() => setGender(item)}
-                >
+                <TouchableOpacity key={item} style={[styles.chip, gender === item && styles.activeChip]} onPress={() => setGender(item)}>
                   <Text style={[styles.chipText, gender === item && styles.activeChipText]}>{item}</Text>
                 </TouchableOpacity>
               ))}
@@ -303,11 +398,7 @@ export default function SignupOnboardingScreen({ navigation, route }) {
             <Text style={[styles.label, { marginTop: 16 }]}>I Want to Meet</Text>
             <View style={styles.chipRow}>
               {SEEKING_OPTIONS.map((item) => (
-                <TouchableOpacity
-                  key={item}
-                  style={[styles.chip, seeking === item && styles.activeChip]}
-                  onPress={() => setSeeking(item)}
-                >
+                <TouchableOpacity key={item} style={[styles.chip, seeking === item && styles.activeChip]} onPress={() => setSeeking(item)}>
                   <Text style={[styles.chipText, seeking === item && styles.activeChipText]}>{item}</Text>
                 </TouchableOpacity>
               ))}
@@ -321,24 +412,19 @@ export default function SignupOnboardingScreen({ navigation, route }) {
             <Text style={styles.stepSub}>What are you looking for on Intent?</Text>
 
             {INTENT_OPTIONS.map((option) => (
-              <TouchableOpacity
-                key={option}
-                style={[styles.intentChip, selectedIntent === option && styles.activeIntentChip]}
-                onPress={() => setSelectedIntent(option)}
-              >
-                <Text style={[styles.intentText, selectedIntent === option && styles.activeIntentText]}>
-                  {option}
-                </Text>
+              <TouchableOpacity key={option} style={[styles.intentChip, selectedIntent === option && styles.activeIntentChip]} onPress={() => setSelectedIntent(option)}>
+                <Text style={[styles.intentText, selectedIntent === option && styles.activeIntentText]}>{option}</Text>
               </TouchableOpacity>
             ))}
 
-            <Text style={[styles.label, { marginTop: 20 }]}>Short Bio</Text>
+            <Text style={[styles.label, { marginTop: 20 }]}>Short Bio ({bio.length}/300)</Text>
             <TextInput
               style={[styles.input, styles.bioInput]}
               placeholder="What makes a great first date for you?"
               placeholderTextColor="#64748B"
               multiline
               numberOfLines={3}
+              maxLength={300}
               value={bio}
               onChangeText={setBio}
             />
@@ -353,34 +439,37 @@ export default function SignupOnboardingScreen({ navigation, route }) {
             <View style={styles.photoGrid}>
               <TouchableOpacity style={styles.photoBoxMain} onPress={() => handlePickPhoto(0)}>
                 {photos[0] ? (
-                  <Image source={{ uri: photos[0] }} style={styles.photoImg} />
+                  <>
+                    <Image source={{ uri: photos[0] }} style={styles.photoImg} />
+                    <TouchableOpacity style={styles.removeBtn} onPress={() => handleRemovePhoto(0)}>
+                      <Text style={styles.removeBtnText}>✕</Text>
+                    </TouchableOpacity>
+                  </>
                 ) : (
                   <>
                     <Ionicons name="camera-outline" size={32} color="#FBBF24" />
-                    <Text style={{ color: '#F97316', fontSize: 13, marginTop: 4, fontWeight: '700' }}>
-                      Tap to Upload Main Photo
-                    </Text>
+                    <Text style={{ color: '#F97316', fontSize: 13, marginTop: 4, fontWeight: '700' }}>Tap to Upload Main Photo</Text>
                   </>
                 )}
               </TouchableOpacity>
 
-              <TouchableOpacity style={styles.photoBox} onPress={() => handlePickPhoto(1)}>
-                {photos[1] ? (
-                  <Image source={{ uri: photos[1] }} style={styles.photoImg} />
-                ) : (
-                  <Ionicons name="add" size={24} color="#FBBF24" />
-                )}
-              </TouchableOpacity>
-
-              <TouchableOpacity style={styles.photoBox} onPress={() => handlePickPhoto(2)}>
-                {photos[2] ? (
-                  <Image source={{ uri: photos[2] }} style={styles.photoImg} />
-                ) : (
-                  <Ionicons name="add" size={24} color="#FBBF24" />
-                )}
-              </TouchableOpacity>
+              {[1, 2].map((slot) => (
+                <TouchableOpacity key={slot} style={styles.photoBox} onPress={() => handlePickPhoto(slot)}>
+                  {photos[slot] ? (
+                    <>
+                      <Image source={{ uri: photos[slot] }} style={styles.photoImg} />
+                      <TouchableOpacity style={styles.removeBtnSmall} onPress={() => handleRemovePhoto(slot)}>
+                        <Text style={styles.removeBtnText}>✕</Text>
+                      </TouchableOpacity>
+                    </>
+                  ) : (
+                    <Ionicons name="add" size={24} color="#FBBF24" />
+                  )}
+                </TouchableOpacity>
+              ))}
             </View>
-            <Text style={styles.photoHint}>Tip: First photo is your main Discovery photo.</Text>
+            <Text style={styles.photoHint}>Tip: First photo is your main Discovery photo. Max 5MB per photo.</Text>
+            {uploadingPhoto ? <Text style={styles.photoHint}>Uploading photo...</Text> : null}
           </View>
         )}
 
@@ -391,12 +480,14 @@ export default function SignupOnboardingScreen({ navigation, route }) {
         ) : null}
 
         <TouchableOpacity style={[styles.nextButton, saving && styles.nextButtonDisabled]} onPress={handleNext} disabled={saving}>
-          {saving ? (
-            <ActivityIndicator color="#fff" />
-          ) : (
-            <Text style={styles.nextButtonText}>{step < 3 ? 'Next Step ›' : 'Complete Setup & Launch'}</Text>
-          )}
+          {saving ? <ActivityIndicator color="#fff" /> : <Text style={styles.nextButtonText}>{step < 3 ? 'Next Step ›' : hasExistingProfile ? 'Save & Go to Discovery' : 'Complete Setup & Launch'}</Text>}
         </TouchableOpacity>
+
+        {step === 3 && (
+          <TouchableOpacity style={styles.skipButton} onPress={() => saveProfile(true)} disabled={saving}>
+            <Text style={styles.skipButtonText}>Skip photos for now</Text>
+          </TouchableOpacity>
+        )}
       </ScrollView>
     </SafeAreaView>
   );
@@ -404,6 +495,8 @@ export default function SignupOnboardingScreen({ navigation, route }) {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0F172A' },
+  centerBox: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 24 },
+  loadingText: { color: '#94A3B8', marginTop: 12, fontSize: 14 },
   topHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingVertical: 12 },
   backButton: { padding: 4 },
   headerTitle: { color: '#FBBF24', fontSize: 14, fontWeight: '700' },
@@ -411,8 +504,8 @@ const styles = StyleSheet.create({
   progressSegment: { flex: 1, height: 4, backgroundColor: '#1E293B', borderRadius: 2, marginRight: 6 },
   activeSegment: { backgroundColor: '#F97316' },
   content: { paddingHorizontal: 24, paddingTop: 10, paddingBottom: 40, maxWidth: 480, width: '100%', alignSelf: 'center' },
-  stepTitle: { fontSize: 26, fontWeight: '800', color: '#F8FAFC' },
-  stepSub: { color: '#94A3B8', fontSize: 13, marginTop: 4, marginBottom: 20 },
+  stepTitle: { fontSize: 26, fontWeight: '800', color: '#F8FAFC', textAlign: 'center' },
+  stepSub: { color: '#94A3B8', fontSize: 13, marginTop: 4, marginBottom: 20, textAlign: 'center' },
   label: { color: '#CBD5E1', fontWeight: '600', fontSize: 13, marginBottom: 8 },
   input: { backgroundColor: '#1E293B', borderRadius: 12, borderWidth: 1, borderColor: '#334155', color: '#F8FAFC', paddingHorizontal: 16, height: 50 },
   categoryBadge: { flexDirection: 'row', alignItems: 'center', backgroundColor: 'rgba(251, 191, 36, 0.15)', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 8, marginTop: 8, alignSelf: 'flex-start', borderWidth: 1, borderColor: 'rgba(251, 191, 36, 0.3)' },
@@ -432,9 +525,14 @@ const styles = StyleSheet.create({
   photoBox: { width: '48%', height: 110, backgroundColor: '#1E293B', borderRadius: 12, borderWidth: 1, borderColor: '#334155', borderStyle: 'dashed', justifyContent: 'center', alignItems: 'center', marginBottom: 12, overflow: 'hidden' },
   photoImg: { width: '100%', height: '100%' },
   photoHint: { color: '#64748B', fontSize: 12, marginTop: 4, textAlign: 'center' },
+  removeBtn: { position: 'absolute', top: 8, right: 8, backgroundColor: 'rgba(0,0,0,0.7)', width: 28, height: 28, borderRadius: 14, justifyContent: 'center', alignItems: 'center' },
+  removeBtnSmall: { position: 'absolute', top: 4, right: 4, backgroundColor: 'rgba(0,0,0,0.7)', width: 22, height: 22, borderRadius: 11, justifyContent: 'center', alignItems: 'center' },
+  removeBtnText: { color: '#fff', fontSize: 12, fontWeight: '800' },
   nextButton: { backgroundColor: '#F97316', height: 54, borderRadius: 14, justifyContent: 'center', alignItems: 'center', marginTop: 20 },
   nextButtonDisabled: { opacity: 0.6 },
   nextButtonText: { color: '#FFFFFF', fontWeight: '800', fontSize: 16 },
+  skipButton: { height: 44, justifyContent: 'center', alignItems: 'center', marginTop: 10 },
+  skipButtonText: { color: '#94A3B8', fontSize: 14, fontWeight: '600' },
   errorBanner: { backgroundColor: 'rgba(239,68,68,0.15)', padding: 12, borderRadius: 12, borderWidth: 1, borderColor: '#EF4444', marginTop: 16 },
   errorText: { color: '#FCA5A5', fontSize: 13, fontWeight: '600' },
 });

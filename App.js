@@ -51,17 +51,12 @@ const routeToPath = (name, params = {}) => {
   return path;
 };
 
-// FIX 3: Helper — does this user have a profiles row?
+// FIX 3 + OLD ACCOUNT FIX: Check profile, auto-create from metadata if old account
 const hasProfile = async (userId) => {
   if (!userId) return false;
   try {
-    const { data, error } = await supabase
-      .from('profiles')
-      .select('id')
-      .eq('id', userId)
-      .maybeSingle();
+    const { data, error } = await supabase.from('profiles').select('id').eq('id', userId).maybeSingle();
     if (error) {
-      // Table missing / RLS error -> treat as no profile, but don't crash boot
       console.warn('[App] hasProfile check failed:', error.message);
       return false;
     }
@@ -72,12 +67,50 @@ const hasProfile = async (userId) => {
   }
 };
 
+// For old accounts: no profiles row, but auth.users exists.
+// Build a minimal profile from user_metadata (or email) so old users are NOT forced through full onboarding.
+const ensureProfileForOldAccount = async (user) => {
+  if (!user?.id) return false;
+  if (await hasProfile(user.id)) return true;
+
+  const meta = user.user_metadata || {};
+  const emailName = user.email?.split('@')[0] || 'Intent User';
+  const fullName = meta.full_name || meta.name || emailName;
+  const ageNum = parseInt(meta.age, 10);
+  const safeAge = !isNaN(ageNum) && ageNum >= 18 && ageNum <= 100 ? ageNum : 25;
+
+  const profile = {
+    id: user.id,
+    email: user.email || null,
+    full_name: fullName,
+    age: safeAge,
+    city: meta.city || 'Accra',
+    country: meta.country || 'Ghana',
+    bio: meta.bio || '',
+    intent: meta.intent || 'Long-term Relationship 💍',
+    avatar_url: meta.avatar_url || meta.photo || null,
+    gender: meta.gender || 'Woman',
+    seeking: meta.seeking || 'Men',
+    photos: meta.photo || meta.avatar_url ? [meta.photo || meta.avatar_url] : [],
+  };
+
+  const { error } = await supabase.from('profiles').upsert(profile, { onConflict: 'id' });
+  if (error) {
+    console.warn('[App] auto-create profile failed:', error.message);
+    return false;
+  }
+  console.log('[App] auto-created profile for old account:', user.email);
+  return true;
+};
+
 export default function App() {
   const [isLoading, setIsLoading] = useState(true);
   const [session, setSession] = useState(null);
   const [stack, setStack] = useState([{ name: 'AuthPortal', params: {} }]);
   const isPoppingRef = useRef(false);
   const sessionRef = useRef(null);
+  const profileCacheRef = useRef({}); // userId -> true/false, avoids re-query on every Back
+  const justSignedUpRef = useRef(false); // true only for the 30s after a fresh signUp from AuthPortal
 
   const current = stack[stack.length - 1];
   const currentRoute = current.name;
@@ -85,6 +118,18 @@ export default function App() {
   useEffect(() => {
     sessionRef.current = session;
   }, [session]);
+
+  const getProfileExists = useCallback(async (user) => {
+    if (!user?.id) return false;
+    if (profileCacheRef.current[user.id] !== undefined) return profileCacheRef.current[user.id];
+    const exists = await hasProfile(user.id);
+    profileCacheRef.current[user.id] = exists;
+    return exists;
+  }, []);
+
+  const clearProfileCache = useCallback((userId) => {
+    if (userId) delete profileCacheRef.current[userId];
+  }, []);
 
   // --- Boot: read session + profile + initial URL once ---
   useEffect(() => {
@@ -104,28 +149,28 @@ export default function App() {
           }
         } catch {}
 
-        // No session -> protected routes bounce to Auth. Onboarding without session also bounces to Auth
-        // (except Demo Mode which is handled via in-app navigation, not URL reload)
         if (!sess) {
           if (initial && (PROTECTED_ROUTES.includes(initial.name) || initial.name === 'SignupOnboarding')) {
             initial = { name: 'AuthPortal', params: {} };
           }
           if (!initial) initial = { name: 'AuthPortal', params: {} };
         } else {
-          // Has session -> check profile
-          const profileExists = await hasProfile(sess.user.id);
+          // Has session -> OLD ACCOUNT FIX: auto-create profile if missing, don't force onboarding on refresh
+          const profileExists = await ensureProfileForOldAccount(sess.user);
+          profileCacheRef.current[sess.user.id] = profileExists;
           if (!mounted) return;
 
           if (!profileExists) {
-            // FIX 3: New user, no profile yet -> force Onboarding, even if URL says /discovery
-            // Exception: if user is on /auth and just signed up, still go to Onboarding
+            // Only if auto-create failed (e.g. RLS / table missing) -> onboarding
             initial = { name: 'SignupOnboarding', params: {} };
           } else {
-            // Returning user with profile
             if (!initial) initial = { name: 'Discovery', params: {} };
             if (initial.name === 'AuthPortal') initial = { name: 'Discovery', params: {} };
-            if (initial.name === 'SignupOnboarding') initial = { name: 'Discovery', params: {} };
-            // If initial is a protected route, keep it (e.g. deep link to /chats)
+            if (initial.name === 'SignupOnboarding') {
+              // Returning user with profile who lands on /onboarding via URL -> Discovery
+              // UNLESS they just signed up seconds ago (handled by justSignedUpRef in listener)
+              initial = { name: 'Discovery', params: {} };
+            }
           }
         }
 
@@ -144,32 +189,53 @@ export default function App() {
   }, []);
 
   // --- FIX 2 + FIX 3: Single source of truth for auth ---
-  // AuthPortal must NOT call navigation.reset() on sign-in.
-  // It should just call supabase.auth.signInWithPassword() and let this listener move us.
   useEffect(() => {
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, sess) => {
       if (event === 'SIGNED_IN' && sess) {
         setSession(sess);
         sessionRef.current = sess;
 
-        // FIX 3: Don't yank to Discovery if profile doesn't exist yet
-        const profileExists = await hasProfile(sess.user.id);
+        // Fresh signup from AuthPortal: AuthPortal sets justSignedUpRef via sessionStorage flag
+        // We check it so a brand-new user still goes to Onboarding, not auto-created Discovery
+        let isFreshSignup = false;
+        try {
+          if (typeof window !== 'undefined' && window.sessionStorage?.getItem('intent_fresh_signup') === '1') {
+            isFreshSignup = true;
+            window.sessionStorage.removeItem('intent_fresh_signup');
+          }
+        } catch {}
+        if (justSignedUpRef.current) {
+          isFreshSignup = true;
+          justSignedUpRef.current = false;
+        }
+
+        if (isFreshSignup) {
+          // Brand-new user -> MUST do onboarding, do NOT auto-create profile
+          profileCacheRef.current[sess.user.id] = false;
+          setStack((prev) => {
+            const topName = prev[prev.length - 1]?.name;
+            if (topName === 'SignupOnboarding') return prev;
+            if (topName === 'AuthPortal' || topName === 'SignupOnboarding') {
+              return [{ name: 'SignupOnboarding', params: {} }];
+            }
+            return prev;
+          });
+          return;
+        }
+
+        // Old / returning account -> ensure profile exists (auto-create if needed)
+        const profileExists = await ensureProfileForOldAccount(sess.user);
+        profileCacheRef.current[sess.user.id] = profileExists;
 
         setStack((prev) => {
           const top = prev[prev.length - 1];
           const topName = top?.name;
-
-          // Demo mode: no session normally, but if SIGNED_IN fires while in Demo, don't yank
           if (top?.params?.isDemo) return prev;
 
           if (!profileExists) {
-            // New signup -> must complete onboarding
-            if (topName === 'SignupOnboarding') return prev; // already there, stay
+            if (topName === 'SignupOnboarding') return prev;
             return [{ name: 'SignupOnboarding', params: {} }];
           }
-
-          // Profile exists -> only auto-move if still on Auth / Onboarding
-          // If user is already on Discovery/Profile/Chats, don't yank them
           if (topName === 'AuthPortal' || topName === 'SignupOnboarding') {
             return [{ name: 'Discovery', params: {} }];
           }
@@ -179,7 +245,16 @@ export default function App() {
       if (event === 'SIGNED_OUT') {
         setSession(null);
         sessionRef.current = null;
+        profileCacheRef.current = {};
+        justSignedUpRef.current = false;
         setStack([{ name: 'AuthPortal', params: {} }]);
+      }
+      if (event === 'SIGNED_UP') {
+        // Supabase fires SIGNED_UP before SIGNED_IN for new accounts - mark it
+        justSignedUpRef.current = true;
+        try {
+          if (typeof window !== 'undefined') window.sessionStorage?.setItem('intent_fresh_signup', '1');
+        } catch {}
       }
     });
     return () => subscription.unsubscribe();
@@ -188,23 +263,34 @@ export default function App() {
   // --- Browser Back / Forward ---
   useEffect(() => {
     if (typeof window === 'undefined') return;
-    const onPop = () => {
+    const onPop = async () => {
       const parsed = pathToRoute(window.location.pathname);
       if (!parsed) return;
 
-      // FIX: Logged-out user pressing Back to /profile or /discovery -> bounce to /auth
-      if (!sessionRef.current && PROTECTED_ROUTES.includes(parsed.name)) {
+      // Logged-out -> bounce to Auth
+      if (!sessionRef.current && (PROTECTED_ROUTES.includes(parsed.name) || parsed.name === 'SignupOnboarding')) {
         isPoppingRef.current = true;
         setStack([{ name: 'AuthPortal', params: {} }]);
         setTimeout(() => { isPoppingRef.current = false; }, 50);
         return;
       }
-      // Logged-out user pressing Back to /onboarding -> bounce to /auth
-      if (!sessionRef.current && parsed.name === 'SignupOnboarding') {
-        isPoppingRef.current = true;
-        setStack([{ name: 'AuthPortal', params: {} }]);
-        setTimeout(() => { isPoppingRef.current = false; }, 50);
-        return;
+
+      // Logged-in but no profile + trying to go to Discovery/etc via Back -> bounce to Onboarding
+      // (only for fresh signups - old accounts auto-create profile, so this rarely triggers)
+      if (sessionRef.current && parsed.name !== 'SignupOnboarding') {
+        const exists = profileCacheRef.current[sessionRef.current.user.id] ?? (await getProfileExists(sessionRef.current.user));
+        if (!exists) {
+          // Check if it's a fresh signup still in onboarding flow
+          const currentTop = stack[stack.length - 1]?.name;
+          if (currentTop === 'SignupOnboarding') {
+            isPoppingRef.current = true;
+            setStack([{ name: 'SignupOnboarding', params: {} }]);
+            // Push onboarding URL back so Back doesn't loop
+            try { window.history.pushState(null, '', '/onboarding'); } catch {}
+            setTimeout(() => { isPoppingRef.current = false; }, 50);
+            return;
+          }
+        }
       }
 
       isPoppingRef.current = true;
@@ -219,7 +305,7 @@ export default function App() {
     };
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
-  }, []);
+  }, [stack, getProfileExists]);
 
   // --- Keep URL in sync — skip push when change CAME from browser Back ---
   useEffect(() => {
@@ -235,6 +321,14 @@ export default function App() {
   }, [currentRoute, current.params, isLoading]);
 
   const navigate = useCallback((name, params = {}) => {
+    // Guard: don't let any screen navigate to protected route if no profile and not Demo / not Onboarding
+    if (PROTECTED_ROUTES.includes(name) && !params?.isDemo && sessionRef.current) {
+      const cached = profileCacheRef.current[sessionRef.current.user.id];
+      if (cached === false) {
+        setStack([{ name: 'SignupOnboarding', params: {} }]);
+        return;
+      }
+    }
     setStack((prev) => {
       const top = prev[prev.length - 1];
       if (top?.name === name && JSON.stringify(top?.params || {}) === JSON.stringify(params)) return prev;
@@ -243,9 +337,29 @@ export default function App() {
   }, []);
 
   const reset = useCallback((opts) => {
-    if (typeof opts === 'string') { setStack([{ name: opts, params: {} }]); return; }
+    if (typeof opts === 'string') {
+      // Guard reset('Discovery') when no profile
+      if (PROTECTED_ROUTES.includes(opts) && sessionRef.current) {
+        const cached = profileCacheRef.current[sessionRef.current.user.id];
+        if (cached === false) {
+          setStack([{ name: 'SignupOnboarding', params: {} }]);
+          return;
+        }
+      }
+      setStack([{ name: opts, params: {} }]);
+      return;
+    }
     const routes = opts?.routes || opts;
     if (Array.isArray(routes) && routes.length) {
+      // If resetting to Discovery but no profile -> Onboarding
+      const first = routes[0];
+      if (first && PROTECTED_ROUTES.includes(first.name) && !first.params?.isDemo && sessionRef.current) {
+        const cached = profileCacheRef.current[sessionRef.current.user.id];
+        if (cached === false) {
+          setStack([{ name: 'SignupOnboarding', params: {} }]);
+          return;
+        }
+      }
       setStack(routes.map((r) => ({ name: r.name, params: r.params || {} })));
     } else if (opts?.name) {
       setStack([{ name: opts.name, params: opts.params || {} }]);
@@ -253,6 +367,16 @@ export default function App() {
   }, []);
 
   const goBack = useCallback(() => {
+    // FIX: Onboarding Back must NOT go to Discovery via history.back()
+    // If current is Onboarding and no profile, stay. Onboarding screen handles its own Back UI.
+    const top = stack[stack.length - 1];
+    if (top?.name === 'SignupOnboarding') {
+      const cached = sessionRef.current ? profileCacheRef.current[sessionRef.current.user.id] : undefined;
+      if (cached === false) {
+        return; // block - Onboarding's own handleBack will show "Leave setup?" dialog
+      }
+      // If profile exists (old account editing), allow normal back to Discovery
+    }
     try {
       if (typeof window !== 'undefined' && window.history.length > 1) {
         window.history.back();
@@ -260,7 +384,7 @@ export default function App() {
       }
     } catch {}
     setStack((prev) => (prev.length <= 1 ? [{ name: 'Discovery', params: {} }] : prev.slice(0, -1)));
-  }, []);
+  }, [stack]);
 
   const canGoBack = useCallback(() => stack.length > 1, [stack.length]);
 
