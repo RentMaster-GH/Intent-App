@@ -314,8 +314,8 @@ export default function AuthPortalScreen({ navigation }) {
                 keyboardType="email-address"
                 autoCapitalize="none"
                 autoCorrect={false}
-                autoComplete="username"
-                textContentType="username"
+                autoComplete={authMode === 'signin' ? 'username' : 'off'}
+                textContentType={authMode === 'signin' ? 'username' : 'none'}
                 returnKeyType="next"
                 value={inputIdentifier}
                 onChangeText={v => { setInputIdentifier(v); setErrorMessage(''); }}
