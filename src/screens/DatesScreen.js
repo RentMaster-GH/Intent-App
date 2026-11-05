@@ -1,48 +1,48 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Image, ActivityIndicator, RefreshControl, Alert, Linking } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, ActivityIndicator, RefreshControl, Alert, Linking } from 'react-native';
+import { Image } from 'expo-image';
 import { supabase } from '../lib/supabase';
 
-export default function DatesScreen({ navigation, route }) {
-  const isDemo = route?.params?.isDemo === true;
+export default function DatesScreen({ navigation }) {
   const [dates, setDates] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
   const loadDates = useCallback(async () => {
     try {
-      if (isDemo) {
-        setDates([
-          { id: 'demo-1', name: 'Ama', status: 'Confirmed', venue: 'Delicious Coffee, Osu', when: 'Sat • 2:00 PM', img: 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80', intent: 'Long-term Relationship 💛', matchId: 'demo-1', otherUserId: 'demo-1' },
-          { id: 'demo-2', name: 'Kwame', status: 'Proposed', venue: 'Apex Cocktail Bar', when: 'Sun • 6:30 PM', img: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=400&auto=format&fit=crop&q=80', intent: 'Friendship First 🤝', matchId: 'demo-2', otherUserId: 'demo-2' },
-        ]);
-        setLoading(false); setRefreshing(false); return;
-      }
       const { data: { user } } = await supabase.auth.getUser();
-      if (!user) { setDates([]); setLoading(false); setRefreshing(false); return; }
+      if (!user) { setDates([]); return; }
 
       // dates table: proposer_id, invitee_id, match_id, venue, date_time, status
-      const { data, error } = await supabase.from('dates').select('*').or(`proposer_id.eq.${user.id},invitee_id.eq.${user.id}`).order('date_time', { ascending: true });
+      const { data, error } = await supabase.from('dates')
+        .select('*')
+        .or(`proposer_id.eq.${user.id},invitee_id.eq.${user.id}`)
+        .neq('status', 'cancelled')
+        .order('date_time', { ascending: true });
+
       if (error) {
-        // Table doesn't exist yet -> show empty, don't crash
-        if (error.message?.includes('does not exist') || error.code === '42P01') { setDates([]); setLoading(false); setRefreshing(false); return; }
+        if (error.message?.includes('does not exist') || error.code === '42P01') { setDates([]); return; }
         throw error;
       }
-      if (!data?.length) { setDates([]); setLoading(false); setRefreshing(false); return; }
+      if (!data?.length) { setDates([]); return; }
 
-      const otherIds = data.map((d) => (d.proposer_id === user.id ? d.invitee_id : d.proposer_id));
-      const { data: profiles } = await supabase.from('profiles').select('*').in('id', otherIds);
+      const otherIds = [...new Set(data.map((d) => (d.proposer_id === user.id ? d.invitee_id : d.proposer_id)))];
+      const { data: profiles } = await supabase.from('profiles')
+        .select('id, name, intent, photos, photo_url')
+        .in('id', otherIds);
       const byId = {}; (profiles || []).forEach((p) => { byId[p.id] = p; });
 
       setDates(data.map((d) => {
         const otherId = d.proposer_id === user.id ? d.invitee_id : d.proposer_id;
         const p = byId[otherId] || {};
+        const photo = Array.isArray(p.photos) && p.photos[0] ? p.photos[0] : p.photo_url || null;
         return {
           id: d.id, matchId: d.match_id, otherUserId: otherId,
-          name: p.full_name || 'Intent User',
+          name: p.name || 'Matched User',
           status: d.status || 'Proposed',
           venue: d.venue || d.location || 'TBD',
           when: d.date_time ? new Date(d.date_time).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' }) : 'TBD',
-          img: p.avatar_url || 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80',
+          img: photo,
           intent: p.intent || '',
           isMine: d.proposer_id === user.id,
         };
@@ -51,7 +51,7 @@ export default function DatesScreen({ navigation, route }) {
       console.error('[Dates] load failed:', e);
       setDates([]);
     } finally { setLoading(false); setRefreshing(false); }
-  }, [isDemo]);
+  }, []);
 
   useEffect(() => { loadDates(); }, [loadDates]);
 
@@ -79,16 +79,24 @@ export default function DatesScreen({ navigation, route }) {
     <ScrollView style={styles.wrap} contentContainerStyle={styles.c} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={() => { setRefreshing(true); loadDates(); }} tintColor="#F97316" />}>
       <View style={styles.header}><Text style={styles.title}>DATES</Text><TouchableOpacity style={styles.topBtn} onPress={() => navigation.navigate('ActiveChats')}><Text style={styles.topBtnText}>Chats</Text></TouchableOpacity></View>
       <Text style={styles.sub}>Global • 3 max chats only</Text>
-      <View style={styles.countBox}><Text style={styles.countTitle}>{dates.length} Dates Planned</Text><Text style={styles.countSub}>Meet IRL • Set 12:00 PM</Text></View>
+
+      {/* FIX: Only show count banner when there ARE dates. Never "0 Dates Planned" + "No dates yet" together. */}
+      {dates.length > 0 && (
+        <View style={styles.countBox}><Text style={styles.countTitle}>{dates.length} {dates.length === 1 ? 'Date' : 'Dates'} Planned</Text><Text style={styles.countSub}>Meet IRL • Confirm time with your match</Text></View>
+      )}
 
       {dates.length === 0 ? (
         <View style={styles.emptyCard}><Text style={styles.emptyEmoji}>🥂</Text><Text style={styles.emptyTitle}>No dates yet</Text><Text style={styles.emptySub}>Go to a chat and propose a date. When they confirm, it appears here.</Text><TouchableOpacity style={styles.emptyBtn} onPress={() => navigation.navigate('ActiveChats')}><Text style={styles.emptyBtnText}>Go to Chats →</Text></TouchableOpacity></View>
       ) : dates.map((d) => (
         <View key={d.id} style={styles.card}>
-          <Image source={{ uri: d.img }} style={styles.avatar} />
+          {d.img ? (
+            <Image source={{ uri: d.img }} style={styles.avatar} contentFit="cover" />
+          ) : (
+            <View style={[styles.avatar, styles.avatarPlaceholder]}><Text style={styles.avatarLetter}>{d.name ? d.name[0].toUpperCase() : '?'}</Text></View>
+          )}
           <View style={{ flex: 1 }}>
             <Text style={styles.name}>{d.name} • {d.status}</Text>
-            <Text style={styles.intent}>{d.intent}</Text>
+            {d.intent ? <Text style={styles.intent}>{d.intent}</Text> : null}
             <Text style={styles.venue}>{d.venue} • {d.when}</Text>
             <View style={styles.btnRow}>
               <TouchableOpacity style={styles.smallBtn} onPress={() => handleMaps(d.venue)}><Text style={styles.smallBtnText}>Maps</Text></TouchableOpacity>
@@ -118,6 +126,8 @@ const styles = StyleSheet.create({
   countBox: { backgroundColor: '#14532D', borderRadius: 16, padding: 14, marginBottom: 16 }, countTitle: { color: '#fff', fontWeight: '800', fontSize: 15 }, countSub: { color: '#BBF7D0', fontSize: 12, marginTop: 2 },
   card: { flexDirection: 'row', backgroundColor: '#1E293B', borderRadius: 16, padding: 12, borderWidth: 1, borderColor: '#334155', marginBottom: 12, gap: 12 },
   avatar: { width: 56, height: 56, borderRadius: 28, backgroundColor: '#0F172A' },
+  avatarPlaceholder: { backgroundColor: '#334155', justifyContent: 'center', alignItems: 'center' },
+  avatarLetter: { color: '#FBBF24', fontSize: 22, fontWeight: '800' },
   name: { color: '#FFF', fontWeight: '800', fontSize: 16 }, intent: { color: '#FBBF24', fontSize: 11, marginTop: 2 }, venue: { color: '#CBD5E1', fontSize: 13, marginTop: 4 },
   btnRow: { flexDirection: 'row', gap: 8, marginTop: 10, flexWrap: 'wrap' },
   smallBtn: { backgroundColor: '#0F172A', borderWidth: 1, borderColor: '#334155', borderRadius: 10, paddingHorizontal: 12, paddingVertical: 7 }, smallBtnText: { color: '#FBBF24', fontSize: 12, fontWeight: '700' },
