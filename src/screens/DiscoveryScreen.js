@@ -1,45 +1,36 @@
-import React, { useState, useEffect, useCallback, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Image, Alert, ActivityIndicator, RefreshControl } from 'react-native';
-import { supabase, MOCK_PROFILES } from '../lib/supabase';
+import { supabase } from '../lib/supabase';
 
-// Fallback demo people (your original 3) — used ONLY in Demo Mode or when profiles table is empty
-const DEMO_PEOPLE = [
-  { id: 'demo-1', name: 'Ama', age: 27, location: 'Accra, Ghana', city: 'Accra', country: 'Ghana', intent: 'Long-term Relationship 💛', bio: 'Intentional. Coffee lover. Looking for something real.', img: 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80' },
-  { id: 'demo-2', name: 'Kwame', age: 29, location: 'Accra, Ghana', city: 'Accra', country: 'Ghana', intent: 'Friendship First 🤝', bio: 'Gym, Afrobeats, and good conversation.', img: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=400&auto=format&fit=crop&q=80' },
-  { id: 'demo-3', name: 'Efua', age: 26, location: 'Kumasi, Ghana', city: 'Kumasi', country: 'Ghana', intent: 'Marriage Minded 💍', bio: 'Faith, family, and building something lasting.', img: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=400&auto=format&fit=crop&q=80' },
+// Production: Demo preview data is ONLY for isDemo=true. Never used for logged-in users.
+// No MOCK_PROFILES import. No fallback to mocks on error / empty table.
+const DEMO_PREVIEW = [
+  { id: 'demo-1', name: 'Ama', age: 27, location: 'Accra, Ghana', city: 'Accra', country: 'Ghana', intent: 'Long-term Relationship 💛', bio: 'Intentional. Coffee lover. Looking for something real.', img: 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80', isDemo: true },
+  { id: 'demo-2', name: 'Kwame', age: 29, location: 'Accra, Ghana', city: 'Accra', country: 'Ghana', intent: 'Friendship First 🤝', bio: 'Gym, Afrobeats, and good conversation.', img: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=400&auto=format&fit=crop&q=80', isDemo: true },
+  { id: 'demo-3', name: 'Efua', age: 26, location: 'Kumasi, Ghana', city: 'Kumasi', country: 'Ghana', intent: 'Marriage Minded 💍', bio: 'Faith, family, and building something lasting.', img: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=400&auto=format&fit=crop&q=80', isDemo: true },
 ];
 
 const CITY_FILTERS = ['All', 'Accra', 'Kumasi', 'Lagos', 'Tema'];
-const INTENT_FILTERS = ['All Intents', 'Long-term Relationship 💍', 'Marriage Minded 💍', 'Friendship First 🤝'];
+const INTENT_FILTERS = ['All Intents', 'Long-term Relationship 💛', 'Marriage Minded 💍', 'Friendship First 🤝'];
 
-const normalizeDbProfile = (p) => ({
+const PLACEHOLDER_IMG = 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80';
+
+// Production: No invented defaults. If a profile has no age / city / bio, we show it as-is or hide the field.
+// Never default to 25 / Accra.
+const normalizeProfile = (p) => ({
   id: p.id,
-  name: p.full_name || p.name || 'Intent User',
-  age: p.age || 25,
-  city: p.city || 'Accra',
-  country: p.country || 'Ghana',
-  location: [p.city, p.country].filter(Boolean).join(', ') || 'Accra, Ghana',
-  intent: p.intent || 'Long-term Relationship 💍',
-  bio: p.bio || 'Looking for something real.',
-  img: p.avatar_url || p.photos?.[0] || 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80',
-  photos: p.photos?.length ? p.photos : p.avatar_url ? [p.avatar_url] : [],
-  gender: p.gender,
-  seeking: p.seeking,
+  name: p.full_name || null,
+  age: p.age ?? null,
+  city: p.city || null,
+  country: p.country || null,
+  location: [p.city, p.country].filter(Boolean).join(', ') || null,
+  intent: p.intent || null,
+  bio: p.bio || '',
+  img: p.avatar_url || (Array.isArray(p.photos) && p.photos[0]) || null,
+  photos: Array.isArray(p.photos) ? p.photos : p.avatar_url ? [p.avatar_url] : [],
+  gender: p.gender || null,
+  seeking: p.seeking || null,
   isDemo: false,
-});
-
-const normalizeMockProfile = (p) => ({
-  id: p.id,
-  name: p.name || p.full_name || 'Intent User',
-  age: p.age || 25,
-  city: p.city || 'Accra',
-  country: p.country || 'Ghana',
-  location: p.location || [p.city, p.country].filter(Boolean).join(', ') || 'Accra, Ghana',
-  intent: p.intent || 'Long-term Relationship 💍',
-  bio: p.bio || 'Looking for something real.',
-  img: p.avatar_url || p.photo || p.photos?.[0] || 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80',
-  photos: p.photos || [],
-  isDemo: true,
 });
 
 export default function DiscoveryScreen({ navigation, route }) {
@@ -49,61 +40,88 @@ export default function DiscoveryScreen({ navigation, route }) {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [myId, setMyId] = useState(null);
+  const [myProfile, setMyProfile] = useState(null);
   const [likedIds, setLikedIds] = useState(new Set());
+  const [passedIds, setPassedIds] = useState(new Set());
+  const [matchedIds, setMatchedIds] = useState(new Set());
+  const [matchIdByUser, setMatchIdByUser] = useState({});
   const [liking, setLiking] = useState(false);
   const [cityFilter, setCityFilter] = useState('All');
   const [intentFilter, setIntentFilter] = useState('All Intents');
   const [loadError, setLoadError] = useState('');
+  const mountedRef = useRef(true);
+
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
 
   const loadPeople = useCallback(async () => {
     setLoadError('');
     try {
       if (isDemo) {
-        setPeople(DEMO_PEOPLE);
+        setPeople(DEMO_PREVIEW);
         setMyId('demo-user');
-        setLoading(false);
-        setRefreshing(false);
+        setLoading(false); setRefreshing(false);
         return;
       }
 
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) {
-        // No session but not demo -> use mocks so screen doesn't crash, App.js will redirect to Auth on refresh
-        setPeople(DEMO_PEOPLE.map((p) => ({ ...p, isDemo: true })));
-        setLoading(false);
-        setRefreshing(false);
+        // Production: No session -> no fake people. App.js should bounce to Auth, but don't invent data.
+        setPeople([]);
+        setMyId(null);
+        setLoading(false); setRefreshing(false);
         return;
       }
       setMyId(user.id);
 
-      // Fetch my likes so we don't show people I already liked
-      const { data: myLikes } = await supabase.from('likes').select('liked_id').eq('liker_id', user.id);
-      const alreadyLiked = new Set((myLikes || []).map((l) => l.liked_id));
+      // My profile — needed for gender/seeking filter. If no profile, App.js should have sent to Onboarding.
+      const { data: me } = await supabase.from('profiles').select('*').eq('id', user.id).maybeSingle();
+      if (me) setMyProfile(normalizeProfile(me));
+
+      // My likes (to exclude) + my matches (to exclude from deck — already matched)
+      const [likesRes, matchesRes] = await Promise.all([
+        supabase.from('likes').select('liked_id').eq('liker_id', user.id),
+        supabase.from('matches').select('id, user_a, user_b').or(`user_a.eq.${user.id},user_b.eq.${user.id}`),
+      ]);
+      const alreadyLiked = new Set((likesRes.data || []).map((l) => l.liked_id));
       setLikedIds(alreadyLiked);
 
-      // Fetch all profiles except me
+      const matched = new Set();
+      const matchMap = {};
+      (matchesRes.data || []).forEach((m) => {
+        const other = m.user_a === user.id ? m.user_b : m.user_a;
+        matched.add(other);
+        matchMap[other] = m.id;
+      });
+      setMatchedIds(matched);
+      setMatchIdByUser(matchMap);
+
+      // Real profiles only. No mock fallback.
       const { data, error } = await supabase.from('profiles').select('*').neq('id', user.id).order('created_at', { ascending: false }).limit(50);
       if (error) throw error;
 
-      if (!data || data.length === 0) {
-        // Table empty -> show MOCK_PROFILES from supabase.js so Discovery still looks full
-        // These are demo profiles, marked isDemo so Like/Chat will prompt to sign up properly
-        const mocks = (MOCK_PROFILES || []).map(normalizeMockProfile);
-        setPeople(mocks);
-      } else {
-        const real = data.map(normalizeDbProfile).filter((p) => !alreadyLiked.has(p.id));
-        // If all real people already liked, still show empty state (don't fall back to mocks)
-        setPeople(real);
-      }
+      // Production filter: exclude liked + matched. Do NOT invent age/city.
+      // Only show profiles with at least a name + photo + intent — otherwise card is empty.
+      const real = (data || [])
+        .map(normalizeProfile)
+        .filter((p) => p.id && p.name && p.img)
+        .filter((p) => !alreadyLiked.has(p.id) && !matched.has(p.id))
+        // Optional: respect seeking if both set — e.g. Woman seeking Man should not see Women
+        .filter((p) => {
+          if (!me?.seeking || !p.gender) return true;
+          if (me.seeking === 'Everyone') return true;
+          return p.gender === me.seeking;
+        });
+
+      if (!mountedRef.current) return;
+      setPeople(real);
       setIndex(0);
     } catch (e) {
-      console.error('[Discovery] load failed:', e);
-      setLoadError(e.message || 'Could not load people.');
-      // Fallback to mocks so UI never blank
-      setPeople(DEMO_PEOPLE);
+      if (!mountedRef.current) return;
+      // Production: On error, show empty + error, NEVER fake people
+      setPeople([]);
+      setLoadError('Could not load people. Check your connection and pull to refresh.');
     } finally {
-      setLoading(false);
-      setRefreshing(false);
+      if (mountedRef.current) { setLoading(false); setRefreshing(false); }
     }
   }, [isDemo]);
 
@@ -115,13 +133,11 @@ export default function DiscoveryScreen({ navigation, route }) {
     loadPeople();
   }, [loadPeople]);
 
-  // Apply filters
   const filtered = useMemo(() => {
     return people.filter((p) => {
       if (cityFilter !== 'All' && p.city !== cityFilter) return false;
-      if (intentFilter !== 'All Intents' && !p.intent?.includes(intentFilter.split(' ')[0])) {
-        // Loose match: "Long-term" vs "Long-term Relationship 💍"
-        if (intentFilter === 'Long-term Relationship 💍' && !p.intent?.includes('Long-term')) return false;
+      if (intentFilter !== 'All Intents') {
+        if (intentFilter === 'Long-term Relationship 💛' && !p.intent?.includes('Long-term')) return false;
         if (intentFilter === 'Marriage Minded 💍' && !p.intent?.includes('Marriage')) return false;
         if (intentFilter === 'Friendship First 🤝' && !p.intent?.includes('Friendship')) return false;
       }
@@ -129,115 +145,76 @@ export default function DiscoveryScreen({ navigation, route }) {
     });
   }, [people, cityFilter, intentFilter]);
 
-  const person = filtered[index % (filtered.length || 1)];
-
-  const findOrCreateMatch = async (otherId) => {
-    if (!myId || myId === 'demo-user') return null;
-    const [a, b] = myId < otherId ? [myId, otherId] : [otherId, myId];
-    // Find existing match (either direction)
-    const { data: existing } = await supabase
-      .from('matches')
-      .select('*')
-      .or(`and(user_a.eq.${myId},user_b.eq.${otherId}),and(user_a.eq.${otherId},user_b.eq.${myId})`)
-      .maybeSingle();
-    if (existing) return existing;
-
-    const { data: created, error } = await supabase
-      .from('matches')
-      .insert({ user_a: a, user_b: b })
-      .select()
-      .single();
-    if (error) throw error;
-    return created;
-  };
+  const person = filtered[index];
 
   const handlePass = () => {
+    if (!person) return;
+    setPassedIds((prev) => new Set(prev).add(person.id));
     setIndex((i) => i + 1);
   };
 
   const handleLike = async () => {
     if (!person || liking) return;
     if (isDemo || person.isDemo || !myId || myId === 'demo-user') {
-      Alert.alert('Demo Mode', 'Create a free account to like real people and start real chats.', [
-        { text: 'Stay in Demo', style: 'cancel' },
+      Alert.alert('Preview Mode', 'This is a preview. Create a free account to like real people.', [
+        { text: 'Stay in Preview', style: 'cancel' },
         { text: 'Create Account', onPress: () => navigation.reset({ index: 0, routes: [{ name: 'AuthPortal', params: {} }] }) },
       ]);
       return;
     }
     setLiking(true);
     try {
-      // 1. Insert like
       const { error: likeError } = await supabase.from('likes').insert({ liker_id: myId, liked_id: person.id });
-      if (likeError && !likeError.message?.includes('duplicate')) throw likeError;
-
+      // 23505 = duplicate like — treat as success, don't crash
+      if (likeError && likeError.code !== '23505') throw likeError;
       setLikedIds((prev) => new Set(prev).add(person.id));
 
-      // 2. Check mutual: did they already like me?
-      const { data: mutual } = await supabase
-        .from('likes')
-        .select('id')
-        .eq('liker_id', person.id)
-        .eq('liked_id', myId)
-        .maybeSingle();
-
+      const { data: mutual } = await supabase.from('likes').select('id').eq('liker_id', person.id).eq('liked_id', myId).maybeSingle();
       if (mutual) {
-        // 3. Mutual -> create match
-        const match = await findOrCreateMatch(person.id);
-        Alert.alert(
-          "It's a Match! 💛",
-          `You and ${person.name} liked each other. Start chatting?`,
-          [
-            { text: 'Keep Browsing', style: 'cancel', onPress: () => setIndex((i) => i + 1) },
-            {
-              text: 'Start Chat 💬',
-              onPress: () =>
-                navigation.navigate('ChatDetail', {
-                  id: match?.id || person.id,
-                  matchId: match?.id,
-                  name: person.name,
-                  avatar: person.img,
-                  img: person.img,
-                  intent: person.intent,
-                  location: person.location,
-                  otherUserId: person.id,
-                }),
-            },
-          ]
-        );
+        // Mutual only — create match
+        const [a, b] = myId < person.id ? [myId, person.id] : [person.id, myId];
+        const { data: existing } = await supabase.from('matches').select('*').or(`and(user_a.eq.${myId},user_b.eq.${person.id}),and(user_a.eq.${person.id},user_b.eq.${myId})`).maybeSingle();
+        let match = existing;
+        if (!match) {
+          const { data: created, error: matchError } = await supabase.from('matches').insert({ user_a: a, user_b: b }).select().single();
+          if (matchError) throw matchError;
+          match = created;
+        }
+        setMatchedIds((prev) => new Set(prev).add(person.id));
+        setMatchIdByUser((prev) => ({ ...prev, [person.id]: match.id }));
+        Alert.alert("It's a Match! 💛", `You and ${person.name} liked each other.`, [
+          { text: 'Keep Browsing', style: 'cancel', onPress: () => setIndex((i) => i + 1) },
+          { text: 'Start Chat 💬', onPress: () => navigation.navigate('ChatDetail', { id: match.id, matchId: match.id, name: person.name, avatar: person.img, img: person.img, intent: person.intent, location: person.location, otherUserId: person.id }) },
+        ]);
       } else {
-        Alert.alert('Liked 💛', `You liked ${person.name}. If they like you back, you'll match!`);
         setIndex((i) => i + 1);
       }
     } catch (e) {
-      console.error('[Discovery] like failed:', e);
-      Alert.alert('Could not like', e.message || 'Check internet and try again.');
+      Alert.alert('Could not like', 'Please try again.');
     } finally {
       setLiking(false);
     }
   };
 
-  const handleStartChat = async () => {
+  // Production: Start Chat ONLY if already matched. No unilateral match creation.
+  const handleStartChat = () => {
     if (!person) return;
-    if (isDemo || person.isDemo || !myId || myId === 'demo-user') {
-      // Demo: keep old behaviour - navigate with fake data so ChatDetail still shows
-      navigation.navigate('ChatDetail', { id: person.id, name: person.name, avatar: person.img, img: person.img, intent: person.intent, location: person.location });
+    if (isDemo || person.isDemo) {
+      Alert.alert('Preview Mode', 'Create a free account to chat with real people.', [
+        { text: 'Stay in Preview', style: 'cancel' },
+        { text: 'Create Account', onPress: () => navigation.reset({ index: 0, routes: [{ name: 'AuthPortal', params: {} }] }) },
+      ]);
       return;
     }
-    try {
-      const match = await findOrCreateMatch(person.id);
-      navigation.navigate('ChatDetail', {
-        id: match?.id || person.id,
-        matchId: match?.id,
-        name: person.name,
-        avatar: person.img,
-        img: person.img,
-        intent: person.intent,
-        location: person.location,
-        otherUserId: person.id,
-      });
-    } catch (e) {
-      Alert.alert('Could not start chat', e.message || 'Try again.');
+    const existingMatchId = matchIdByUser[person.id];
+    if (!existingMatchId) {
+      Alert.alert('Like first 💛', `Like ${person.name} to unlock chat. If they like you back, you'll match and can chat.`, [
+        { text: 'OK', style: 'cancel' },
+        { text: 'Like Now', onPress: handleLike },
+      ]);
+      return;
     }
+    navigation.navigate('ChatDetail', { id: existingMatchId, matchId: existingMatchId, name: person.name, avatar: person.img, img: person.img, intent: person.intent, location: person.location, otherUserId: person.id });
   };
 
   if (loading) {
@@ -257,17 +234,24 @@ export default function DiscoveryScreen({ navigation, route }) {
           <TouchableOpacity style={styles.profileBtn} onPress={() => navigation.navigate('Profile')}><Text style={styles.profileBtnText}>👤 Profile</Text></TouchableOpacity>
         </View>
         <Text style={styles.title}>Discovery</Text>
-        <Text style={styles.sub}>People near you — max 3 active chats worldwide.</Text>
+        <Text style={styles.sub}>People near you — max 3 active chats worldwide.{isDemo ? ' Preview Mode' : ''}</Text>
         <View style={styles.emptyCard}>
           <Text style={styles.emptyEmoji}>🔍</Text>
-          <Text style={styles.emptyTitle}>No more people nearby</Text>
+          <Text style={styles.emptyTitle}>{loadError ? 'Could not load people' : people.length === 0 ? 'No one nearby yet' : 'No more people nearby'}</Text>
           <Text style={styles.emptySub}>
-            {loadError ? loadError : 'You have seen everyone matching your filters. Try clearing filters or pull to refresh.'}
+            {loadError || (people.length === 0
+              ? 'Be the first in your area. Share Intent with friends — new profiles appear here as they join.'
+              : 'You have seen everyone matching your filters. Try clearing filters or pull to refresh.')}
           </Text>
           <TouchableOpacity style={styles.refreshBtn} onPress={onRefresh}><Text style={styles.btnText}>↻ Refresh</Text></TouchableOpacity>
           <TouchableOpacity style={styles.clearBtn} onPress={() => { setCityFilter('All'); setIntentFilter('All Intents'); setIndex(0); }}>
             <Text style={styles.clearBtnText}>Clear Filters</Text>
           </TouchableOpacity>
+          {isDemo ? (
+            <TouchableOpacity style={styles.clearBtn} onPress={() => navigation.reset({ index: 0, routes: [{ name: 'AuthPortal', params: {} }] })}>
+              <Text style={styles.clearBtnText}>Create Free Account →</Text>
+            </TouchableOpacity>
+          ) : null}
         </View>
         <View style={styles.footer}>
           <TouchableOpacity onPress={() => navigation.navigate('ActiveChats')}><Text style={styles.link}>Chats →</Text></TouchableOpacity>
@@ -278,6 +262,8 @@ export default function DiscoveryScreen({ navigation, route }) {
     );
   }
 
+  const isMatched = matchedIds.has(person.id);
+
   return (
     <ScrollView style={styles.wrap} contentContainerStyle={styles.c} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#F97316" />}>
       <View style={styles.header}>
@@ -286,11 +272,9 @@ export default function DiscoveryScreen({ navigation, route }) {
       </View>
 
       <Text style={styles.title}>Discovery</Text>
-      <Text style={styles.sub}>People near you — max 3 active chats worldwide. {isDemo ? '(Demo Mode)' : ''}</Text>
-
+      <Text style={styles.sub}>People near you — max 3 active chats worldwide.{isDemo ? ' Preview Mode' : ''}</Text>
       {loadError ? <Text style={styles.errorText}>⚠️ {loadError}</Text> : null}
 
-      {/* Filters */}
       <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.filterRow}>
         {CITY_FILTERS.map((c) => (
           <TouchableOpacity key={c} style={[styles.filterChip, cityFilter === c && styles.filterChipActive]} onPress={() => { setCityFilter(c); setIndex(0); }}>
@@ -307,12 +291,12 @@ export default function DiscoveryScreen({ navigation, route }) {
       </ScrollView>
 
       <View style={styles.card}>
-        <Image source={{ uri: person.img }} style={styles.img} />
-        <Text style={styles.name}>{person.name}, {person.age} ✓</Text>
-        <Text style={styles.intent}>{person.intent}</Text>
-        <Text style={styles.meta}>{person.location}</Text>
-        <Text style={styles.bio}>{person.bio}</Text>
-        <Text style={styles.counter}>{filtered.length ? `${(index % filtered.length) + 1} of ${filtered.length}` : ''}</Text>
+        <Image source={{ uri: person.img || PLACEHOLDER_IMG }} style={styles.img} />
+        <Text style={styles.name}>{person.name}{person.age ? `, ${person.age}` : ''} ✓</Text>
+        {person.intent ? <Text style={styles.intent}>{person.intent}</Text> : null}
+        {person.location ? <Text style={styles.meta}>{person.location}</Text> : null}
+        {person.bio ? <Text style={styles.bio}>{person.bio}</Text> : null}
+        <Text style={styles.counter}>{`${index + 1} of ${filtered.length}`}</Text>
 
         <View style={styles.actions}>
           <TouchableOpacity style={[styles.btn, styles.pass]} onPress={handlePass}><Text style={styles.btnText}>✕ Pass</Text></TouchableOpacity>
@@ -320,9 +304,10 @@ export default function DiscoveryScreen({ navigation, route }) {
             {liking ? <ActivityIndicator color="#fff" /> : <Text style={styles.btnText}>♥ Like</Text>}
           </TouchableOpacity>
         </View>
-        <TouchableOpacity style={styles.chatBtn} onPress={handleStartChat}>
-          <Text style={styles.chatText}>💬 Start Chat →</Text>
+        <TouchableOpacity style={[styles.chatBtn, !isMatched && !isDemo && styles.chatBtnLocked]} onPress={handleStartChat}>
+          <Text style={styles.chatText}>{isMatched ? '💬 Start Chat →' : '💬 Like to Unlock Chat'}</Text>
         </TouchableOpacity>
+        {!isMatched && !isDemo ? <Text style={styles.lockHint}>Chat unlocks only after a mutual Like.</Text> : null}
       </View>
 
       <View style={styles.footer}>
@@ -366,7 +351,9 @@ const styles = StyleSheet.create({
   btnDisabled: { opacity: 0.6 },
   btnText: { color: '#FFF', fontWeight: '800' },
   chatBtn: { backgroundColor: '#0F172A', height: 48, borderRadius: 12, justifyContent: 'center', alignItems: 'center', marginTop: 10, borderWidth: 1, borderColor: '#334155' },
+  chatBtnLocked: { opacity: 0.7 },
   chatText: { color: '#FBBF24', fontWeight: '800' },
+  lockHint: { color: '#64748B', fontSize: 11, textAlign: 'center', marginTop: 6 },
   footer: { flexDirection: 'row', gap: 24, marginTop: 20, flexWrap: 'wrap' },
   link: { color: '#FBBF24', fontWeight: '700' },
   emptyCard: { width: '100%', backgroundColor: '#1E293B', borderRadius: 20, padding: 24, borderWidth: 1, borderColor: '#334155', alignItems: 'center', marginTop: 8 },
