@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { StyleSheet, Text, View, TextInput, TouchableOpacity, KeyboardAvoidingView, Platform, Modal, FlatList, SafeAreaView, ScrollView, ActivityIndicator } from 'react-native';
 import { COUNTRIES } from '../data/countries';
 import { supabase } from '../lib/supabase';
@@ -19,7 +19,6 @@ const clearFreshSignupFlag = () => {
   try { if (typeof window !== 'undefined') window.sessionStorage?.removeItem(FRESH_SIGNUP_KEY); } catch {}
 };
 
-// Production: extract email anywhere in string — fixes "+233 violetakaayye@gmail.com", pasted junk, trailing spaces
 const extractEmail = (raw) => {
   if (!raw) return null;
   const m = String(raw).match(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/);
@@ -28,7 +27,6 @@ const extractEmail = (raw) => {
 
 const isValidEmail = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(email || '');
 
-// Production: never leak raw Supabase / DB errors to users
 const mapAuthError = (err) => {
   const msg = err?.message || 'Auth failed';
   const lower = msg.toLowerCase();
@@ -81,6 +79,46 @@ const getPasswordStrength = (pw) => {
   return { label: 'Strong', color: '#22C55E' };
 };
 
+// Production web: Chrome ignores RN autoComplete="off" on password fields.
+// This DOM-level killer runs on every render + via MutationObserver.
+const killChromeAutofill = () => {
+  if (typeof document === 'undefined') return;
+  try {
+    document.querySelectorAll('form').forEach((f) => f.setAttribute('autocomplete', 'off'));
+    // Decoy inputs to absorb Chrome's autofill — Chrome fills the first username/password it finds
+    if (!document.getElementById('intent-decoy')) {
+      const decoy = document.createElement('div');
+      decoy.id = 'intent-decoy';
+      decoy.setAttribute('aria-hidden', 'true');
+      decoy.style.cssText = 'position:absolute;opacity:0;height:0;width:0;overflow:hidden;pointer-events:none;';
+      decoy.innerHTML = '<input type="text" name="username" autocomplete="username" tabindex="-1" /><input type="password" name="password" autocomplete="current-password" tabindex="-1" />';
+      document.body.appendChild(decoy);
+    }
+    // Real password fields: random name + readonly-until-focus + new-password
+    document.querySelectorAll('input[type="password"]').forEach((el) => {
+      // Skip decoy
+      if (el.closest('#intent-decoy')) return;
+      el.setAttribute('autocomplete', 'new-password');
+      // Random name each time so Chrome can't match to saved login for this origin
+      if (!el.dataset.intentProtected) {
+        el.dataset.intentProtected = '1';
+        el.setAttribute('name', `intent-pw-${Math.random().toString(36).slice(2, 10)}`);
+        el.setAttribute('readonly', 'true');
+        el.addEventListener('focus', () => { try { el.removeAttribute('readonly'); } catch {} }, { once: false });
+        el.addEventListener('click', () => { try { el.removeAttribute('readonly'); } catch {} }, { once: false });
+      }
+      // If Chrome re-adds readonly or autocomplete, force again
+      el.setAttribute('data-lpignore', 'true');
+      el.setAttribute('data-1p-ignore', 'true');
+    });
+    // Email field: keep as username so Chrome doesn't treat it as login email + password pair
+    document.querySelectorAll('input[type="email"], input[inputmode="email"]').forEach((el) => {
+      if (el.closest('#intent-decoy')) return;
+      el.setAttribute('autocomplete', 'username');
+    });
+  } catch {}
+};
+
 export default function AuthPortalScreen({ navigation }) {
   const [authMode, setAuthMode] = useState('signin');
   const [inputIdentifier, setInputIdentifier] = useState('');
@@ -126,6 +164,8 @@ export default function AuthPortalScreen({ navigation }) {
   const [otpPhone, setOtpPhone] = useState('');
   const [otpVerifying, setOtpVerifying] = useState(false);
   const [resendCooldown, setResendCooldown] = useState(0);
+  const passwordRef = useRef(null);
+  const confirmRef = useRef(null);
 
   useEffect(() => {
     if (Platform.OS === 'web' && typeof document !== 'undefined') {
@@ -140,6 +180,19 @@ export default function AuthPortalScreen({ navigation }) {
     clearFreshSignupFlag();
   }, []);
 
+  // Chrome autofill killer — runs on mount + every state change + via observer
+  useEffect(() => {
+    if (Platform.OS !== 'web' || typeof document === 'undefined') return;
+    killChromeAutofill();
+    const interval = setInterval(killChromeAutofill, 500);
+    let observer = null;
+    try {
+      observer = new MutationObserver(() => killChromeAutofill());
+      observer.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['autocomplete', 'name'] });
+    } catch {}
+    return () => { clearInterval(interval); try { observer?.disconnect(); } catch {} };
+  }, [authMode, modalVisible, forgotModalVisible, otpModalVisible, showPassword, showConfirmPassword]);
+
   useEffect(() => {
     if (resendCooldown <= 0) return;
     const t = setTimeout(() => setResendCooldown((c) => c - 1), 1000);
@@ -153,6 +206,8 @@ export default function AuthPortalScreen({ navigation }) {
     setPassword('');
     setConfirmPassword('');
     if (mode === 'signin') clearFreshSignupFlag();
+    // Re-run killer after mode switch — new inputs mount
+    setTimeout(killChromeAutofill, 100);
   };
 
   const handleAuth = async () => {
@@ -173,12 +228,10 @@ export default function AuthPortalScreen({ navigation }) {
         if (authMode === 'signup' && password !== confirmPassword) { setErrorMessage('Passwords do not match.'); setLoading(false); return; }
 
         if (authMode === 'signup') {
-          // Set flag BEFORE signUp — Supabase can fire SIGNED_IN synchronously inside signUp
           setFreshSignupFlag();
           const { data, error } = await supabase.auth.signUp({ email: inputVal, password });
           if (error) {
             clearFreshSignupFlag();
-            // Production: don't leave failed password in field for Chrome to save
             setPassword(''); setConfirmPassword('');
             throw error;
           }
@@ -196,13 +249,10 @@ export default function AuthPortalScreen({ navigation }) {
           const { error } = await supabase.auth.signInWithPassword({ email: inputVal, password });
           if (error) throw error;
           setSuccessMessage('Signed in! Loading...');
-          // App.js onAuthStateChange moves to Discovery / Onboarding — do NOT navigate here
         }
       } else {
-        // Phone OTP — send code, then show verify modal. Do NOT navigate yet, no session.
         const safeCountry = selectedCountry || FALLBACK_COUNTRY;
         const digits = inputVal.replace(/\D/g, '');
-        // Strip leading 0 for local numbers: 055 -> 55, then prepend +233
         const localDigits = digits.startsWith('0') ? digits.slice(1) : digits;
         const formattedPhone = inputVal.startsWith('+') ? `+${digits}` : `${safeCountry.code}${localDigits}`;
         if (localDigits.length < 9) { setErrorMessage('Enter a valid phone number (e.g. 55 000 0000).'); setLoading(false); return; }
@@ -234,7 +284,6 @@ export default function AuthPortalScreen({ navigation }) {
       if (authMode === 'signup') {
         navigation.navigate('SignupOnboarding', { fullPhone: otpPhone, isDemo: false });
       }
-      // Returning user: App.js moves to Discovery / Onboarding
     } catch (e) {
       setErrorMessage(mapAuthError(e));
     } finally { setOtpVerifying(false); }
@@ -270,7 +319,6 @@ export default function AuthPortalScreen({ navigation }) {
     } finally { setLoading(false); }
   };
 
-  // Production: Demo is read-only preview. No Supabase writes, no fake session.
   const handleDemoMode = () => {
     clearFreshSignupFlag();
     navigation.reset({ index: 0, routes: [{ name: 'Discovery', params: { isDemo: true } }] });
@@ -335,13 +383,13 @@ export default function AuthPortalScreen({ navigation }) {
             <Text style={[styles.inputLabel, { marginTop: 14 }]}>Password</Text>
             <View style={styles.passwordInputWrapper}>
               <TextInput
+                ref={passwordRef}
                 style={styles.inputFlex}
                 placeholder="••••••••••••"
                 placeholderTextColor="#64748B"
                 secureTextEntry={!showPassword}
                 autoCapitalize="none"
                 autoCorrect={false}
-                // PRODUCTION FIX: Never use current-password / new-password here — Chrome shows Saved Passwords popup (video 9-11s)
                 autoComplete="off"
                 textContentType="none"
                 importantForAutofill="no"
@@ -350,6 +398,7 @@ export default function AuthPortalScreen({ navigation }) {
                 blurOnSubmit={true}
                 value={password}
                 onChangeText={v => { setPassword(v); setErrorMessage(''); }}
+                onFocus={() => { if (Platform.OS === 'web' && typeof document !== 'undefined') { try { document.querySelectorAll('input[type="password"]').forEach((el) => el.removeAttribute('readonly')); } catch {} } }}
               />
               <TouchableOpacity style={styles.eyeButton} onPress={() => setShowPassword(!showPassword)}><Text style={{ fontSize: 18 }}>{showPassword ? '🙈' : '👁️'}</Text></TouchableOpacity>
             </View>
@@ -360,13 +409,13 @@ export default function AuthPortalScreen({ navigation }) {
                 <Text style={styles.inputLabel}>Confirm Password</Text>
                 <View style={styles.passwordInputWrapper}>
                   <TextInput
+                    ref={confirmRef}
                     style={styles.inputFlex}
                     placeholder="••••••••••••"
                     placeholderTextColor="#64748B"
                     secureTextEntry={!showConfirmPassword}
                     autoCapitalize="none"
                     autoCorrect={false}
-                    // PRODUCTION FIX: Same — blocks Chrome autofilling old saved password into Confirm
                     autoComplete="off"
                     textContentType="none"
                     importantForAutofill="no"
@@ -375,6 +424,7 @@ export default function AuthPortalScreen({ navigation }) {
                     blurOnSubmit={true}
                     value={confirmPassword}
                     onChangeText={v => { setConfirmPassword(v); setErrorMessage(''); }}
+                    onFocus={() => { if (Platform.OS === 'web' && typeof document !== 'undefined') { try { document.querySelectorAll('input[type="password"]').forEach((el) => el.removeAttribute('readonly')); } catch {} } }}
                   />
                   <TouchableOpacity style={styles.eyeButton} onPress={() => setShowConfirmPassword(!showConfirmPassword)}><Text style={{ fontSize: 18 }}>{showConfirmPassword ? '🙈' : '👁️'}</Text></TouchableOpacity>
                 </View>
