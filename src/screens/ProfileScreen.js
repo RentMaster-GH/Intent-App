@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, ScrollView, Modal, Switch, Alert, ActivityIndicator } from 'react-native';
 import { Image } from 'expo-image';
+import * as ImagePicker from 'expo-image-picker';
 import { supabase } from '../lib/supabase';
 
 const INTENTS = ['Long-term Relationship 💛', 'Activity & Event Buddy 🎟️', 'Friendship First 🤝', 'Marriage Minded 💍'];
@@ -14,6 +15,7 @@ export default function ProfileScreen({ navigation, route }) {
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const [deleteText, setDeleteText] = useState('');
   const [photoUrlInput, setPhotoUrlInput] = useState('');
+  const [uploadingPhoto, setUploadingPhoto] = useState(false);
   const [showBlocked, setShowBlocked] = useState(false);
 
   const [userId, setUserId] = useState(null);
@@ -38,11 +40,9 @@ export default function ProfileScreen({ navigation, route }) {
       setUserId(user.id);
       setEmail(user.email || '');
 
-      // FIX: Only select columns that actually exist. photo_url / avatar_url do not exist and made this query fail.
       const { data: profile, error: profileError } = await supabase.from('profiles')
         .select('name, bio, intent, location, age, photos, notifications, show_on_discovery')
         .eq('id', user.id).maybeSingle();
-
       if (profileError) throw profileError;
 
       if (profile) {
@@ -97,7 +97,6 @@ export default function ProfileScreen({ navigation, route }) {
     navigation.reset({ index: 0, routes: [{ name: 'AuthPortal' }] });
   };
 
-  // FIX: Removed stray duplicate lines after this function that broke compilation.
   const saveToggle = async (column, value, setFn) => {
     if (!userId) return;
     setFn(value);
@@ -112,16 +111,9 @@ export default function ProfileScreen({ navigation, route }) {
     setSaving(true);
     try {
       const { error } = await supabase.from('profiles').upsert({
-        id: userId,
-        email,
-        name: name.trim(),
-        bio: bio.trim(),
-        intent,
-        location: location.trim(),
-        age: age ? parseInt(age, 10) : null,
-        photos,
-        notifications,
-        show_on_discovery: showOnDiscovery,
+        id: userId, email, name: name.trim(), bio: bio.trim(), intent,
+        location: location.trim(), age: age ? parseInt(age, 10) : null,
+        photos, notifications, show_on_discovery: showOnDiscovery,
         updated_at: new Date().toISOString(),
       }, { onConflict: 'id' });
       if (error) throw error;
@@ -130,16 +122,82 @@ export default function ProfileScreen({ navigation, route }) {
     finally { setSaving(false); }
   };
 
-  const addPhotoFromUrl = () => {
+  // Save photos array immediately so a refresh never loses a photo
+  const persistPhotos = async (newPhotos) => {
+    if (!userId) return;
+    const { error } = await supabase.from('profiles').upsert({ id: userId, email, photos: newPhotos }, { onConflict: 'id' });
+    if (error) throw error;
+  };
+
+  const addPhotoFromUrl = async () => {
     const url = photoUrlInput.trim();
     if (!url.startsWith('http')) { Alert.alert('Photo URL', 'Paste a valid https:// image URL.'); return; }
     if (photos.length >= 6) { Alert.alert('Limit', 'You can upload up to 6 photos.'); return; }
-    setPhotos([...photos, url]); setPhotoUrlInput('');
+    const newPhotos = [...photos, url];
+    setPhotos(newPhotos);
+    setPhotoUrlInput('');
+    try { await persistPhotos(newPhotos); } catch (e) { Alert.alert('Save failed', e.message || 'Photo added locally but not saved. Tap Save Profile.'); }
   };
 
-  // FIX: Allow removing last photo. Old code blocked it, so a bad photo could never be removed.
-  const removePhoto = (idx) => {
-    setPhotos(photos.filter((_, i) => i !== idx));
+  // NEW: Upload from device — Gallery on phone, File picker on web
+  const pickAndUploadPhoto = async () => {
+    if (photos.length >= 6) { Alert.alert('Limit', 'You can upload up to 6 photos.'); return; }
+    if (!userId) return;
+
+    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (status !== 'granted') { Alert.alert('Permission', 'Allow photo access to upload a photo.'); return; }
+
+    const result = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ['images'],
+      allowsEditing: true,
+      aspect: [3, 4],
+      quality: 0.8,
+    });
+    if (result.canceled) return;
+
+    const asset = result.assets[0];
+    setUploadingPhoto(true);
+    try {
+      const response = await fetch(asset.uri);
+      const blob = await response.blob();
+      const ext = asset.fileName?.split('.').pop()?.toLowerCase() || 'jpg';
+      const fileName = `${userId}/${Date.now()}.${ext}`;
+
+      const { error: uploadError } = await supabase.storage
+        .from('profile-photos')
+        .upload(fileName, blob, { contentType: blob.type || 'image/jpeg', upsert: false });
+      if (uploadError) throw uploadError;
+
+      const { data } = supabase.storage.from('profile-photos').getPublicUrl(fileName);
+      if (!data?.publicUrl) throw new Error('Could not get photo URL');
+
+      const newPhotos = [...photos, data.publicUrl];
+      setPhotos(newPhotos);
+      await persistPhotos(newPhotos);
+    } catch (e) {
+      Alert.alert('Upload failed', e.message || 'Could not upload photo. Try a smaller image.');
+    } finally { setUploadingPhoto(false); }
+  };
+
+  const removePhoto = async (idx) => {
+    const removed = photos[idx];
+    const newPhotos = photos.filter((_, i) => i !== idx);
+    setPhotos(newPhotos);
+    try {
+      await persistPhotos(newPhotos);
+      // Best-effort: delete file from storage if it's ours
+      if (removed && removed.includes('profile-photos/')) {
+        const path = removed.split('profile-photos/')[1];
+        if (path) await supabase.storage.from('profile-photos').remove([path]);
+      }
+    } catch {}
+  };
+
+  const setAsMainPhoto = async (idx) => {
+    if (idx === 0) return;
+    const newPhotos = [photos[idx], ...photos.filter((_, i) => i !== idx)];
+    setPhotos(newPhotos);
+    try { await persistPhotos(newPhotos); } catch {}
   };
 
   const handleUnblock = async (blockedId, blockedRowId, nameLabel) => {
@@ -222,21 +280,27 @@ export default function ProfileScreen({ navigation, route }) {
           <Text style={[styles.label, { alignSelf: 'flex-start' }]}>PHOTOS ({photos.length}/6)</Text>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.photoRow}>
             {photos.map((p, i) => (
-              <View key={i} style={styles.photoWrap}>
+              <TouchableOpacity key={`${p}-${i}`} style={styles.photoWrap} onPress={() => setAsMainPhoto(i)}>
                 <Image source={{ uri: p }} style={styles.photoThumb} contentFit="cover" />
                 {i === 0 && <Text style={styles.mainBadge}>MAIN</Text>}
                 <TouchableOpacity style={styles.removePhoto} onPress={() => removePhoto(i)}><Text style={{ color: '#FFF', fontSize: 12, fontWeight: '800' }}>✕</Text></TouchableOpacity>
-              </View>
+              </TouchableOpacity>
             ))}
-            <View style={{ gap: 8 }}>
-              <Text style={[styles.inputLabel, { marginTop: 8 }]}>Paste photo URL</Text>
-              <View style={{ flexDirection: 'row', gap: 8 }}>
-                <TextInput style={[styles.input, { flex: 1, minWidth: 180 }]} value={photoUrlInput} onChangeText={setPhotoUrlInput} placeholder="https://..." placeholderTextColor="#64748B" autoCapitalize="none" />
-                <TouchableOpacity style={[styles.secondaryBtn, { height: 48, paddingHorizontal: 14, marginTop: 0, width: 60 }]} onPress={addPhotoFromUrl}><Text style={styles.secondaryBtnText}>Add</Text></TouchableOpacity>
-              </View>
-            </View>
           </ScrollView>
-          {photos.length === 0 && <Text style={{ color: '#94A3B8', fontSize: 12, marginTop: 8, alignSelf: 'flex-start' }}>No photos yet. Paste a URL above, then tap Save Profile.</Text>}
+
+          <TouchableOpacity style={styles.uploadBtn} onPress={pickAndUploadPhoto} disabled={uploadingPhoto}>
+            {uploadingPhoto ? <ActivityIndicator color="#FFF" /> : <Text style={styles.uploadBtnText}>📸 Upload Photo from Device</Text>}
+          </TouchableOpacity>
+          <Text style={styles.uploadHint}>Tap a photo to make it your main photo. Max 6 photos.</Text>
+
+          <View style={{ gap: 8, width: '100%' }}>
+            <Text style={[styles.inputLabel, { marginTop: 8 }]}>Or paste photo URL</Text>
+            <View style={{ flexDirection: 'row', gap: 8 }}>
+              <TextInput style={[styles.input, { flex: 1, minWidth: 180 }]} value={photoUrlInput} onChangeText={setPhotoUrlInput} placeholder="https://..." placeholderTextColor="#64748B" autoCapitalize="none" />
+              <TouchableOpacity style={[styles.secondaryBtn, { height: 48, paddingHorizontal: 14, marginTop: 0, width: 60 }]} onPress={addPhotoFromUrl}><Text style={styles.secondaryBtnText}>Add</Text></TouchableOpacity>
+            </View>
+          </View>
+          {photos.length === 0 && <Text style={{ color: '#94A3B8', fontSize: 12, marginTop: 8, alignSelf: 'flex-start' }}>No photos yet. Upload one from your device above.</Text>}
         </View>
 
         <View style={styles.section}>
@@ -346,6 +410,9 @@ const styles = StyleSheet.create({
   photoThumb: { width: 72, height: 96, borderRadius: 12 },
   mainBadge: { position: 'absolute', bottom: 4, left: 4, backgroundColor: '#F97316', color: '#FFF', fontSize: 9, fontWeight: '800', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6, overflow: 'hidden' },
   removePhoto: { position: 'absolute', top: -6, right: -6, backgroundColor: '#EF4444', width: 22, height: 22, borderRadius: 11, justifyContent: 'center', alignItems: 'center' },
+  uploadBtn: { backgroundColor: '#F97316', height: 48, borderRadius: 12, justifyContent: 'center', alignItems: 'center', marginTop: 12, width: '100%' },
+  uploadBtnText: { color: '#FFF', fontWeight: '800' },
+  uploadHint: { color: '#94A3B8', fontSize: 11, marginTop: 8, textAlign: 'center' },
   logout: { backgroundColor: '#EF4444', paddingHorizontal: 24, paddingVertical: 12, borderRadius: 12, marginTop: 12, minWidth: 120, alignItems: 'center', justifyContent: 'center', width: '100%' },
   modalOverlay: { flex: 1, backgroundColor: 'rgba(2,6,23,0.85)', justifyContent: 'center', alignItems: 'center', padding: 20 },
   modalCard: { backgroundColor: '#1E293B', borderRadius: 24, padding: 20, width: '100%', maxWidth: 440, maxHeight: '88%', borderWidth: 1, borderColor: '#334155' },
