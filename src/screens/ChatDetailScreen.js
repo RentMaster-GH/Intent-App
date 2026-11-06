@@ -2,20 +2,21 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   View, Text, Image, TouchableOpacity, StyleSheet, SafeAreaView,
   FlatList, TextInput, Modal, ScrollView, Linking, Alert, ActivityIndicator,
+  Platform,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { supabase } from '../lib/supabase';
 import Constants from 'expo-constants';
 
-// --- LiveKit Native ---
-import { Room, Track } from 'livekit-client';
-import { useTracks } from '@livekit/react-native';
-import { RTCView } from '@livekit/react-native-webrtc';
+// Web-safe: Metro picks .native.js on phone, .web.js on Vercel
+import LivekitVideoView from './LivekitVideoView';
 
 const LIVEKIT_URL =
   Constants.expoConfig?.extra?.EXPO_PUBLIC_LIVEKIT_URL ||
   process.env.EXPO_PUBLIC_LIVEKIT_URL ||
   'wss://intent-app-1qma00x5.livekit.cloud';
+
+const IS_WEB = Platform.OS === 'web';
 
 const FALLBACK_PHOTO = 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80';
 
@@ -33,9 +34,7 @@ const RECOMMENDED_DATE_SPOTS = [
   { id: 'v4', name: 'Conservatory Scenic Garden Walk', vibe: 'Outdoor & Scenic', category: 'parks', rating: '4.9', address: 'Central Park East & 105th St', perk: '🎁 Free Entry' },
 ];
 
-const FALLBACK_VENUE = RECOMMENDED_DATE_SPOTS?.[0] || {
-  id: 'fallback', name: 'Local Coffee Shop', vibe: 'Cozy & Casual', category: 'coffee', rating: '4.9', address: 'Nearby — Search on Maps', perk: '🎁 Intent perk',
-};
+const FALLBACK_VENUE = RECOMMENDED_DATE_SPOTS[0];
 
 const PEOPLE_BY_ID = {
   '1': { name: 'Ama', avatar: 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80', intent: 'Long-term Relationship 💛', location: 'Accra, Ghana' },
@@ -48,26 +47,6 @@ const formatTimer = (sec) => {
   const s = sec % 60;
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 };
-
-// --- Native LiveKit Video View ---
-function LivekitVideoView({ room }) {
-  const tracks = useTracks([Track.Source.Camera]);
-  const remote = tracks.find((t) => t.participant.identity !== room.localParticipant.identity);
-  const local = tracks.find((t) => t.participant.identity === room.localParticipant.identity);
-  const trackRef = remote || local;
-  const mediaTrack = trackRef?.publication?.track;
-  const stream = mediaTrack?.mediaStream;
-  if (!stream) return null;
-  const streamURL = typeof stream.toURL === 'function' ? stream.toURL() : stream;
-  return (
-    <RTCView
-      streamURL={streamURL}
-      style={{ width: '100%', height: '100%' }}
-      objectFit="cover"
-      mirror={trackRef.participant.identity === room.localParticipant.identity}
-    />
-  );
-}
 
 export default function ChatDetailScreen({ route, navigation }) {
   const paramChat = route.params?.chat;
@@ -116,8 +95,12 @@ export default function ChatDetailScreen({ route, navigation }) {
 
   const listRef = useRef(null);
 
-  // --- LiveKit helpers ---
+  // --- LiveKit helpers (web-safe) ---
   const joinLivekit = useCallback(async (callRow, isVideo) => {
+    if (IS_WEB) {
+      Alert.alert('Use mobile app', 'Voice/video calls only work in the Intent mobile app, not the web preview.');
+      return;
+    }
     if (!callRow?.match_id || !userId) return;
     if (roomRef.current) return;
     setIsLivekitConnecting(true);
@@ -128,6 +111,8 @@ export default function ChatDetailScreen({ route, navigation }) {
       });
       if (error || !data?.token) throw new Error('Could not get call token');
 
+      // Dynamic import — never bundled on web, so Vercel won't crash
+      const { Room } = await import('livekit-client');
       const room = new Room({ adaptiveStream: true, dynacast: true });
       roomRef.current = room;
       setLivekitRoom(room);
@@ -152,7 +137,6 @@ export default function ChatDetailScreen({ route, navigation }) {
     setLivekitRoom(null);
   }, []);
 
-  // Cleanup LiveKit on unmount
   useEffect(() => {
     return () => { roomRef.current?.disconnect?.().catch(() => {}); };
   }, []);
@@ -225,7 +209,7 @@ export default function ChatDetailScreen({ route, navigation }) {
     } catch (e) {
       console.log('[ChatDetail] load error', e?.message);
     } finally { setLoading(false); }
-  }, [navigation]);
+  }, [navigation, otherUserId, matchId]);
 
   useEffect(() => { loadChat(); }, [loadChat]);
 
@@ -266,7 +250,6 @@ export default function ChatDetailScreen({ route, navigation }) {
           setActiveCall(null);
           leaveLivekit();
         }
-        // Caller joins LiveKit when callee answers
         if (row.status === 'answered' && row.caller_id === userId) {
           setActiveCall(row);
           joinLivekit(row, row.type === 'video');
@@ -294,6 +277,10 @@ export default function ChatDetailScreen({ route, navigation }) {
 
   // --- Calls ---
   const handleStartCall = async (type) => {
+    if (IS_WEB) {
+      Alert.alert('Use mobile app', 'Calls only work in the Intent mobile app, not the web preview.');
+      return;
+    }
     if (!userId || !otherUserId || !matchId) {
       Alert.alert('Call unavailable', 'Start a chat first — this profile is not yet a real match. Like them on Discovery to unlock calls.');
       return;
@@ -305,7 +292,6 @@ export default function ChatDetailScreen({ route, navigation }) {
     }).select().single();
     if (error) { Alert.alert('Call failed', error.message); return; }
     setActiveCall(data);
-    // Do NOT join LiveKit here — wait for answer
   };
 
   const handleAnswerCall = async () => {
@@ -407,8 +393,6 @@ export default function ChatDetailScreen({ route, navigation }) {
   };
 
   const filteredVenues = (RECOMMENDED_DATE_SPOTS || []).filter((v) => selectedVibeCategory === 'all' || v?.category === selectedVibeCategory);
-
-  const inCall = activeCall || incomingCall;
   const isRingingOut = activeCall && activeCall.status === 'ringing' && !incomingCall;
 
   if (loading) {
@@ -468,7 +452,6 @@ export default function ChatDetailScreen({ route, navigation }) {
         <TouchableOpacity style={styles.sendBtn} onPress={handleSend} disabled={sending}><Ionicons name="send" size={18} color="#FFFFFF" /></TouchableOpacity>
       </View>
 
-      {/* INCOMING CALL */}
       {incomingCall && (
         <Modal visible transparent animationType="fade">
           <View style={styles.callOverlay}>
@@ -491,7 +474,6 @@ export default function ChatDetailScreen({ route, navigation }) {
         </Modal>
       )}
 
-      {/* OUTGOING / ACTIVE CALL */}
       {activeCall && !incomingCall && (
         <Modal visible transparent animationType="fade">
           <View style={styles.callOverlay}>
