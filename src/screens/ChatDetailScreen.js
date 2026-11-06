@@ -17,8 +17,10 @@ const LIVEKIT_URL =
 const IS_WEB = Platform.OS === 'web';
 const FALLBACK_PHOTO = 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80';
 
-// YOUR REAL TABLE: messages(id, match_id, sender_id, body, created_at)
-const getMessageText = (mm) => mm?.body ?? mm?.content ?? mm?.text ?? mm?.message ?? '';
+// SINGLE SOURCE OF TRUTH — your table is:
+// messages(id uuid, match_id uuid, sender_id uuid, body text NOT NULL, created_at timestamptz)
+// NEVER use `content`, `text`, or `message` anywhere.
+const getMessageText = (mm) => mm?.body ?? '';
 
 const ICEBREAKER_CARDS = [
   '☕ Suggest a 20-min coffee meetup',
@@ -142,16 +144,16 @@ export default function ChatDetailScreen({ route, navigation }) {
     return null;
   }, [rawId]);
 
-  // --- NEW: refetch messages from DB — used for polling + after send + on focus ---
   const refetchMessages = useCallback(async () => {
     const mid = matchIdRef.current || await ensureMatchId();
     const uid = userIdRef.current;
     if (!mid || !uid) return;
-    const { data: msgs } = await supabase.from('messages')
+    const { data: msgs, error } = await supabase.from('messages')
       .select('id, match_id, sender_id, body, created_at')
       .eq('match_id', mid)
       .order('created_at', { ascending: true })
       .limit(200);
+    if (error) { console.log('[ChatDetail] LOAD ERROR:', error.message); return; }
     if (Array.isArray(msgs)) {
       setMessages(msgs.map((mm) => {
         const txt = getMessageText(mm);
@@ -256,11 +258,8 @@ export default function ChatDetailScreen({ route, navigation }) {
         }
       }
 
-      if (resolvedMatchId) {
-        await refetchMessages();
-      } else {
-        setMessages([]);
-      }
+      if (resolvedMatchId) await refetchMessages();
+      else setMessages([]);
     } catch (e) {
       console.log('[ChatDetail] load error', e?.message);
     } finally { setLoading(false); }
@@ -268,7 +267,7 @@ export default function ChatDetailScreen({ route, navigation }) {
 
   useEffect(() => { loadChat(); }, [loadChat]);
 
-  // --- NEW: Poll every 3s + refetch when tab regains focus — fixes missed realtime ---
+  // Poll every 3s + refetch on focus — covers missed realtime
   useEffect(() => {
     if (!matchId) return;
     const interval = setInterval(() => { refetchMessages(); }, 3000);
@@ -396,13 +395,17 @@ export default function ChatDetailScreen({ route, navigation }) {
     try { await roomRef.current?.localParticipant.setCameraEnabled(!next); } catch {}
   };
 
+  // ONLY body — never content/text/message. This is the fix for the 400 + NOT NULL error.
   const persistMessage = async (text) => {
     const mid = await ensureMatchId();
     const uid = userIdRef.current;
-    if (!mid || !uid) return false;
+    if (!mid || !uid) {
+      console.log('[ChatDetail] SEND FAILED — no match_id', { mid, uid });
+      return false;
+    }
     const { data, error } = await supabase.from('messages')
       .insert({ match_id: mid, sender_id: uid, body: text })
-      .select()
+      .select('id, match_id, sender_id, body, created_at')
       .single();
     if (error) {
       console.log('[ChatDetail] SEND FAILED:', error.message);
@@ -410,7 +413,6 @@ export default function ChatDetailScreen({ route, navigation }) {
       return false;
     }
     console.log('[ChatDetail] SEND OK — saved id:', data?.id, 'match:', mid, 'using column: body');
-    // Immediately refetch so both sides see it even if realtime misses
     setTimeout(() => refetchMessages(), 500);
     return true;
   };
