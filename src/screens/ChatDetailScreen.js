@@ -15,7 +15,6 @@ const LIVEKIT_URL =
   'wss://intent-app-1qma00x5.livekit.cloud';
 
 const IS_WEB = Platform.OS === 'web';
-
 const FALLBACK_PHOTO = 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80';
 
 const ICEBREAKER_CARDS = [
@@ -33,7 +32,6 @@ const RECOMMENDED_DATE_SPOTS = [
 ];
 
 const FALLBACK_VENUE = RECOMMENDED_DATE_SPOTS[0];
-
 const PEOPLE_BY_ID = {
   '1': { name: 'Ama', avatar: 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80', intent: 'Long-term Relationship 💛', location: 'Accra, Ghana' },
   '2': { name: 'Kwame', avatar: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=400&auto=format&fit=crop&q=80', intent: 'Friendship First 🤝', location: 'Accra, Ghana' },
@@ -45,10 +43,9 @@ const formatTimer = (sec) => {
   const s = sec % 60;
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 };
-
 const isUuidLike = (v) => typeof v === 'string' && v.length > 20 && v.includes('-');
 
-// Web params without expo-router — React Navigation app, so we read window.location directly
+// Web params without expo-router — read window.location directly
 const getWebParams = () => {
   if (Platform.OS !== 'web') return {};
   try {
@@ -57,7 +54,9 @@ const getWebParams = () => {
       const sp = new URLSearchParams(window.location.search || '');
       sp.forEach((v, k) => { out[k] = v; });
       const pathParts = window.location.pathname.split('/').filter(Boolean);
+      // /chat/<uuid> — could be match_id OR otherUserId, resolved in loadChat
       if (pathParts[0] === 'chat' && pathParts[1]) out.id = pathParts[1];
+      if (pathParts[0] === 'chat' && pathParts[1] && !out.matchId && !out.otherUserId) out.rawChatId = pathParts[1];
       if (window.location.hash && window.location.hash.includes('?')) {
         const hashSearch = window.location.hash.split('?')[1] || '';
         new URLSearchParams(hashSearch).forEach((v, k) => { out[k] = v; });
@@ -68,14 +67,14 @@ const getWebParams = () => {
 };
 
 export default function ChatDetailScreen({ route, navigation }) {
-  // Params: native = route.params, web = window.location ?id=...
   const webParams = getWebParams();
   const allParams = { ...(route?.params || {}), ...webParams };
 
   const paramChat = allParams?.chat;
-  const rawId = String(allParams?.id || allParams?.matchId || allParams?.match_id || '');
-  const paramMatchId = allParams?.matchId || allParams?.match_id || (rawId && !isUuidLike(rawId) ? rawId : null);
-  const paramOtherId = allParams?.otherUserId || allParams?.userId || allParams?.other_id || allParams?.otherId || (isUuidLike(rawId) ? rawId : null);
+  const rawId = String(allParams?.id || allParams?.rawChatId || allParams?.matchId || allParams?.match_id || '');
+  // Keep explicit params if passed from native, otherwise rawId is ambiguous — resolved in loadChat
+  const paramMatchId = allParams?.matchId || allParams?.match_id || null;
+  const paramOtherId = allParams?.otherUserId || allParams?.userId || allParams?.other_id || allParams?.otherId || null;
   const paramId = rawId;
 
   const initialChat =
@@ -92,34 +91,25 @@ export default function ChatDetailScreen({ route, navigation }) {
   const [matchId, setMatchId] = useState(paramMatchId);
   const [chat, setChat] = useState({ ...initialChat, avatar: initialChat?.avatar || initialChat?.photos?.[0] || FALLBACK_PHOTO });
   const [loading, setLoading] = useState(true);
-
   const [messages, setMessages] = useState([]);
   const [inputText, setInputText] = useState('');
   const [sending, setSending] = useState(false);
-
-  // --- Calls ---
   const [activeCall, setActiveCall] = useState(null);
   const [incomingCall, setIncomingCall] = useState(null);
   const [callDuration, setCallDuration] = useState(0);
   const [isMuted, setIsMuted] = useState(false);
   const [isCameraOff, setIsCameraOff] = useState(false);
-
-  // --- LiveKit ---
   const [livekitRoom, setLivekitRoom] = useState(null);
   const [isLivekitConnecting, setIsLivekitConnecting] = useState(false);
   const roomRef = useRef(null);
-
   const [showDateModal, setShowShowDateModal] = useState(false);
   const [selectedVibeCategory, setSelectedVibeCategory] = useState('all');
   const [selectedVenue, setSelectedVenue] = useState(FALLBACK_VENUE);
   const [dateTimeInput, setDateTimeInput] = useState('Saturday at 2:00 PM');
-
   const [showReportModal, setShowReportModal] = useState(false);
   const [reportReason, setReportReason] = useState('Harassment or disrespectful behavior');
-
   const listRef = useRef(null);
 
-  // --- LiveKit helpers (web-safe) ---
   const joinLivekit = useCallback(async (callRow, isVideo) => {
     if (IS_WEB) {
       Alert.alert('Use mobile app', 'Voice/video calls only work in the Intent mobile app, not the web preview.');
@@ -134,25 +124,19 @@ export default function ChatDetailScreen({ route, navigation }) {
         body: { room: roomName, identity: userId, name: chat?.name || 'User' },
       });
       if (error || !data?.token) throw new Error('Could not get call token');
-
-      // Dynamic import — never bundled on web, so Vercel won't crash
       const { Room } = await import('livekit-client');
       const room = new Room({ adaptiveStream: true, dynacast: true });
       roomRef.current = room;
       setLivekitRoom(room);
       await room.connect(LIVEKIT_URL, data.token);
       await room.localParticipant.setMicrophoneEnabled(true);
-      if (isVideo || callRow.type === 'video') {
-        await room.localParticipant.setCameraEnabled(true);
-      }
+      if (isVideo || callRow.type === 'video') await room.localParticipant.setCameraEnabled(true);
     } catch (e) {
       console.log('[LiveKit]', e);
-      Alert.alert('Media failed', e.message || 'Could not start encrypted media. Check LiveKit URL / token function.');
+      Alert.alert('Media failed', e.message || 'Could not start encrypted media.');
       roomRef.current = null;
       setLivekitRoom(null);
-    } finally {
-      setIsLivekitConnecting(false);
-    }
+    } finally { setIsLivekitConnecting(false); }
   }, [userId, chat?.name]);
 
   const leaveLivekit = useCallback(async () => {
@@ -161,11 +145,8 @@ export default function ChatDetailScreen({ route, navigation }) {
     setLivekitRoom(null);
   }, []);
 
-  useEffect(() => {
-    return () => { roomRef.current?.disconnect?.().catch(() => {}); };
-  }, []);
+  useEffect(() => { return () => { roomRef.current?.disconnect?.().catch(() => {}); }; }, []);
 
-  // --- Load me + other user + match ---
   const loadChat = useCallback(async () => {
     setLoading(true);
     try {
@@ -175,10 +156,11 @@ export default function ChatDetailScreen({ route, navigation }) {
 
       let resolvedOtherId = paramOtherId;
       let resolvedMatchId = paramMatchId;
+      const ambiguousId = !resolvedMatchId && !resolvedOtherId ? rawId : null;
 
-      console.log('[ChatDetail] params:', { paramOtherId, paramMatchId, paramId, rawId });
+      console.log('[ChatDetail] params:', { paramOtherId, paramMatchId, rawId, ambiguousId });
 
-      // 1) If we have a match_id, resolve the other user from it
+      // CASE A: explicit match_id passed
       if (resolvedMatchId) {
         const { data: m } = await supabase.from('matches').select('id, user_a, user_b').eq('id', resolvedMatchId).maybeSingle();
         if (m) {
@@ -187,20 +169,41 @@ export default function ChatDetailScreen({ route, navigation }) {
         }
       }
 
-      // 2) If we only have otherUserId, find the match between me + them
+      // CASE B: ambiguous /chat/<uuid> — try as match_id FIRST
+      if (!resolvedMatchId && ambiguousId && isUuidLike(ambiguousId)) {
+        const { data: m } = await supabase.from('matches').select('id, user_a, user_b').eq('id', ambiguousId).maybeSingle();
+        if (m) {
+          console.log('[ChatDetail] id was match_id:', m.id);
+          resolvedMatchId = m.id;
+          setMatchId(m.id);
+          resolvedOtherId = m.user_a === user.id ? m.user_b : m.user_a;
+          setOtherUserId(resolvedOtherId);
+        } else {
+          // CASE C: id was otherUserId — find match between me + them
+          console.log('[ChatDetail] id was otherUserId, finding match...');
+          resolvedOtherId = ambiguousId;
+          setOtherUserId(ambiguousId);
+          const { data: existing } = await supabase.from('matches').select('id')
+            .or(`and(user_a.eq.${user.id},user_b.eq.${ambiguousId}),and(user_a.eq.${ambiguousId},user_b.eq.${user.id})`)
+            .maybeSingle();
+          if (existing) {
+            resolvedMatchId = existing.id;
+            setMatchId(existing.id);
+          }
+        }
+      }
+
+      // CASE D: only otherUserId known — find match
       if (!resolvedMatchId && resolvedOtherId && isUuidLike(String(resolvedOtherId))) {
-        const { data: existing, error } = await supabase.from('matches')
-          .select('id')
+        const { data: existing } = await supabase.from('matches').select('id')
           .or(`and(user_a.eq.${user.id},user_b.eq.${resolvedOtherId}),and(user_a.eq.${resolvedOtherId},user_b.eq.${user.id})`)
           .maybeSingle();
-        console.log('[ChatDetail] found match for otherUser:', existing, error?.message);
         if (existing) {
           resolvedMatchId = existing.id;
           setMatchId(existing.id);
         }
       }
 
-      // 3) Load profile for other user
       if (resolvedOtherId && isUuidLike(String(resolvedOtherId))) {
         const { data: p } = await supabase.from('profiles').select('id, name, bio, intent, location, photos').eq('id', resolvedOtherId).maybeSingle();
         if (p) {
@@ -214,14 +217,13 @@ export default function ChatDetailScreen({ route, navigation }) {
         }
       }
 
-      // 4) Load messages for that match
       if (resolvedMatchId) {
         const { data: msgs, error: msgError } = await supabase.from('messages')
           .select('id, match_id, sender_id, content, created_at')
           .eq('match_id', resolvedMatchId)
           .order('created_at', { ascending: true })
           .limit(200);
-        console.log('[ChatDetail] messages loaded:', msgs?.length, msgError?.message);
+        console.log('[ChatDetail] match:', resolvedMatchId, 'messages:', msgs?.length, msgError?.message);
         if (Array.isArray(msgs)) {
           setMessages(msgs.map((mm) => ({
             id: String(mm.id),
@@ -233,11 +235,8 @@ export default function ChatDetailScreen({ route, navigation }) {
           })));
         }
       } else {
-        console.log('[ChatDetail] no match found, showing demo messages');
-        setMessages([
-          { id: 'm1', text: "Hey! Loved your prompt about urban architecture.", sender: 'them', time: '10:30 AM' },
-          { id: 'm2', text: "Thanks! It's rare finding someone who appreciates design.", sender: 'me', time: '10:35 AM' },
-        ]);
+        console.log('[ChatDetail] no match found');
+        setMessages([]);
       }
     } catch (e) {
       console.log('[ChatDetail] load error', e?.message);
@@ -246,7 +245,6 @@ export default function ChatDetailScreen({ route, navigation }) {
 
   useEffect(() => { loadChat(); }, [loadChat]);
 
-  // --- Realtime: new messages ---
   useEffect(() => {
     if (!matchId) return;
     const ch = supabase.channel(`messages-${matchId}`)
@@ -268,7 +266,6 @@ export default function ChatDetailScreen({ route, navigation }) {
     return () => supabase.removeChannel(ch);
   }, [matchId, userId]);
 
-  // --- Realtime: incoming calls ---
   useEffect(() => {
     if (!userId || !matchId) return;
     const ch = supabase.channel(`calls-${matchId}`)
@@ -292,37 +289,22 @@ export default function ChatDetailScreen({ route, navigation }) {
     return () => supabase.removeChannel(ch);
   }, [userId, matchId, joinLivekit, leaveLivekit]);
 
-  // --- Call timer ---
   useEffect(() => {
     let t;
-    if (activeCall?.status === 'answered') {
-      t = setInterval(() => setCallDuration((v) => v + 1), 1000);
-    } else {
-      setCallDuration(0);
-    }
+    if (activeCall?.status === 'answered') t = setInterval(() => setCallDuration((v) => v + 1), 1000);
+    else setCallDuration(0);
     return () => clearInterval(t);
   }, [activeCall]);
 
-  const openGoogleMaps = (addr) => {
-    Linking.openURL(`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(addr || '')}`).catch(() => {});
-  };
+  const openGoogleMaps = (addr) => Linking.openURL(`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(addr || '')}`).catch(() => {});
   const openUber = () => Linking.openURL('https://m.uber.com/ul/?action=setPickup').catch(() => {});
 
-  // --- Calls ---
   const handleStartCall = async (type) => {
-    if (IS_WEB) {
-      Alert.alert('Use mobile app', 'Calls only work in the Intent mobile app, not the web preview.');
-      return;
-    }
-    if (!userId || !otherUserId || !matchId) {
-      Alert.alert('Call unavailable', 'Start a chat first — this profile is not yet a real match. Like them on Discovery to unlock calls.');
-      return;
-    }
+    if (IS_WEB) { Alert.alert('Use mobile app', 'Calls only work in the Intent mobile app, not the web preview.'); return; }
+    if (!userId || !otherUserId || !matchId) { Alert.alert('Call unavailable', 'Start a chat first — this profile is not yet a real match.'); return; }
     setIsMuted(false); setIsCameraOff(false);
     await supabase.from('calls').update({ status: 'missed' }).eq('match_id', matchId).eq('status', 'ringing');
-    const { data, error } = await supabase.from('calls').insert({
-      match_id: matchId, caller_id: userId, callee_id: otherUserId, type, status: 'ringing',
-    }).select().single();
+    const { data, error } = await supabase.from('calls').insert({ match_id: matchId, caller_id: userId, callee_id: otherUserId, type, status: 'ringing' }).select().single();
     if (error) { Alert.alert('Call failed', error.message); return; }
     setActiveCall(data);
   };
@@ -347,9 +329,7 @@ export default function ChatDetailScreen({ route, navigation }) {
     const callRow = activeCall || incomingCall;
     const durationFormatted = formatTimer(callDuration);
     const callTypeTitle = (callRow?.type || activeCall?.type || 'audio') === 'video' ? 'Video Call' : 'Voice Call';
-    if (callRow?.id) {
-      await supabase.from('calls').update({ status: 'ended', ended_at: new Date().toISOString() }).eq('id', callRow.id);
-    }
+    if (callRow?.id) await supabase.from('calls').update({ status: 'ended', ended_at: new Date().toISOString() }).eq('id', callRow.id);
     if (matchId && userId) {
       const logText = `📞 ${callTypeTitle} Ended (${durationFormatted})`;
       await supabase.from('messages').insert({ match_id: matchId, sender_id: userId, content: logText });
@@ -370,7 +350,6 @@ export default function ChatDetailScreen({ route, navigation }) {
     try { await roomRef.current?.localParticipant.setCameraEnabled(!next); } catch {}
   };
 
-  // --- Real send ---
   const persistMessage = async (text) => {
     if (!matchId || !userId) return false;
     const { error } = await supabase.from('messages').insert({ match_id: matchId, sender_id: userId, content: text });
@@ -422,7 +401,7 @@ export default function ChatDetailScreen({ route, navigation }) {
         });
       }
     } catch {}
-    Alert.alert('Report Received 🛡️', `Thank you. Your report against ${chat?.name || 'this user'} has been submitted to the Intent App Manager for review.`);
+    Alert.alert('Report Received 🛡️', `Thank you. Your report against ${chat?.name || 'this user'} has been submitted.`);
   };
 
   const filteredVenues = (RECOMMENDED_DATE_SPOTS || []).filter((v) => selectedVibeCategory === 'all' || v?.category === selectedVibeCategory);
@@ -456,12 +435,17 @@ export default function ChatDetailScreen({ route, navigation }) {
         data={messages || []}
         keyExtractor={(item) => String(item?.id || Math.random().toString())}
         contentContainerStyle={styles.msgList}
+        ListEmptyComponent={
+          <View style={styles.emptyState}>
+            <Text style={styles.emptyEmoji}>👋</Text>
+            <Text style={styles.emptyTitle}>No messages yet</Text>
+            <Text style={styles.emptySub}>You matched with {chat?.name || 'Vio'}. Say hi — send your first intentional message below.</Text>
+          </View>
+        }
         onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
         renderItem={({ item }) => {
           const isMe = item?.sender === 'me';
-          if (item?.isCallLog) {
-            return (<View style={styles.callLogCard}><Ionicons name="call" size={16} color="#FBBF24" /><Text style={styles.callLogText}>{item?.text || ''}</Text></View>);
-          }
+          if (item?.isCallLog) return (<View style={styles.callLogCard}><Ionicons name="call" size={16} color="#FBBF24" /><Text style={styles.callLogText}>{item?.text || ''}</Text></View>);
           return (
             <View style={[styles.msgBubble, isMe ? styles.myMsg : styles.theirMsg, item?.isProposal && styles.proposalMsg]}>
               <Text style={[styles.msgText, isMe ? styles.myMsgText : styles.theirMsgText]}>{item?.text || ''}</Text>
@@ -512,23 +496,14 @@ export default function ChatDetailScreen({ route, navigation }) {
           <View style={styles.callOverlay}>
             <SafeAreaView style={styles.callContainer}>
               <View style={styles.callTopHeader}>
-                <View style={styles.encryptionBadge}>
-                  <Text style={styles.encryptionText}>{livekitRoom ? '🔒 Encrypted Call • DTLS-SRTP' : 'Connecting...'}</Text>
-                </View>
+                <View style={styles.encryptionBadge}><Text style={styles.encryptionText}>{livekitRoom ? '🔒 Encrypted Call • DTLS-SRTP' : 'Connecting...'}</Text></View>
                 <Text style={styles.callTimerText}>{isRingingOut ? 'Ringing...' : formatTimer(callDuration)}</Text>
                 {isRingingOut && <Text style={{ color: '#94A3B8', marginTop: 6 }}>Waiting for {chat?.name} to answer...</Text>}
               </View>
-
               {activeCall.type === 'video' ? (
                 <View style={styles.videoFeedBox}>
-                  {livekitRoom ? (
-                    <LivekitVideoView room={livekitRoom} />
-                  ) : isCameraOff ? (
-                    <View style={styles.cameraOffPlaceholder}><Ionicons name="videocam-off" size={48} color="#64748B" /><Text style={{ color: '#94A3B8', marginTop: 8 }}>Camera Off</Text></View>
-                  ) : (
-                    <View style={styles.cameraOffPlaceholder}>
-                      <Text style={{ color: '#94A3B8' }}>{isLivekitConnecting ? 'Connecting encrypted media...' : 'Waiting for media...'}</Text>
-                    </View>
+                  {livekitRoom ? <LivekitVideoView room={livekitRoom} /> : (
+                    <View style={styles.cameraOffPlaceholder}><Text style={{ color: '#94A3B8' }}>{isLivekitConnecting ? 'Connecting encrypted media...' : 'Waiting for media...'}</Text></View>
                   )}
                 </View>
               ) : (
@@ -538,7 +513,6 @@ export default function ChatDetailScreen({ route, navigation }) {
                   <Text style={{ color: '#94A3B8', marginTop: 8 }}>{livekitRoom ? '🔒 Encrypted • Connected' : isRingingOut ? 'Ringing...' : 'Connecting...'}</Text>
                 </View>
               )}
-
               <View style={styles.callControlsRow}>
                 <TouchableOpacity style={[styles.controlCircle, isMuted && styles.controlCircleActive]} onPress={toggleMute}><Ionicons name={isMuted ? 'mic-off' : 'mic'} size={24} color="#FFFFFF" /></TouchableOpacity>
                 {activeCall.type === 'video' && (
@@ -614,7 +588,11 @@ const styles = StyleSheet.create({
   callHeaderActions: { flexDirection: 'row', alignItems: 'center', gap: 8 },
   callIconBtn: { width: 36, height: 36, borderRadius: 18, backgroundColor: '#1E293B', justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: '#334155' },
   planDateBtn: { width: 36, height: 36, borderRadius: 18, backgroundColor: '#F97316', justifyContent: 'center', alignItems: 'center' },
-  msgList: { padding: 16, gap: 12 },
+  msgList: { padding: 16, gap: 12, flexGrow: 1 },
+  emptyState: { flex: 1, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 32, paddingVertical: 60 },
+  emptyEmoji: { fontSize: 48, marginBottom: 12 },
+  emptyTitle: { fontSize: 18, fontWeight: '800', color: '#F8FAFC', marginBottom: 6 },
+  emptySub: { fontSize: 13, color: '#94A3B8', textAlign: 'center', lineHeight: 19 },
   msgBubble: { maxWidth: '80%', padding: 12, borderRadius: 16 },
   myMsg: { alignSelf: 'flex-end', backgroundColor: '#F97316' },
   theirMsg: { alignSelf: 'flex-start', backgroundColor: '#1E293B', borderWidth: 1, borderColor: '#334155' },
@@ -643,13 +621,11 @@ const styles = StyleSheet.create({
   audioCallAvatar: { width: 120, height: 120, borderRadius: 60, marginBottom: 16 },
   callPartnerName: { fontSize: 26, fontWeight: '800', color: '#F8FAFC' },
   videoFeedBox: { flex: 1, borderRadius: 24, overflow: 'hidden', backgroundColor: '#1E293B', marginVertical: 20 },
-  remoteVideo: { width: '100%', height: '100%' },
   cameraOffPlaceholder: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   callControlsRow: { flexDirection: 'row', justifyContent: 'space-evenly', alignItems: 'center', marginBottom: 20 },
   controlCircle: { width: 56, height: 56, borderRadius: 28, backgroundColor: '#1E293B', justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: '#334155' },
   controlCircleActive: { backgroundColor: '#EF4444' },
   endCallBtn: { width: 68, height: 68, borderRadius: 34, backgroundColor: '#EF4444', justifyContent: 'center', alignItems: 'center' },
-  callNote: { color: '#64748B', fontSize: 11, textAlign: 'center', marginBottom: 12 },
   modalBg: { flex: 1, backgroundColor: 'rgba(2, 6, 23, 0.85)', justifyContent: 'center', padding: 20 },
   dateModalCard: { backgroundColor: '#1E293B', borderRadius: 20, padding: 20, borderWidth: 1, borderColor: '#334155', maxHeight: '90%' },
   recommenderHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
