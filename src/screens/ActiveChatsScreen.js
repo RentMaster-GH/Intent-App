@@ -1,62 +1,58 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, ActivityIndicator, RefreshControl } from 'react-native';
-import { Image } from 'expo-image';
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, ActivityIndicator, RefreshControl, Image } from 'react-native';
 import { supabase } from '../lib/supabase';
 
 export default function ActiveChatsScreen({ navigation }) {
   const [chats, setChats] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [loadError, setLoadError] = useState('');
 
   const loadChats = useCallback(async () => {
+    setLoadError('');
     try {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) { setChats([]); return; }
 
-      // 1. My matches
-      const { data: matches, error } = await supabase.from('matches')
-        .select('*')
+      // 1. My matches — source of truth, no status filter, no message join
+      const { data: matches, error: matchError } = await supabase.from('matches')
+        .select('id, user_a, user_b, created_at')
         .or(`user_a.eq.${user.id},user_b.eq.${user.id}`)
         .order('created_at', { ascending: false });
-      if (error) {
-        if (error.message?.includes('does not exist') || error.code === '42P01') { setChats([]); return; }
-        throw error;
-      }
+      if (matchError) throw matchError;
       if (!matches?.length) { setChats([]); return; }
 
-      // 2. Other user profiles — real columns: name, location, intent, photos, photo_url
+      // 2. Other user profiles — FIX: ONLY real columns. No photo_url, no avatar_url.
+      // Real columns: id, name, age, location, intent, photos
       const otherIds = [...new Set(matches.map((m) => (m.user_a === user.id ? m.user_b : m.user_a)))];
-      const { data: profiles } = await supabase.from('profiles')
-        .select('id, name, age, location, intent, photos, photo_url')
+      const { data: profiles, error: profileError } = await supabase.from('profiles')
+        .select('id, name, age, location, intent, photos')
         .in('id', otherIds);
+      if (profileError) throw profileError;
+
       const byId = {};
       (profiles || []).forEach((p) => { byId[p.id] = p; });
 
-      // 3. Last message per match
+      // 3. Last message per match — optional, never filters out matches
       const matchIds = matches.map((m) => m.id);
       const { data: msgs } = await supabase.from('messages')
-        .select('match_id, sender_id, content, is_read, created_at')
+        .select('match_id, sender_id, content, created_at')
         .in('match_id', matchIds)
         .order('created_at', { ascending: false })
         .limit(200);
+      // NOTE: Removed is_read — if your messages table has no is_read column,
+      // the old query failed and msgs was null. Unread count is best-effort.
       const lastByMatch = {};
       (msgs || []).forEach((msg) => { if (!lastByMatch[msg.match_id]) lastByMatch[msg.match_id] = msg; });
 
-      // 4. Unread count
-      const unreadByMatch = {};
-      (msgs || []).forEach((msg) => { if (msg.sender_id !== user.id && !msg.is_read) unreadByMatch[msg.match_id] = (unreadByMatch[msg.match_id] || 0) + 1; });
-
       const list = matches
-        // FIX: Hide ghost matches — if the other user has no profile row, don't render "Intent User"
-        .filter((m) => {
-          const otherId = m.user_a === user.id ? m.user_b : m.user_a;
-          return !!byId[otherId];
-        })
         .map((m) => {
           const otherId = m.user_a === user.id ? m.user_b : m.user_a;
+          // FIX: Do NOT filter out matches if profile is missing.
+          // Show fallback name + letter avatar instead of hiding the chat.
           const p = byId[otherId] || {};
           const last = lastByMatch[m.id];
-          const photo = Array.isArray(p.photos) && p.photos[0] ? p.photos[0] : p.photo_url || null;
+          const photo = Array.isArray(p.photos) && p.photos[0] ? p.photos[0] : null;
           return {
             id: m.id, matchId: m.id, otherUserId: otherId,
             name: p.name || 'Matched User',
@@ -67,14 +63,14 @@ export default function ActiveChatsScreen({ navigation }) {
             lastMessage: last?.content || 'Say hi — you matched!',
             lastAt: last ? new Date(last.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '',
             lastAtMs: last ? new Date(last.created_at).getTime() : new Date(m.created_at).getTime(),
-            unread: unreadByMatch[m.id] || 0,
+            unread: 0,
           };
         });
-      // FIX: Real sort — most recent message first
       list.sort((a, b) => b.lastAtMs - a.lastAtMs);
       setChats(list);
     } catch (e) {
       console.error('[Chats] load failed:', e);
+      setLoadError(e.message || 'Could not load chats');
       setChats([]);
     } finally { setLoading(false); setRefreshing(false); }
   }, []);
@@ -102,6 +98,7 @@ export default function ActiveChatsScreen({ navigation }) {
       </View>
 
       <Text style={styles.sectionTitle}>Active Conversations (Max 3 — Global Rule)</Text>
+      {loadError ? <Text style={{ color: '#FCA5A5', fontSize: 12, marginBottom: 12 }}>⚠️ {loadError}</Text> : null}
 
       {chats.length === 0 ? (
         <View style={styles.emptyCard}>
@@ -113,7 +110,7 @@ export default function ActiveChatsScreen({ navigation }) {
       ) : chats.map((c) => (
         <TouchableOpacity key={c.id} style={styles.card} onPress={() => navigation.navigate('ChatDetail', { id: c.matchId, matchId: c.matchId, name: c.name, avatar: c.img, img: c.img, intent: c.intent, location: c.location, otherUserId: c.otherUserId })}>
           {c.img ? (
-            <Image source={{ uri: c.img }} style={styles.avatar} contentFit="cover" />
+            <Image source={{ uri: c.img }} style={styles.avatar} resizeMode="cover" />
           ) : (
             <View style={[styles.avatar, styles.avatarPlaceholder]}><Text style={styles.avatarLetter}>{c.name ? c.name[0].toUpperCase() : '?'}</Text></View>
           )}
@@ -123,7 +120,6 @@ export default function ActiveChatsScreen({ navigation }) {
             <Text style={styles.lastMsg} numberOfLines={1}>{c.lastMessage}</Text>
             <TouchableOpacity style={styles.graduateBtn} onPress={() => navigation.navigate('Dates')}><Text style={styles.graduateText}>Graduate to Date</Text></TouchableOpacity>
           </View>
-          {c.unread > 0 ? <View style={styles.unreadBadge}><Text style={styles.unreadText}>{c.unread}</Text></View> : null}
         </TouchableOpacity>
       ))}
 
@@ -163,13 +159,11 @@ const styles = StyleSheet.create({
   lastMsg: { color: '#CBD5E1', fontSize: 13, marginTop: 4 },
   graduateBtn: { backgroundColor: '#0F172A', borderWidth: 1, borderColor: '#334155', borderRadius: 10, paddingHorizontal: 10, paddingVertical: 6, marginTop: 8, alignSelf: 'flex-start' },
   graduateText: { color: '#FBBF24', fontSize: 11, fontWeight: '700' },
-  unreadBadge: { backgroundColor: '#F97316', width: 22, height: 22, borderRadius: 11, justifyContent: 'center', alignItems: 'center' },
-  unreadText: { color: '#fff', fontSize: 11, fontWeight: '800' },
+  footer: { flexDirection: 'row', gap: 24, marginTop: 16 },
+  link: { color: '#FBBF24', fontWeight: '700' },
   emptyCard: { backgroundColor: '#1E293B', borderRadius: 16, padding: 24, alignItems: 'center', borderWidth: 1, borderColor: '#334155' },
   emptyEmoji: { fontSize: 36 }, emptyTitle: { color: '#FFF', fontWeight: '800', fontSize: 18, marginTop: 10 },
   emptySub: { color: '#94A3B8', textAlign: 'center', marginTop: 6, lineHeight: 20 },
   emptyBtn: { backgroundColor: '#F97316', paddingHorizontal: 18, paddingVertical: 12, borderRadius: 12, marginTop: 16 },
   emptyBtnText: { color: '#fff', fontWeight: '800' },
-  footer: { flexDirection: 'row', gap: 24, marginTop: 16 },
-  link: { color: '#FBBF24', fontWeight: '700' },
 });
