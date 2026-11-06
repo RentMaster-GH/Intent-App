@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { View, Text, TextInput, TouchableOpacity, StyleSheet, ScrollView, Modal, Switch, Alert, ActivityIndicator, Platform } from 'react-native';
+import { View, Text, TextInput, TouchableOpacity, StyleSheet, ScrollView, Modal, Switch, Alert, ActivityIndicator } from 'react-native';
 import { Image } from 'expo-image';
 import { supabase } from '../lib/supabase';
 
@@ -38,9 +38,12 @@ export default function ProfileScreen({ navigation, route }) {
       setUserId(user.id);
       setEmail(user.email || '');
 
-      const { data: profile } = await supabase.from('profiles')
-        .select('name, bio, intent, location, age, photos, photo_url, avatar_url, notifications, show_on_discovery')
+      // FIX: Only select columns that actually exist. photo_url / avatar_url do not exist and made this query fail.
+      const { data: profile, error: profileError } = await supabase.from('profiles')
+        .select('name, bio, intent, location, age, photos, notifications, show_on_discovery')
         .eq('id', user.id).maybeSingle();
+
+      if (profileError) throw profileError;
 
       if (profile) {
         setName(profile.name || '');
@@ -48,20 +51,14 @@ export default function ProfileScreen({ navigation, route }) {
         if (profile.intent) setIntent(profile.intent);
         setLocation(profile.location || '');
         setAge(profile.age ? String(profile.age) : '');
-        // Photos: real array, or single photo_url/avatar_url. Never invent a stock face.
-        const arr = Array.isArray(profile.photos) ? profile.photos.filter(Boolean)
-          : profile.photo_url ? [profile.photo_url]
-          : profile.avatar_url ? [profile.avatar_url] : [];
-        setPhotos(arr);
+        setPhotos(Array.isArray(profile.photos) ? profile.photos.filter(Boolean) : []);
         setNotifications(profile.notifications ?? true);
         setShowOnDiscovery(profile.show_on_discovery ?? true);
       }
 
-      // Blocked users: real query. If table doesn't exist, shows 0, never fake Spam User.
       try {
         const { data: blocked } = await supabase.from('blocked_users').select('id, blocked_id, reason, created_at').eq('blocker_id', user.id);
         if (blocked) {
-          // Fetch names for blocked ids
           const ids = blocked.map(b => b.blocked_id).filter(Boolean);
           let nameMap = {};
           if (ids.length) {
@@ -71,7 +68,7 @@ export default function ProfileScreen({ navigation, route }) {
           setBlockedUsers(blocked.map(b => ({ id: b.id, blocked_id: b.blocked_id, name: nameMap[b.blocked_id] || 'User', reason: b.reason || '' })));
         }
       } catch { setBlockedUsers([]); }
-    } catch { Alert.alert('Could not load profile', 'Check connection and try again.'); }
+    } catch (e) { Alert.alert('Could not load profile', e.message || 'Check connection and try again.'); }
     finally { setLoading(false); }
   }, [navigation]);
 
@@ -100,39 +97,38 @@ export default function ProfileScreen({ navigation, route }) {
     navigation.reset({ index: 0, routes: [{ name: 'AuthPortal' }] });
   };
 
+  // FIX: Removed stray duplicate lines after this function that broke compilation.
   const saveToggle = async (column, value, setFn) => {
     if (!userId) return;
     setFn(value);
     const { error } = await supabase.from('profiles').upsert({ id: userId, email, [column]: value }, { onConflict: 'id' });
-    if (error) { setFn(!value); Alert.alert('Could not save', error.message); }
-};
-    if (error) { setFn(!value); Alert.alert('Could not save', 'Setting not saved.'); }
+    if (error) { setFn(!value); Alert.alert('Could not save', error.message || 'Setting not saved.'); }
   };
 
   const handleSaveProfile = async () => {
-  if (!userId) return;
-  if (!name.trim()) { Alert.alert('Name required', 'Enter your name.'); return; }
-  if (bio.trim().length > 0 && bio.trim().length < 10) { Alert.alert('Bio too short', 'Write at least 10 characters so people know your intent.'); return; }
-  setSaving(true);
-  try {
-    const { error } = await supabase.from('profiles').upsert({
-      id: userId,
-      email,
-      name: name.trim(),
-      bio: bio.trim(),
-      intent,
-      location: location.trim(),
-      age: age ? parseInt(age, 10) : null,
-      photos,
-      notifications,
-      show_on_discovery: showOnDiscovery,
-      updated_at: new Date().toISOString(),
-    }, { onConflict: 'id' });
-    if (error) throw error;
-    Alert.alert('Saved', 'Your profile has been updated.');
-  } catch (e) { Alert.alert('Save failed', e.message || 'Could not save profile.'); }
-  finally { setSaving(false); }
-};
+    if (!userId) return;
+    if (!name.trim()) { Alert.alert('Name required', 'Enter your name.'); return; }
+    if (bio.trim().length > 0 && bio.trim().length < 10) { Alert.alert('Bio too short', 'Write at least 10 characters so people know your intent.'); return; }
+    setSaving(true);
+    try {
+      const { error } = await supabase.from('profiles').upsert({
+        id: userId,
+        email,
+        name: name.trim(),
+        bio: bio.trim(),
+        intent,
+        location: location.trim(),
+        age: age ? parseInt(age, 10) : null,
+        photos,
+        notifications,
+        show_on_discovery: showOnDiscovery,
+        updated_at: new Date().toISOString(),
+      }, { onConflict: 'id' });
+      if (error) throw error;
+      Alert.alert('Saved', 'Your profile has been updated.');
+    } catch (e) { Alert.alert('Save failed', e.message || 'Could not save profile.'); }
+    finally { setSaving(false); }
+  };
 
   const addPhotoFromUrl = () => {
     const url = photoUrlInput.trim();
@@ -141,8 +137,8 @@ export default function ProfileScreen({ navigation, route }) {
     setPhotos([...photos, url]); setPhotoUrlInput('');
   };
 
+  // FIX: Allow removing last photo. Old code blocked it, so a bad photo could never be removed.
   const removePhoto = (idx) => {
-    if (photos.length <= 1) { Alert.alert('Keep one', 'You need at least 1 photo.'); return; }
     setPhotos(photos.filter((_, i) => i !== idx));
   };
 
@@ -199,7 +195,6 @@ export default function ProfileScreen({ navigation, route }) {
           <TouchableOpacity style={styles.settingsBtn} onPress={() => navigation.navigate('SettingsPortal')}><Text style={styles.settingsText}>⚙️ Settings</Text></TouchableOpacity>
         </View>
 
-        {/* OVERVIEW */}
         <View style={styles.section}>
           {mainPhoto ? (
             <Image source={{ uri: mainPhoto }} style={styles.avatar} contentFit="cover" />
@@ -212,7 +207,7 @@ export default function ProfileScreen({ navigation, route }) {
           <View style={styles.completeBox}>
             <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}><Text style={styles.completeLabel}>Profile Completeness</Text><Text style={styles.completePct}>{completeness}%</Text></View>
             <View style={styles.progressTrack}><View style={[styles.progressFill, { width: `${completeness}%` }]} /></View>
-            <Text style={styles.completeHint}>{completeness >= 100 ? '🎉 Complete — you show up more on Discovery.' : photos.length < 3 ? 'Add 2 more photos to reach 100% and get more matches.' : 'Almost there — finish your bio to reach 100%.'}</Text>
+            <Text style={styles.completeHint}>{completeness >= 100 ? '🎉 Complete — you show up more on Discovery.' : photos.length < 3 ? `Add ${3 - photos.length} more photo${3 - photos.length === 1 ? '' : 's'} to reach 100% and get more matches.` : 'Almost there — finish your bio to reach 100%.'}</Text>
           </View>
           <View style={styles.card}><Text style={styles.label}>BIO</Text><Text style={styles.value}>{bio || 'No bio yet — add one below.'}</Text></View>
           <View style={styles.card}><Text style={styles.label}>EMAIL</Text><Text style={styles.value}>{email || 'Not available'}</Text></View>
@@ -223,7 +218,6 @@ export default function ProfileScreen({ navigation, route }) {
           </View>
         </View>
 
-        {/* PHOTOS */}
         <View style={styles.section}>
           <Text style={[styles.label, { alignSelf: 'flex-start' }]}>PHOTOS ({photos.length}/6)</Text>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.photoRow}>
@@ -245,7 +239,6 @@ export default function ProfileScreen({ navigation, route }) {
           {photos.length === 0 && <Text style={{ color: '#94A3B8', fontSize: 12, marginTop: 8, alignSelf: 'flex-start' }}>No photos yet. Paste a URL above, then tap Save Profile.</Text>}
         </View>
 
-        {/* DETAILS */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Edit Details</Text>
           <Text style={styles.inputLabel}>Name</Text>
@@ -265,7 +258,6 @@ export default function ProfileScreen({ navigation, route }) {
           <TouchableOpacity style={styles.saveBtn} onPress={handleSaveProfile} disabled={saving}>{saving ? <ActivityIndicator color="#FFF" /> : <Text style={styles.saveBtnText}>Save Profile</Text>}</TouchableOpacity>
         </View>
 
-        {/* PREFERENCES */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Preferences</Text>
           <View style={styles.toggleRow}><Text style={styles.toggleLabel}>🔔 Notifications</Text><Switch value={notifications} onValueChange={(v) => saveToggle('notifications', v, setNotifications)} trackColor={{ false: '#334155', true: '#F97316' }} thumbColor="#FFF" /></View>
@@ -274,7 +266,6 @@ export default function ProfileScreen({ navigation, route }) {
           <TouchableOpacity style={styles.secondaryBtn} onPress={() => navigation.navigate('SettingsPortal')}><Text style={styles.secondaryBtnText}>⚙️ Open Full Settings Portal →</Text></TouchableOpacity>
         </View>
 
-        {/* SECURITY */}
         <View style={styles.section}>
           <Text style={styles.sectionTitle}>Security</Text>
           <TextInput style={styles.input} value={newPassword} onChangeText={setNewPassword} placeholder="New password (6+ chars)" placeholderTextColor="#64748B" secureTextEntry autoComplete="new-password" textContentType="newPassword" />
@@ -283,7 +274,6 @@ export default function ProfileScreen({ navigation, route }) {
           <TouchableOpacity style={styles.secondaryBtn} onPress={() => Alert.alert('Export Data', 'Export is not available yet. Contact support if you need a copy of your data.')}><Text style={styles.secondaryBtnText}>📥 Export My Data</Text></TouchableOpacity>
         </View>
 
-        {/* DANGER */}
         <View style={styles.section}>
           <Text style={[styles.sectionTitle, { color: '#FCA5A5' }]}>Danger Zone</Text>
           <View style={styles.dangerBox}>
