@@ -2,36 +2,34 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Image, Alert, ActivityIndicator, RefreshControl } from 'react-native';
 import { supabase } from '../lib/supabase';
 
-// Production: Demo preview data is ONLY for isDemo=true. Never used for logged-in users.
-// No MOCK_PROFILES import. No fallback to mocks on error / empty table.
 const DEMO_PREVIEW = [
-  { id: 'demo-1', name: 'Ama', age: 27, location: 'Accra, Ghana', city: 'Accra', country: 'Ghana', intent: 'Long-term Relationship 💛', bio: 'Intentional. Coffee lover. Looking for something real.', img: 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80', isDemo: true },
-  { id: 'demo-2', name: 'Kwame', age: 29, location: 'Accra, Ghana', city: 'Accra', country: 'Ghana', intent: 'Friendship First 🤝', bio: 'Gym, Afrobeats, and good conversation.', img: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=400&auto=format&fit=crop&q=80', isDemo: true },
-  { id: 'demo-3', name: 'Efua', age: 26, location: 'Kumasi, Ghana', city: 'Kumasi', country: 'Ghana', intent: 'Marriage Minded 💍', bio: 'Faith, family, and building something lasting.', img: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=400&auto=format&fit=crop&q=80', isDemo: true },
+  { id: 'demo-1', name: 'Ama', age: 27, location: 'Accra, Ghana', city: 'Accra', intent: 'Long-term Relationship 💛', bio: 'Intentional. Coffee lover. Looking for something real.', img: 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80', isDemo: true },
+  { id: 'demo-2', name: 'Kwame', age: 29, location: 'Accra, Ghana', city: 'Accra', intent: 'Friendship First 🤝', bio: 'Gym, Afrobeats, and good conversation.', img: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=400&auto=format&fit=crop&q=80', isDemo: true },
 ];
 
 const CITY_FILTERS = ['All', 'Accra', 'Kumasi', 'Lagos', 'Tema'];
 const INTENT_FILTERS = ['All Intents', 'Long-term Relationship 💛', 'Marriage Minded 💍', 'Friendship First 🤝'];
 
-const PLACEHOLDER_IMG = 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80';
-
-// Production: No invented defaults. If a profile has no age / city / bio, we show it as-is or hide the field.
-// Never default to 25 / Accra.
-const normalizeProfile = (p) => ({
-  id: p.id,
-  name: p.full_name || null,
-  age: p.age ?? null,
-  city: p.city || null,
-  country: p.country || null,
-  location: [p.city, p.country].filter(Boolean).join(', ') || null,
-  intent: p.intent || null,
-  bio: p.bio || '',
-  img: p.avatar_url || (Array.isArray(p.photos) && p.photos[0]) || null,
-  photos: Array.isArray(p.photos) ? p.photos : p.avatar_url ? [p.avatar_url] : [],
-  gender: p.gender || null,
-  seeking: p.seeking || null,
-  isDemo: false,
-});
+// FIX: Real columns are name / location / photos. NOT full_name / city / country / avatar_url.
+// location is a single string like "Accra" or "Accra, Ghana" — parse city from it.
+const normalizeProfile = (p) => {
+  const photos = Array.isArray(p.photos) ? p.photos.filter(Boolean) : [];
+  const location = p.location || '';
+  // City = part before comma. "Accra, Ghana" -> "Accra". "Tema" -> "Tema".
+  const city = location.split(',')[0]?.trim() || null;
+  return {
+    id: p.id,
+    name: p.name || null,
+    age: p.age ?? null,
+    city,
+    location: location || null,
+    intent: p.intent || null,
+    bio: p.bio || '',
+    img: photos[0] || null,
+    photos,
+    isDemo: false,
+  };
+};
 
 export default function DiscoveryScreen({ navigation, route }) {
   const isDemo = route?.params?.isDemo === true;
@@ -40,9 +38,7 @@ export default function DiscoveryScreen({ navigation, route }) {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [myId, setMyId] = useState(null);
-  const [myProfile, setMyProfile] = useState(null);
   const [likedIds, setLikedIds] = useState(new Set());
-  const [passedIds, setPassedIds] = useState(new Set());
   const [matchedIds, setMatchedIds] = useState(new Set());
   const [matchIdByUser, setMatchIdByUser] = useState({});
   const [liking, setLiking] = useState(false);
@@ -65,7 +61,6 @@ export default function DiscoveryScreen({ navigation, route }) {
 
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) {
-        // Production: No session -> no fake people. App.js should bounce to Auth, but don't invent data.
         setPeople([]);
         setMyId(null);
         setLoading(false); setRefreshing(false);
@@ -73,11 +68,6 @@ export default function DiscoveryScreen({ navigation, route }) {
       }
       setMyId(user.id);
 
-      // My profile — needed for gender/seeking filter. If no profile, App.js should have sent to Onboarding.
-      const { data: me } = await supabase.from('profiles').select('*').eq('id', user.id).maybeSingle();
-      if (me) setMyProfile(normalizeProfile(me));
-
-      // My likes (to exclude) + my matches (to exclude from deck — already matched)
       const [likesRes, matchesRes] = await Promise.all([
         supabase.from('likes').select('liked_id').eq('liker_id', user.id),
         supabase.from('matches').select('id, user_a, user_b').or(`user_a.eq.${user.id},user_b.eq.${user.id}`),
@@ -95,21 +85,24 @@ export default function DiscoveryScreen({ navigation, route }) {
       setMatchedIds(matched);
       setMatchIdByUser(matchMap);
 
-      // Real profiles only. No mock fallback.
-      const { data, error } = await supabase.from('profiles').select('*').neq('id', user.id).order('created_at', { ascending: false }).limit(50);
+      // FIX: Select only real columns. select('*') worked, but normalize now uses real names.
+      // Also: NO location filter here. Accra must see Tema. Ghana-wide / Global.
+      const { data, error } = await supabase.from('profiles')
+        .select('id, name, age, location, intent, bio, photos, show_on_discovery, created_at')
+        .neq('id', user.id)
+        .order('created_at', { ascending: false })
+        .limit(50);
       if (error) throw error;
 
-      // Production filter: exclude liked + matched. Do NOT invent age/city.
-      // Only show profiles with at least a name + photo + intent — otherwise card is empty.
       const real = (data || [])
         .map(normalizeProfile)
+        // FIX: name + photo required. img now comes from photos[0], so this works.
         .filter((p) => p.id && p.name && p.img)
         .filter((p) => !alreadyLiked.has(p.id) && !matched.has(p.id))
-        // Optional: respect seeking if both set — e.g. Woman seeking Man should not see Women
+        // Respect opt-out only. No gender/seeking filter — you don't collect gender.
         .filter((p) => {
-          if (!me?.seeking || !p.gender) return true;
-          if (me.seeking === 'Everyone') return true;
-          return p.gender === me.seeking;
+          const raw = (data || []).find(d => d.id === p.id);
+          return raw?.show_on_discovery !== false;
         });
 
       if (!mountedRef.current) return;
@@ -117,7 +110,6 @@ export default function DiscoveryScreen({ navigation, route }) {
       setIndex(0);
     } catch (e) {
       if (!mountedRef.current) return;
-      // Production: On error, show empty + error, NEVER fake people
       setPeople([]);
       setLoadError('Could not load people. Check your connection and pull to refresh.');
     } finally {
@@ -135,6 +127,8 @@ export default function DiscoveryScreen({ navigation, route }) {
 
   const filtered = useMemo(() => {
     return people.filter((p) => {
+      // City filter now works because city is parsed from location string.
+      // Default is 'All', so Accra sees Tema unless user taps a city chip.
       if (cityFilter !== 'All' && p.city !== cityFilter) return false;
       if (intentFilter !== 'All Intents') {
         if (intentFilter === 'Long-term Relationship 💛' && !p.intent?.includes('Long-term')) return false;
@@ -149,7 +143,6 @@ export default function DiscoveryScreen({ navigation, route }) {
 
   const handlePass = () => {
     if (!person) return;
-    setPassedIds((prev) => new Set(prev).add(person.id));
     setIndex((i) => i + 1);
   };
 
@@ -165,13 +158,11 @@ export default function DiscoveryScreen({ navigation, route }) {
     setLiking(true);
     try {
       const { error: likeError } = await supabase.from('likes').insert({ liker_id: myId, liked_id: person.id });
-      // 23505 = duplicate like — treat as success, don't crash
       if (likeError && likeError.code !== '23505') throw likeError;
       setLikedIds((prev) => new Set(prev).add(person.id));
 
       const { data: mutual } = await supabase.from('likes').select('id').eq('liker_id', person.id).eq('liked_id', myId).maybeSingle();
       if (mutual) {
-        // Mutual only — create match
         const [a, b] = myId < person.id ? [myId, person.id] : [person.id, myId];
         const { data: existing } = await supabase.from('matches').select('*').or(`and(user_a.eq.${myId},user_b.eq.${person.id}),and(user_a.eq.${person.id},user_b.eq.${myId})`).maybeSingle();
         let match = existing;
@@ -196,7 +187,6 @@ export default function DiscoveryScreen({ navigation, route }) {
     }
   };
 
-  // Production: Start Chat ONLY if already matched. No unilateral match creation.
   const handleStartChat = () => {
     if (!person) return;
     if (isDemo || person.isDemo) {
@@ -291,7 +281,11 @@ export default function DiscoveryScreen({ navigation, route }) {
       </ScrollView>
 
       <View style={styles.card}>
-        <Image source={{ uri: person.img || PLACEHOLDER_IMG }} style={styles.img} />
+        {person.img ? (
+          <Image source={{ uri: person.img }} style={styles.img} />
+        ) : (
+          <View style={[styles.img, styles.imgPlaceholder]}><Text style={styles.imgLetter}>{person.name?.[0]?.toUpperCase() || '?'}</Text></View>
+        )}
         <Text style={styles.name}>{person.name}{person.age ? `, ${person.age}` : ''} ✓</Text>
         {person.intent ? <Text style={styles.intent}>{person.intent}</Text> : null}
         {person.location ? <Text style={styles.meta}>{person.location}</Text> : null}
@@ -339,6 +333,8 @@ const styles = StyleSheet.create({
   filterTextActive: { color: '#fff' },
   card: { width: '100%', backgroundColor: '#1E293B', borderRadius: 20, padding: 16, borderWidth: 1, borderColor: '#334155', marginTop: 8 },
   img: { width: '100%', height: 320, borderRadius: 14, backgroundColor: '#0F172A' },
+  imgPlaceholder: { justifyContent: 'center', alignItems: 'center' },
+  imgLetter: { color: '#FBBF24', fontSize: 80, fontWeight: '800' },
   name: { color: '#FFF', fontSize: 22, fontWeight: '800', marginTop: 12 },
   intent: { color: '#FBBF24', marginTop: 4, fontWeight: '700' },
   meta: { color: '#94A3B8', marginTop: 4 },
