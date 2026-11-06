@@ -11,5 +11,12 @@ export default function LivekitVideoView({ room }) {
   const stream = trackRef?.publication?.track?.mediaStream;
   if (!stream) return null;
   const streamURL = typeof stream.toURL === 'function' ? stream.toURL() : stream;
-  return <RTCView streamURL={streamURL} style={{ width: '100%', height: '100%' }} objectFit="cover" mirror={trackRef.participant.identity === room.localParticipant.identity} />;
+  return (
+    <RTCView
+      streamURL={streamURL}
+      style={{ width: '100%', height: '100%' }}
+      objectFit="cover"
+      mirror={trackRef.participant.identity === room.localParticipant.identity}
+    />
+  );
 }
