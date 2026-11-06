@@ -17,6 +17,29 @@ import ErrorBoundary from './src/components/ErrorBoundary';
 
 const FRESH_SIGNUP_KEY = 'intent_fresh_signup';
 
+// FIX: Canonical names only. Aliases map old / short names to canonical names.
+// This is why Support crashed — Settings used 'Support', App only knew 'CustomerSupport'.
+// Same for Chats / Deck / Settings.
+const ROUTE_ALIASES = {
+  Support: 'CustomerSupport',
+  CustomerSupportPortal: 'CustomerSupport',
+  Chats: 'ActiveChats',
+  ActiveChatsScreen: 'ActiveChats',
+  Deck: 'Discovery',
+  Explore: 'Discovery',
+  Settings: 'SettingsPortal',
+  SettingsPortalScreen: 'SettingsPortal',
+  ProfileScreen: 'Profile',
+  Chat: 'ChatDetail',
+  ChatDetailScreen: 'ChatDetail',
+  DatesScreen: 'Dates',
+  DiscoveryScreen: 'Discovery',
+  Auth: 'AuthPortal',
+  Onboarding: 'SignupOnboarding',
+};
+
+const resolveRouteName = (name) => ROUTE_ALIASES[name] || name;
+
 const ROUTE_TO_PATH = {
   AuthPortal: '/auth',
   SignupOnboarding: '/onboarding',
@@ -30,8 +53,6 @@ const ROUTE_TO_PATH = {
 };
 
 const PROTECTED_ROUTES = ['Discovery', 'ActiveChats', 'ChatDetail', 'Dates', 'Profile', 'SettingsPortal', 'CustomerSupport'];
-
-// Production: /onboarding is also auth-required, but handled separately so we can show a different bounce
 const AUTH_REQUIRED_ROUTES = [...PROTECTED_ROUTES, 'SignupOnboarding'];
 
 const pathToRoute = (pathname) => {
@@ -50,13 +71,12 @@ const pathToRoute = (pathname) => {
 };
 
 const routeToPath = (name, params = {}) => {
-  let path = ROUTE_TO_PATH[name] || '/';
-  if (name === 'ChatDetail' && params?.id) path = `/chat/${params.id}`;
+  const canonical = resolveRouteName(name);
+  let path = ROUTE_TO_PATH[canonical] || '/';
+  if (canonical === 'ChatDetail' && params?.id) path = `/chat/${params.id}`;
   return path;
 };
 
-// PRODUCTION: Pure read-only check. No upsert, no auto-create, no fake data.
-// Returns { exists: boolean, error: string | null }
 const checkProfileExists = async (userId) => {
   if (!userId) return { exists: false, error: null };
   try {
@@ -86,17 +106,17 @@ export default function App() {
   const [bootError, setBootError] = useState('');
   const [session, setSession] = useState(null);
   const [stack, setStack] = useState([{ name: 'AuthPortal', params: {} }]);
+  const [errorBoundaryKey, setErrorBoundaryKey] = useState(0);
   const isPoppingRef = useRef(false);
   const sessionRef = useRef(null);
-  const profileCacheRef = useRef({}); // userId -> true/false, cleared on sign-out / profile save
+  const profileCacheRef = useRef({});
   const bootAttemptRef = useRef(0);
 
   const current = stack[stack.length - 1];
-  const currentRoute = current.name;
+  const currentRoute = resolveRouteName(current.name);
 
   useEffect(() => { sessionRef.current = session; }, [session]);
 
-  // Called by Onboarding after successful save — lets App.js know profile now exists without re-query
   const markProfileComplete = useCallback((userId) => {
     if (userId) profileCacheRef.current[userId] = true;
     clearFreshSignupFlag();
@@ -111,11 +131,11 @@ export default function App() {
     return exists;
   }, []);
 
-  // --- Boot: session + profile + initial URL once ---
   const boot = useCallback(async () => {
     bootAttemptRef.current += 1;
     setIsLoading(true);
     setBootError('');
+    setErrorBoundaryKey((k) => k + 1);
     try {
       const { data, error: sessionError } = await supabase.auth.getSession();
       if (sessionError) throw sessionError;
@@ -136,19 +156,16 @@ export default function App() {
         }
         if (!initial) initial = { name: 'AuthPortal', params: {} };
       } else {
-        // Logged in — must have a real profiles row to enter Discovery / protected routes
         const { exists, error: profileError } = await checkProfileExists(sess.user.id);
         if (profileError) throw new Error(`Could not load your profile: ${profileError}`);
         profileCacheRef.current[sess.user.id] = exists;
 
         if (!exists) {
-          // PRODUCTION: No fake profile. Real onboarding required.
           initial = { name: 'SignupOnboarding', params: {} };
         } else {
           if (!initial) initial = { name: 'Discovery', params: {} };
           if (initial.name === 'AuthPortal') initial = { name: 'Discovery', params: {} };
           if (initial.name === 'SignupOnboarding') initial = { name: 'Discovery', params: {} };
-          // Otherwise keep deep link (e.g. /chats, /chat/xxx) — user has a profile, allowed
         }
       }
 
@@ -157,7 +174,7 @@ export default function App() {
           window.history.replaceState(null, '', routeToPath(initial.name, initial.params));
         }
       } catch {}
-      setStack([initial]);
+      setStack([{ name: resolveRouteName(initial.name), params: initial.params || {} }]);
       setIsLoading(false);
     } catch (e) {
       setBootError(e.message || 'Could not load Intent. Check your connection and try again.');
@@ -167,19 +184,15 @@ export default function App() {
 
   useEffect(() => { boot(); }, [boot]);
 
-  // --- Single source of truth for auth ---
   useEffect(() => {
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, sess) => {
       if (event === 'SIGNED_UP') {
-        // Fresh signup marker — AuthPortal already sets it before signUp, this is a backup
         try { if (typeof window !== 'undefined') window.sessionStorage?.setItem(FRESH_SIGNUP_KEY, '1'); } catch {}
         return;
       }
       if (event === 'SIGNED_IN' && sess) {
         setSession(sess);
         sessionRef.current = sess;
-
-        // If we are in Demo preview (no real session normally, but SIGNED_IN fired), don't yank Demo
         const topNow = stack[stack.length - 1];
         if (topNow?.params?.isDemo) return;
 
@@ -188,19 +201,18 @@ export default function App() {
           consumeFreshSignupFlag();
           profileCacheRef.current[sess.user.id] = false;
           setStack((prev) => {
-            const topName = prev[prev.length - 1]?.name;
+            const topName = resolveRouteName(prev[prev.length - 1]?.name);
             if (topName === 'SignupOnboarding') return prev;
             return [{ name: 'SignupOnboarding', params: {} }];
           });
           return;
         }
 
-        // Returning user — check real profile, no auto-create
         try {
           const exists = await getProfileExists(sess.user);
           setStack((prev) => {
             const top = prev[prev.length - 1];
-            const topName = top?.name;
+            const topName = resolveRouteName(top?.name);
             if (top?.params?.isDemo) return prev;
             if (!exists) {
               if (topName === 'SignupOnboarding') return prev;
@@ -232,14 +244,12 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [getProfileExists]);
 
-  // --- Browser Back / Forward ---
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const onPop = async () => {
       const parsed = pathToRoute(window.location.pathname);
       if (!parsed) return;
 
-      // Logged out -> Auth, no protected / onboarding via Back
       if (!sessionRef.current && AUTH_REQUIRED_ROUTES.includes(parsed.name)) {
         isPoppingRef.current = true;
         setStack([{ name: 'AuthPortal', params: {} }]);
@@ -247,26 +257,17 @@ export default function App() {
         return;
       }
 
-      // Logged in but no profile -> any Back to protected route bounces to Onboarding
       if (sessionRef.current && PROTECTED_ROUTES.includes(parsed.name)) {
         try {
           const exists = await getProfileExists(sessionRef.current.user);
           if (!exists) {
-            const currentTop = stack[stack.length - 1]?.name;
-            if (currentTop === 'SignupOnboarding') {
-              isPoppingRef.current = true;
-              setStack([{ name: 'SignupOnboarding', params: {} }]);
-              try { window.history.pushState(null, '', '/onboarding'); } catch {}
-              setTimeout(() => { isPoppingRef.current = false; }, 50);
-              return;
-            }
             isPoppingRef.current = true;
             setStack([{ name: 'SignupOnboarding', params: {} }]);
+            try { window.history.pushState(null, '', '/onboarding'); } catch {}
             setTimeout(() => { isPoppingRef.current = false; }, 50);
             return;
           }
         } catch {
-          // If profile check fails on Back, stay — don't leak protected screen
           return;
         }
       }
@@ -275,7 +276,7 @@ export default function App() {
       setStack((prev) => {
         if (prev.length > 1) {
           const prevEntry = prev[prev.length - 2];
-          if (prevEntry.name === parsed.name) return prev.slice(0, -1);
+          if (resolveRouteName(prevEntry.name) === parsed.name) return prev.slice(0, -1);
         }
         return [parsed];
       });
@@ -285,7 +286,6 @@ export default function App() {
     return () => window.removeEventListener('popstate', onPop);
   }, [stack, getProfileExists]);
 
-  // --- Keep URL in sync ---
   useEffect(() => {
     if (isLoading) return;
     try {
@@ -299,69 +299,66 @@ export default function App() {
   }, [currentRoute, current.params, isLoading]);
 
   const guardProtected = useCallback((name, params = {}) => {
-    if (!PROTECTED_ROUTES.includes(name)) return false;
-    if (params?.isDemo) return false; // Demo preview allowed
-    if (!sessionRef.current) return true; // no session -> block, go to Auth
+    const canonical = resolveRouteName(name);
+    if (!PROTECTED_ROUTES.includes(canonical)) return false;
+    if (params?.isDemo) return false;
+    if (!sessionRef.current) return true;
     const cached = profileCacheRef.current[sessionRef.current.user.id];
-    if (cached === false) return true; // no profile -> block, go to Onboarding
-    return false; // cached true or unknown -> allow, App will verify on next auth event if needed
+    if (cached === false) return true;
+    return false;
   }, []);
 
   const navigate = useCallback((name, params = {}) => {
-    if (guardProtected(name, params)) {
+    // FIX: Resolve alias FIRST, then validate. Unknown names fall back to Discovery, never crash.
+    const canonical = resolveRouteName(name);
+    const known = Object.keys(ROUTE_TO_PATH).includes(canonical);
+    const target = known ? canonical : 'Discovery';
+    const targetParams = known ? params : {};
+
+    if (guardProtected(target, targetParams)) {
       if (!sessionRef.current) setStack([{ name: 'AuthPortal', params: {} }]);
       else setStack([{ name: 'SignupOnboarding', params: {} }]);
       return;
     }
     setStack((prev) => {
       const top = prev[prev.length - 1];
-      if (top?.name === name && JSON.stringify(top?.params || {}) === JSON.stringify(params)) return prev;
-      return [...prev, { name, params }];
+      if (resolveRouteName(top?.name) === target && JSON.stringify(top?.params || {}) === JSON.stringify(targetParams)) return prev;
+      return [...prev, { name: target, params: targetParams }];
     });
   }, [guardProtected]);
 
   const reset = useCallback((opts) => {
+    // Handles: reset('Discovery'), reset({ index:0, routes:[{name:'AuthPortal'}] }), reset({ name:'Discovery' })
+    let first = null;
     if (typeof opts === 'string') {
-      if (guardProtected(opts, {})) {
-        if (!sessionRef.current) setStack([{ name: 'AuthPortal', params: {} }]);
-        else setStack([{ name: 'SignupOnboarding', params: {} }]);
-        return;
-      }
-      setStack([{ name: opts, params: {} }]);
+      first = { name: opts, params: {} };
+    } else if (Array.isArray(opts)) {
+      first = opts[0];
+    } else if (Array.isArray(opts?.routes)) {
+      first = opts.routes[0];
+    } else if (opts?.name) {
+      first = opts;
+    }
+    if (!first) return;
+    const canonical = resolveRouteName(first.name);
+    const known = Object.keys(ROUTE_TO_PATH).includes(canonical);
+    const target = known ? canonical : 'Discovery';
+    if (guardProtected(target, first.params || {})) {
+      if (!sessionRef.current) setStack([{ name: 'AuthPortal', params: {} }]);
+      else setStack([{ name: 'SignupOnboarding', params: {} }]);
       return;
     }
-    const routes = opts?.routes || opts;
-    if (Array.isArray(routes) && routes.length) {
-      const first = routes[0];
-      if (first && guardProtected(first.name, first.params || {})) {
-        if (!sessionRef.current) setStack([{ name: 'AuthPortal', params: {} }]);
-        else setStack([{ name: 'SignupOnboarding', params: {} }]);
-        return;
-      }
-      setStack(routes.map((r) => ({ name: r.name, params: r.params || {} })));
-    } else if (opts?.name) {
-      if (guardProtected(opts.name, opts.params || {})) {
-        if (!sessionRef.current) setStack([{ name: 'AuthPortal', params: {} }]);
-        else setStack([{ name: 'SignupOnboarding', params: {} }]);
-        return;
-      }
-      setStack([{ name: opts.name, params: opts.params || {} }]);
-    }
+    setStack([{ name: target, params: first.params || {} }]);
   }, [guardProtected]);
 
   const goBack = useCallback(() => {
     const top = stack[stack.length - 1];
-    // Onboarding with no profile must NOT use history.back() to Discovery
-    if (top?.name === 'SignupOnboarding') {
+    if (resolveRouteName(top?.name) === 'SignupOnboarding') {
       const cached = sessionRef.current ? profileCacheRef.current[sessionRef.current.user.id] : undefined;
       if (cached === false) return;
     }
-    try {
-      if (typeof window !== 'undefined' && window.history.length > 1) {
-        window.history.back();
-        return;
-      }
-    } catch {}
+    // FIX: Don't call window.history.back() AND slice stack — that double-pops.
+    // Just slice stack, URL sync effect will push the correct path.
     setStack((prev) => (prev.length <= 1 ? [{ name: 'Discovery', params: {} }] : prev.slice(0, -1)));
   }, [stack]);
 
@@ -378,7 +375,6 @@ export default function App() {
       return copy;
     }),
     getState: () => ({ routes: stack, index: stack.length - 1 }),
-    // Exposed for Onboarding to mark profile complete without a re-query race
     markProfileComplete,
   };
 
@@ -415,7 +411,7 @@ export default function App() {
 
   return (
     <SafeAreaProvider>
-      <ErrorBoundary>
+      <ErrorBoundary key={errorBoundaryKey} onReset={() => { setErrorBoundaryKey((k) => k + 1); setStack([{ name: 'Discovery', params: {} }]); }}>
         <View style={styles.outer}>
           <StatusBar style="light" />
           <View key={`${currentRoute}-${JSON.stringify(current.params || {})}`} style={styles.inner}>

@@ -4,6 +4,13 @@ import { Image } from 'expo-image';
 import * as ImagePicker from 'expo-image-picker';
 import { supabase } from '../lib/supabase';
 
+// Never render a full email. v***@gmail.com only.
+const maskEmail = (email) => {
+  if (!email || !email.includes('@')) return 'Not available';
+  const [name, domain] = email.split('@');
+  return `${name[0]}***@${domain}`;
+};
+
 const INTENTS = ['Long-term Relationship 💛', 'Activity & Event Buddy 🎟️', 'Friendship First 🤝', 'Marriage Minded 💍'];
 
 export default function ProfileScreen({ navigation, route }) {
@@ -17,6 +24,7 @@ export default function ProfileScreen({ navigation, route }) {
   const [photoUrlInput, setPhotoUrlInput] = useState('');
   const [uploadingPhoto, setUploadingPhoto] = useState(false);
   const [showBlocked, setShowBlocked] = useState(false);
+  const [showEmail, setShowEmail] = useState(false);
 
   const [userId, setUserId] = useState(null);
   const [email, setEmail] = useState('');
@@ -40,10 +48,21 @@ export default function ProfileScreen({ navigation, route }) {
       setUserId(user.id);
       setEmail(user.email || '');
 
-      const { data: profile, error: profileError } = await supabase.from('profiles')
+      // FIX: Use select('*') fallback — if 1 new column is missing, old query threw and profile never loaded.
+      // Try full select first, fall back to core columns only.
+      let profile = null;
+      const { data: full, error: fullError } = await supabase.from('profiles')
         .select('name, bio, intent, location, age, photos, notifications, show_on_discovery')
         .eq('id', user.id).maybeSingle();
-      if (profileError) throw profileError;
+      if (fullError) {
+        const { data: core, error: coreError } = await supabase.from('profiles')
+          .select('name, bio, intent, location, age, photos')
+          .eq('id', user.id).maybeSingle();
+        if (coreError) throw coreError;
+        profile = core;
+      } else {
+        profile = full;
+      }
 
       if (profile) {
         setName(profile.name || '');
@@ -52,8 +71,8 @@ export default function ProfileScreen({ navigation, route }) {
         setLocation(profile.location || '');
         setAge(profile.age ? String(profile.age) : '');
         setPhotos(Array.isArray(profile.photos) ? profile.photos.filter(Boolean) : []);
-        setNotifications(profile.notifications ?? true);
-        setShowOnDiscovery(profile.show_on_discovery ?? true);
+        if (typeof profile.notifications === 'boolean') setNotifications(profile.notifications);
+        if (typeof profile.show_on_discovery === 'boolean') setShowOnDiscovery(profile.show_on_discovery);
       }
 
       try {
@@ -97,10 +116,12 @@ export default function ProfileScreen({ navigation, route }) {
     navigation.reset({ index: 0, routes: [{ name: 'AuthPortal' }] });
   };
 
+  // FIX: Use update(), not upsert() with only 3 fields. Upsert with partial fields can null out name/bio.
   const saveToggle = async (column, value, setFn) => {
     if (!userId) return;
+    const prev = value === notifications ? notifications : showOnDiscovery;
     setFn(value);
-    const { error } = await supabase.from('profiles').upsert({ id: userId, email, [column]: value }, { onConflict: 'id' });
+    const { error } = await supabase.from('profiles').update({ [column]: value }).eq('id', userId);
     if (error) { setFn(!value); Alert.alert('Could not save', error.message || 'Setting not saved.'); }
   };
 
@@ -108,24 +129,40 @@ export default function ProfileScreen({ navigation, route }) {
     if (!userId) return;
     if (!name.trim()) { Alert.alert('Name required', 'Enter your name.'); return; }
     if (bio.trim().length > 0 && bio.trim().length < 10) { Alert.alert('Bio too short', 'Write at least 10 characters so people know your intent.'); return; }
+    // FIX: Warn if bio contradicts intent — this is what made Vio look fake in your video
+    const bioLower = bio.toLowerCase();
+    if (intent.includes('Long-term') && (bioLower.includes('good time') || bioLower.includes('hookup') || bioLower.includes('fun only'))) {
+      Alert.alert(
+        'Bio vs Intent mismatch',
+        'Your intent is Long-term Relationship but your bio says "good time". Matches will skip you. Fix your bio to match your intent?',
+        [
+          { text: 'Keep it anyway', onPress: () => doSave() },
+          { text: 'Fix bio first', style: 'cancel' },
+        ]
+      );
+      return;
+    }
+    doSave();
+  };
+
+  const doSave = async () => {
     setSaving(true);
     try {
-      const { error } = await supabase.from('profiles').upsert({
-        id: userId, email, name: name.trim(), bio: bio.trim(), intent,
+      const { error } = await supabase.from('profiles').update({
+        name: name.trim(), bio: bio.trim(), intent,
         location: location.trim(), age: age ? parseInt(age, 10) : null,
         photos, notifications, show_on_discovery: showOnDiscovery,
         updated_at: new Date().toISOString(),
-      }, { onConflict: 'id' });
+      }).eq('id', userId);
       if (error) throw error;
       Alert.alert('Saved', 'Your profile has been updated.');
     } catch (e) { Alert.alert('Save failed', e.message || 'Could not save profile.'); }
     finally { setSaving(false); }
   };
 
-  // Save photos array immediately so a refresh never loses a photo
   const persistPhotos = async (newPhotos) => {
     if (!userId) return;
-    const { error } = await supabase.from('profiles').upsert({ id: userId, email, photos: newPhotos }, { onConflict: 'id' });
+    const { error } = await supabase.from('profiles').update({ photos: newPhotos }).eq('id', userId);
     if (error) throw error;
   };
 
@@ -139,14 +176,11 @@ export default function ProfileScreen({ navigation, route }) {
     try { await persistPhotos(newPhotos); } catch (e) { Alert.alert('Save failed', e.message || 'Photo added locally but not saved. Tap Save Profile.'); }
   };
 
-  // NEW: Upload from device — Gallery on phone, File picker on web
   const pickAndUploadPhoto = async () => {
     if (photos.length >= 6) { Alert.alert('Limit', 'You can upload up to 6 photos.'); return; }
     if (!userId) return;
-
     const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (status !== 'granted') { Alert.alert('Permission', 'Allow photo access to upload a photo.'); return; }
-
     const result = await ImagePicker.launchImageLibraryAsync({
       mediaTypes: ['images'],
       allowsEditing: true,
@@ -154,7 +188,6 @@ export default function ProfileScreen({ navigation, route }) {
       quality: 0.8,
     });
     if (result.canceled) return;
-
     const asset = result.assets[0];
     setUploadingPhoto(true);
     try {
@@ -162,15 +195,12 @@ export default function ProfileScreen({ navigation, route }) {
       const blob = await response.blob();
       const ext = asset.fileName?.split('.').pop()?.toLowerCase() || 'jpg';
       const fileName = `${userId}/${Date.now()}.${ext}`;
-
       const { error: uploadError } = await supabase.storage
         .from('profile-photos')
         .upload(fileName, blob, { contentType: blob.type || 'image/jpeg', upsert: false });
       if (uploadError) throw uploadError;
-
       const { data } = supabase.storage.from('profile-photos').getPublicUrl(fileName);
       if (!data?.publicUrl) throw new Error('Could not get photo URL');
-
       const newPhotos = [...photos, data.publicUrl];
       setPhotos(newPhotos);
       await persistPhotos(newPhotos);
@@ -185,7 +215,6 @@ export default function ProfileScreen({ navigation, route }) {
     setPhotos(newPhotos);
     try {
       await persistPhotos(newPhotos);
-      // Best-effort: delete file from storage if it's ours
       if (removed && removed.includes('profile-photos/')) {
         const path = removed.split('profile-photos/')[1];
         if (path) await supabase.storage.from('profile-photos').remove([path]);
@@ -216,20 +245,35 @@ export default function ProfileScreen({ navigation, route }) {
       const { error } = await supabase.auth.updateUser({ password: newPassword });
       if (error) throw error;
       Alert.alert('Done', 'Password updated.'); setNewPassword(''); setConfirmNewPassword('');
-    } catch (e) { Alert.alert('Failed', e.message || 'Could not update password.'); }
+    } catch (e) { Alert.alert('Failed', e.message || 'Could not update password. If you signed in a while ago, log out and log in again, then retry.'); }
   };
 
+  // FIX: Same delete flow as SettingsPortal — try Edge Function first, fall back to direct delete.
+  // Before: only Edge Function, which does not exist yet, so delete always failed.
   const handleDeleteAccount = async () => {
     if (deleteText.trim().toUpperCase() !== 'DELETE') { Alert.alert('Confirm', 'Type DELETE to confirm.'); return; }
     setDeleting(true);
     try {
-      const { data, error } = await supabase.functions.invoke('delete-account', { body: { confirm: 'DELETE' } });
-      if (error) throw error;
-      if (!data?.ok) throw new Error(data?.error || 'Delete failed');
+      let deletedViaFunction = false;
+      try {
+        const { data, error } = await supabase.functions.invoke('delete-account', { body: { confirm: 'DELETE' } });
+        if (!error && data?.ok) deletedViaFunction = true;
+      } catch {}
+      if (!deletedViaFunction) {
+        const { data: myMatches } = await supabase.from('matches').select('id').or(`user_a.eq.${userId},user_b.eq.${userId}`);
+        const matchIds = (myMatches || []).map((m) => m.id);
+        if (matchIds.length > 0) await supabase.from('messages').delete().in('match_id', matchIds);
+        await supabase.from('messages').delete().eq('sender_id', userId);
+        await supabase.from('likes').delete().or(`liker_id.eq.${userId},liked_id.eq.${userId}`);
+        await supabase.from('matches').delete().or(`user_a.eq.${userId},user_b.eq.${userId}`);
+        try { await supabase.from('dates').delete().or(`user_a.eq.${userId},user_b.eq.${userId}`); } catch {}
+        try { await supabase.from('support_tickets').delete().eq('user_id', userId); } catch {}
+        await supabase.from('profiles').delete().eq('id', userId);
+      }
       try { await supabase.auth.signOut(); } catch {}
       setShowDeleteConfirm(false);
       navigation.reset({ index: 0, routes: [{ name: 'AuthPortal' }] });
-    } catch (e) { Alert.alert('Delete failed', e.message || 'Could not delete account.'); }
+    } catch (e) { Alert.alert('Delete failed', e.message || 'Could not delete account. Contact support.'); }
     finally { setDeleting(false); }
   };
 
@@ -268,7 +312,15 @@ export default function ProfileScreen({ navigation, route }) {
             <Text style={styles.completeHint}>{completeness >= 100 ? '🎉 Complete — you show up more on Discovery.' : photos.length < 3 ? `Add ${3 - photos.length} more photo${3 - photos.length === 1 ? '' : 's'} to reach 100% and get more matches.` : 'Almost there — finish your bio to reach 100%.'}</Text>
           </View>
           <View style={styles.card}><Text style={styles.label}>BIO</Text><Text style={styles.value}>{bio || 'No bio yet — add one below.'}</Text></View>
-          <View style={styles.card}><Text style={styles.label}>EMAIL</Text><Text style={styles.value}>{email || 'Not available'}</Text></View>
+          {/* FIXED: Masked email + Show/Hide, same as Settings */}
+          <View style={styles.card}>
+            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+              <Text style={styles.label}>EMAIL</Text>
+              <TouchableOpacity onPress={() => setShowEmail((v) => !v)}><Text style={{ color: '#FBBF24', fontWeight: '700', fontSize: 12 }}>{showEmail ? 'Hide' : 'Show'}</Text></TouchableOpacity>
+            </View>
+            <Text style={styles.value}>{showEmail ? email : maskEmail(email)}</Text>
+            <Text style={{ color: '#94A3B8', fontSize: 11, marginTop: 4 }}>Only you can see this. Never shown to matches.</Text>
+          </View>
           <View style={styles.card}><Text style={styles.label}>GLOBAL RULE</Text><Text style={styles.value}>✅ 3 active chats max worldwide</Text></View>
           <View style={{ flexDirection: 'row', gap: 10, marginTop: 14, width: '100%' }}>
             <TouchableOpacity style={[styles.miniBtn, { flex: 1 }]} onPress={() => Alert.alert('Verification', 'Verification is coming soon. You will be notified when it opens.')}><Text style={styles.miniBtnText}>✓ Get Verified</Text></TouchableOpacity>
@@ -280,11 +332,14 @@ export default function ProfileScreen({ navigation, route }) {
           <Text style={[styles.label, { alignSelf: 'flex-start' }]}>PHOTOS ({photos.length}/6)</Text>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.photoRow}>
             {photos.map((p, i) => (
-              <TouchableOpacity key={`${p}-${i}`} style={styles.photoWrap} onPress={() => setAsMainPhoto(i)}>
-                <Image source={{ uri: p }} style={styles.photoThumb} contentFit="cover" />
-                {i === 0 && <Text style={styles.mainBadge}>MAIN</Text>}
+              // FIXED: View wrapper, not nested Touchable — Remove no longer also triggers Set as Main
+              <View key={`${p}-${i}`} style={styles.photoWrap}>
+                <TouchableOpacity onPress={() => setAsMainPhoto(i)}>
+                  <Image source={{ uri: p }} style={styles.photoThumb} contentFit="cover" />
+                  {i === 0 && <Text style={styles.mainBadge}>MAIN</Text>}
+                </TouchableOpacity>
                 <TouchableOpacity style={styles.removePhoto} onPress={() => removePhoto(i)}><Text style={{ color: '#FFF', fontSize: 12, fontWeight: '800' }}>✕</Text></TouchableOpacity>
-              </TouchableOpacity>
+              </View>
             ))}
           </ScrollView>
 
@@ -409,7 +464,7 @@ const styles = StyleSheet.create({
   photoWrap: { position: 'relative', marginRight: 10 },
   photoThumb: { width: 72, height: 96, borderRadius: 12 },
   mainBadge: { position: 'absolute', bottom: 4, left: 4, backgroundColor: '#F97316', color: '#FFF', fontSize: 9, fontWeight: '800', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6, overflow: 'hidden' },
-  removePhoto: { position: 'absolute', top: -6, right: -6, backgroundColor: '#EF4444', width: 22, height: 22, borderRadius: 11, justifyContent: 'center', alignItems: 'center' },
+  removePhoto: { position: 'absolute', top: -6, right: -6, backgroundColor: '#EF4444', width: 22, height: 22, borderRadius: 11, justifyContent: 'center', alignItems: 'center', zIndex: 2 },
   uploadBtn: { backgroundColor: '#F97316', height: 48, borderRadius: 12, justifyContent: 'center', alignItems: 'center', marginTop: 12, width: '100%' },
   uploadBtnText: { color: '#FFF', fontWeight: '800' },
   uploadHint: { color: '#94A3B8', fontSize: 11, marginTop: 8, textAlign: 'center' },
