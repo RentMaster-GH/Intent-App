@@ -45,6 +45,10 @@ const formatTimer = (sec) => {
 };
 const isUuidLike = (v) => typeof v === 'string' && v.length > 20 && v.includes('-');
 
+// --- FIX: messages table column is inconsistent — read any of these ---
+const getMessageText = (mm) => mm?.content ?? mm?.text ?? mm?.message ?? mm?.body ?? mm?.message_text ?? '';
+const MSG_TEXT_COLS = ['content', 'text', 'message', 'body'];
+
 const getWebParams = () => {
   if (Platform.OS !== 'web') return {};
   try {
@@ -107,19 +111,17 @@ export default function ChatDetailScreen({ route, navigation }) {
   const [reportReason, setReportReason] = useState('Harassment or disrespectful behavior');
   const listRef = useRef(null);
 
-  // --- REFS: fix stale-closure bug — send must use latest ids, not old render ---
   const matchIdRef = useRef(paramMatchId);
   const otherUserIdRef = useRef(paramOtherId);
   const userIdRef = useRef(null);
+  const textColRef = useRef('content'); // learned working column, cached
   const setMatchIdBoth = (id) => { matchIdRef.current = id; setMatchId(id); };
   const setOtherIdBoth = (id) => { otherUserIdRef.current = id; setOtherUserId(id); };
 
-  // Resolve match_id at send-time, never rely on state alone
   const ensureMatchId = useCallback(async () => {
     if (matchIdRef.current) return matchIdRef.current;
     const uid = userIdRef.current;
     if (!uid) return null;
-    // 1) rawId is match_id?
     if (rawId && isUuidLike(rawId)) {
       const { data: m } = await supabase.from('matches').select('id, user_a, user_b').eq('id', rawId).maybeSingle();
       if (m) {
@@ -128,17 +130,11 @@ export default function ChatDetailScreen({ route, navigation }) {
         setMatchIdBoth(m.id);
         return m.id;
       }
-      // 2) rawId is otherUserId
       const { data: existing } = await supabase.from('matches').select('id')
         .or(`and(user_a.eq.${uid},user_b.eq.${rawId}),and(user_a.eq.${rawId},user_b.eq.${uid})`)
         .maybeSingle();
-      if (existing) {
-        setOtherIdBoth(rawId);
-        setMatchIdBoth(existing.id);
-        return existing.id;
-      }
+      if (existing) { setOtherIdBoth(rawId); setMatchIdBoth(existing.id); return existing.id; }
     }
-    // 3) otherUserId known
     if (otherUserIdRef.current) {
       const { data: existing } = await supabase.from('matches').select('id')
         .or(`and(user_a.eq.${uid},user_b.eq.${otherUserIdRef.current}),and(user_a.eq.${otherUserIdRef.current},user_b.eq.${uid})`)
@@ -205,7 +201,6 @@ export default function ChatDetailScreen({ route, navigation }) {
       if (!resolvedMatchId && ambiguousId && isUuidLike(ambiguousId)) {
         const { data: m } = await supabase.from('matches').select('id, user_a, user_b').eq('id', ambiguousId).maybeSingle();
         if (m) {
-          console.log('[ChatDetail] id was match_id:', m.id);
           resolvedMatchId = m.id;
           setMatchIdBoth(m.id);
           resolvedOtherId = m.user_a === user.id ? m.user_b : m.user_a;
@@ -241,24 +236,28 @@ export default function ChatDetailScreen({ route, navigation }) {
       }
 
       if (resolvedMatchId) {
+        // FIX: select * — never hard-code 'content', it 400s if column is named differently
         const { data: msgs, error: msgError } = await supabase.from('messages')
-          .select('id, match_id, sender_id, content, created_at')
+          .select('*')
           .eq('match_id', resolvedMatchId)
           .order('created_at', { ascending: true })
           .limit(200);
         console.log('[ChatDetail] match:', resolvedMatchId, 'messages:', msgs?.length, msgError?.message);
+        if (msgError) console.log('[ChatDetail] LOAD ERROR:', msgError.message);
         if (Array.isArray(msgs)) {
-          setMessages(msgs.map((mm) => ({
-            id: String(mm.id),
-            text: mm.content || '',
-            sender: mm.sender_id === user.id ? 'me' : 'them',
-            time: mm.created_at ? new Date(mm.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '',
-            isProposal: String(mm.content || '').startsWith('📍 PROPOSED DATE'),
-            isCallLog: String(mm.content || '').includes('Call Ended'),
-          })));
+          setMessages(msgs.map((mm) => {
+            const txt = getMessageText(mm);
+            return {
+              id: String(mm.id),
+              text: txt,
+              sender: mm.sender_id === user.id ? 'me' : 'them',
+              time: mm.created_at ? new Date(mm.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '',
+              isProposal: String(txt).startsWith('📍 PROPOSED DATE'),
+              isCallLog: String(txt).includes('Call Ended'),
+            };
+          }));
         }
       } else {
-        console.log('[ChatDetail] no match found');
         setMessages([]);
       }
     } catch (e) {
@@ -273,17 +272,17 @@ export default function ChatDetailScreen({ route, navigation }) {
     const ch = supabase.channel(`messages-${matchId}`)
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `match_id=eq.${matchId}` }, (p) => {
         const mm = p.new;
+        const txt = getMessageText(mm);
         setMessages((prev) => {
           if (prev.some((x) => String(x.id) === String(mm.id))) return prev;
-          // Remove optimistic duplicate with same text sent just now
-          const filtered = prev.filter((x) => !(String(x.id).startsWith('local-') && x.text === mm.content && x.sender === (mm.sender_id === userIdRef.current ? 'me' : 'them')));
+          const filtered = prev.filter((x) => !(String(x.id).startsWith('local-') && x.text === txt && x.sender === (mm.sender_id === userIdRef.current ? 'me' : 'them')));
           return [...filtered, {
             id: String(mm.id),
-            text: mm.content || '',
+            text: txt,
             sender: mm.sender_id === userIdRef.current ? 'me' : 'them',
             time: mm.created_at ? new Date(mm.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Just now',
-            isProposal: String(mm.content || '').startsWith('📍 PROPOSED DATE'),
-            isCallLog: String(mm.content || '').includes('Call Ended'),
+            isProposal: String(txt).startsWith('📍 PROPOSED DATE'),
+            isCallLog: String(txt).includes('Call Ended'),
           }];
         });
       })
@@ -359,7 +358,7 @@ export default function ChatDetailScreen({ route, navigation }) {
     const mid = await ensureMatchId();
     if (mid && userIdRef.current) {
       const logText = `📞 ${callTypeTitle} Ended (${durationFormatted})`;
-      await supabase.from('messages').insert({ match_id: mid, sender_id: userIdRef.current, content: logText });
+      await persistMessage(logText);
     }
     setMessages((prev) => [...prev, { id: Date.now().toString(), text: `📞 ${callTypeTitle} Ended (${durationFormatted})`, sender: 'me', isCallLog: true, time: 'Just now' }]);
     setActiveCall(null); setIncomingCall(null); setCallDuration(0);
@@ -377,7 +376,7 @@ export default function ChatDetailScreen({ route, navigation }) {
     try { await roomRef.current?.localParticipant.setCameraEnabled(!next); } catch {}
   };
 
-  // --- FIXED SEND: resolves match_id live, logs real Supabase error ---
+  // --- FIXED SEND: tries content → text → message → body, learns working column ---
   const persistMessage = async (text) => {
     const mid = await ensureMatchId();
     const uid = userIdRef.current;
@@ -385,17 +384,24 @@ export default function ChatDetailScreen({ route, navigation }) {
       console.log('[ChatDetail] SEND FAILED — no match_id', { mid, uid, rawId });
       return false;
     }
-    const { data, error } = await supabase.from('messages')
-      .insert({ match_id: mid, sender_id: uid, content: text })
-      .select()
-      .single();
-    if (error) {
-      console.log('[ChatDetail] SEND FAILED — Supabase error:', error.message, error);
-      Alert.alert('Message not sent', error.message + '\n\nCheck Supabase → messages table RLS: insert must allow sender = auth.uid()');
-      return false;
+    const colsToTry = [textColRef.current, ...MSG_TEXT_COLS.filter((c) => c !== textColRef.current)];
+    for (const col of colsToTry) {
+      const payload = { match_id: mid, sender_id: uid, [col]: text };
+      const { data, error } = await supabase.from('messages').insert(payload).select().single();
+      if (!error) {
+        textColRef.current = col;
+        console.log('[ChatDetail] SEND OK — saved id:', data?.id, 'match:', mid, 'using column:', col);
+        return true;
+      }
+      console.log(`[ChatDetail] SEND try column '${col}' failed:`, error.message);
+      // If error is NOT about missing column, don't keep trying — it's RLS / real error
+      if (!error.message.includes(`Could not find the '${col}'`) && !error.message.includes('schema cache')) {
+        Alert.alert('Message not sent', error.message);
+        return false;
+      }
     }
-    console.log('[ChatDetail] SEND OK — saved id:', data?.id, 'match:', mid);
-    return true;
+    Alert.alert('Message not sent', "Your messages table has no text column (no content / text / message / body). Run the SQL fix in Supabase.");
+    return false;
   };
 
   const handleSend = async () => {
@@ -403,15 +409,11 @@ export default function ChatDetailScreen({ route, navigation }) {
     const text = inputText.trim();
     setInputText('');
     const optimisticId = `local-${Date.now()}`;
-    const optimistic = { id: optimisticId, text, sender: 'me', time: 'Just now' };
-    setMessages((prev) => [...prev, optimistic]);
+    setMessages((prev) => [...prev, { id: optimisticId, text, sender: 'me', time: 'Just now' }]);
     setSending(true);
     try {
       const ok = await persistMessage(text);
-      if (!ok) {
-        // Roll back optimistic bubble if save failed, so Kay doesn't think it sent
-        setMessages((prev) => prev.filter((x) => x.id !== optimisticId));
-      }
+      if (!ok) setMessages((prev) => prev.filter((x) => x.id !== optimisticId));
     } finally { setSending(false); }
   };
 
