@@ -5,21 +5,26 @@
   "scripts": {
     "start": "expo start",
     "build": "expo export -p web",
-    "android": "expo start --android",
-    "ios": "expo start --ios",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
     "web": "expo start --web"
   },
   "dependencies": {
     "@expo/metro-runtime": "~6.1.2",
+    "@livekit/components-react": "^2.9.25",
+    "@livekit/react-native": "^3.1.0",
+    "@livekit/react-native-webrtc": "^150.1.1",
     "@react-native-async-storage/async-storage": "2.2.0",
     "@react-navigation/native": "^6.1.18",
     "@react-navigation/native-stack": "^6.10.1",
     "@supabase/supabase-js": "^2.112.4",
     "expo": "~54.0.0",
+    "expo-dev-client": "~6.0.21",
     "expo-haptics": "~15.0.8",
     "expo-image": "~3.0.11",
     "expo-image-picker": "~17.0.11",
     "expo-status-bar": "~3.0.9",
+    "livekit-client": "^2.23.0",
     "react": "19.1.0",
     "react-dom": "19.1.0",
     "react-native": "0.81.5",
@@ -29,7 +34,9 @@
     "react-native-web": "^0.21.0"
   },
   "devDependencies": {
-    "@babel/core": "^7.20.0"
+    "@babel/core": "^7.20.0",
+    "@types/react": "~19.1.10",
+    "typescript": "~5.9.2"
   },
   "private": true
 }

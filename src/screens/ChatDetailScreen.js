@@ -5,6 +5,17 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { supabase } from '../lib/supabase';
+import Constants from 'expo-constants';
+
+// --- LiveKit Native ---
+import { Room, Track } from 'livekit-client';
+import { useTracks } from '@livekit/react-native';
+import { RTCView } from '@livekit/react-native-webrtc';
+
+const LIVEKIT_URL =
+  Constants.expoConfig?.extra?.EXPO_PUBLIC_LIVEKIT_URL ||
+  process.env.EXPO_PUBLIC_LIVEKIT_URL ||
+  'wss://intent-app-1qma00x5.livekit.cloud';
 
 const FALLBACK_PHOTO = 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80';
 
@@ -38,8 +49,27 @@ const formatTimer = (sec) => {
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 };
 
+// --- Native LiveKit Video View ---
+function LivekitVideoView({ room }) {
+  const tracks = useTracks([Track.Source.Camera]);
+  const remote = tracks.find((t) => t.participant.identity !== room.localParticipant.identity);
+  const local = tracks.find((t) => t.participant.identity === room.localParticipant.identity);
+  const trackRef = remote || local;
+  const mediaTrack = trackRef?.publication?.track;
+  const stream = mediaTrack?.mediaStream;
+  if (!stream) return null;
+  const streamURL = typeof stream.toURL === 'function' ? stream.toURL() : stream;
+  return (
+    <RTCView
+      streamURL={streamURL}
+      style={{ width: '100%', height: '100%' }}
+      objectFit="cover"
+      mirror={trackRef.participant.identity === room.localParticipant.identity}
+    />
+  );
+}
+
 export default function ChatDetailScreen({ route, navigation }) {
-  // --- Resolve chat: chat object > flat params > id lookup > fallback ---
   const paramChat = route.params?.chat;
   const paramId = String(route.params?.id || route.params?.matchId || route.params?.match_id || '');
   const paramMatchId = route.params?.matchId || route.params?.match_id || null;
@@ -64,12 +94,17 @@ export default function ChatDetailScreen({ route, navigation }) {
   const [inputText, setInputText] = useState('');
   const [sending, setSending] = useState(false);
 
-  // --- Calls: real signalling, not local-only ---
-  const [activeCall, setActiveCall] = useState(null); // call row for caller
-  const [incomingCall, setIncomingCall] = useState(null); // call row for callee
+  // --- Calls ---
+  const [activeCall, setActiveCall] = useState(null);
+  const [incomingCall, setIncomingCall] = useState(null);
   const [callDuration, setCallDuration] = useState(0);
   const [isMuted, setIsMuted] = useState(false);
   const [isCameraOff, setIsCameraOff] = useState(false);
+
+  // --- LiveKit ---
+  const [livekitRoom, setLivekitRoom] = useState(null);
+  const [isLivekitConnecting, setIsLivekitConnecting] = useState(false);
+  const roomRef = useRef(null);
 
   const [showDateModal, setShowShowDateModal] = useState(false);
   const [selectedVibeCategory, setSelectedVibeCategory] = useState('all');
@@ -80,6 +115,47 @@ export default function ChatDetailScreen({ route, navigation }) {
   const [reportReason, setReportReason] = useState('Harassment or disrespectful behavior');
 
   const listRef = useRef(null);
+
+  // --- LiveKit helpers ---
+  const joinLivekit = useCallback(async (callRow, isVideo) => {
+    if (!callRow?.match_id || !userId) return;
+    if (roomRef.current) return;
+    setIsLivekitConnecting(true);
+    try {
+      const roomName = `match_${callRow.match_id}`;
+      const { data, error } = await supabase.functions.invoke('livekit-token', {
+        body: { room: roomName, identity: userId, name: chat?.name || 'User' },
+      });
+      if (error || !data?.token) throw new Error('Could not get call token');
+
+      const room = new Room({ adaptiveStream: true, dynacast: true });
+      roomRef.current = room;
+      setLivekitRoom(room);
+      await room.connect(LIVEKIT_URL, data.token);
+      await room.localParticipant.setMicrophoneEnabled(true);
+      if (isVideo || callRow.type === 'video') {
+        await room.localParticipant.setCameraEnabled(true);
+      }
+    } catch (e) {
+      console.log('[LiveKit]', e);
+      Alert.alert('Media failed', e.message || 'Could not start encrypted media. Check LiveKit URL / token function.');
+      roomRef.current = null;
+      setLivekitRoom(null);
+    } finally {
+      setIsLivekitConnecting(false);
+    }
+  }, [userId, chat?.name]);
+
+  const leaveLivekit = useCallback(async () => {
+    try { await roomRef.current?.disconnect(); } catch {}
+    roomRef.current = null;
+    setLivekitRoom(null);
+  }, []);
+
+  // Cleanup LiveKit on unmount
+  useEffect(() => {
+    return () => { roomRef.current?.disconnect?.().catch(() => {}); };
+  }, []);
 
   // --- Load me + other user + match ---
   const loadChat = useCallback(async () => {
@@ -92,8 +168,6 @@ export default function ChatDetailScreen({ route, navigation }) {
       let resolvedOtherId = otherUserId;
       let resolvedMatchId = matchId;
 
-      // If we only have a Discovery id (1,2,3) and no real match, keep fallback profile
-      // If we have a real matchId, find the other participant
       if (resolvedMatchId) {
         const { data: m } = await supabase.from('matches').select('id, user_a, user_b').eq('id', resolvedMatchId).maybeSingle();
         if (m) {
@@ -102,7 +176,6 @@ export default function ChatDetailScreen({ route, navigation }) {
         }
       }
 
-      // Load other user's real profile if we have a UUID
       if (resolvedOtherId && String(resolvedOtherId).length > 10) {
         const { data: p } = await supabase.from('profiles').select('id, name, bio, intent, location, photos').eq('id', resolvedOtherId).maybeSingle();
         if (p) {
@@ -116,7 +189,6 @@ export default function ChatDetailScreen({ route, navigation }) {
         }
       }
 
-      // If no matchId but we have both user ids, find or create match row for messages/calls
       if (!resolvedMatchId && resolvedOtherId && String(resolvedOtherId).length > 10) {
         const { data: existing } = await supabase.from('matches')
           .select('id')
@@ -128,7 +200,6 @@ export default function ChatDetailScreen({ route, navigation }) {
         }
       }
 
-      // Load messages for this match (if we have one)
       if (resolvedMatchId) {
         const { data: msgs } = await supabase.from('messages')
           .select('id, match_id, sender_id, content, created_at')
@@ -146,7 +217,6 @@ export default function ChatDetailScreen({ route, navigation }) {
           })));
         }
       } else {
-        // Demo fallback when no real match exists yet (Discovery id 1-3)
         setMessages([
           { id: 'm1', text: "Hey! Loved your prompt about urban architecture.", sender: 'them', time: '10:30 AM' },
           { id: 'm2', text: "Thanks! It's rare finding someone who appreciates design.", sender: 'me', time: '10:35 AM' },
@@ -191,32 +261,38 @@ export default function ChatDetailScreen({ route, navigation }) {
       })
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'calls', filter: `match_id=eq.${matchId}` }, (p) => {
         const row = p.new;
-        if (['declined', 'ended', 'missed'].includes(row.status)) { setIncomingCall(null); setActiveCall(null); }
-        if (row.status === 'answered' && row.caller_id === userId) setActiveCall(row);
+        if (['declined', 'ended', 'missed'].includes(row.status)) {
+          setIncomingCall(null);
+          setActiveCall(null);
+          leaveLivekit();
+        }
+        // Caller joins LiveKit when callee answers
+        if (row.status === 'answered' && row.caller_id === userId) {
+          setActiveCall(row);
+          joinLivekit(row, row.type === 'video');
+        }
       })
       .subscribe();
     return () => supabase.removeChannel(ch);
-  }, [userId, matchId]);
+  }, [userId, matchId, joinLivekit, leaveLivekit]);
 
   // --- Call timer ---
   useEffect(() => {
     let t;
-    if (activeCall || incomingCall) {
-      // Timer only counts when answered, not while ringing — caller sees Ringing until answer
-      const isConnected = activeCall?.status === 'answered' || (activeCall && incomingCall === null && activeCall.status !== 'ringing');
-      if (activeCall?.status === 'answered') {
-        t = setInterval(() => setCallDuration((v) => v + 1), 1000);
-      } else setCallDuration(0);
-    } else setCallDuration(0);
+    if (activeCall?.status === 'answered') {
+      t = setInterval(() => setCallDuration((v) => v + 1), 1000);
+    } else {
+      setCallDuration(0);
+    }
     return () => clearInterval(t);
-  }, [activeCall, incomingCall]);
+  }, [activeCall]);
 
   const openGoogleMaps = (addr) => {
     Linking.openURL(`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(addr || '')}`).catch(() => {});
   };
   const openUber = () => Linking.openURL('https://m.uber.com/ul/?action=setPickup').catch(() => {});
 
-  // --- Real call start: inserts row Vio can hear ---
+  // --- Calls ---
   const handleStartCall = async (type) => {
     if (!userId || !otherUserId || !matchId) {
       Alert.alert('Call unavailable', 'Start a chat first — this profile is not yet a real match. Like them on Discovery to unlock calls.');
@@ -229,6 +305,7 @@ export default function ChatDetailScreen({ route, navigation }) {
     }).select().single();
     if (error) { Alert.alert('Call failed', error.message); return; }
     setActiveCall(data);
+    // Do NOT join LiveKit here — wait for answer
   };
 
   const handleAnswerCall = async () => {
@@ -237,27 +314,41 @@ export default function ChatDetailScreen({ route, navigation }) {
     setActiveCall({ ...incomingCall, status: 'answered' });
     setIncomingCall(null);
     setCallDuration(0);
+    await joinLivekit(incomingCall, incomingCall.type === 'video');
   };
 
   const handleDeclineCall = async () => {
     if (incomingCall) await supabase.from('calls').update({ status: 'declined', ended_at: new Date().toISOString() }).eq('id', incomingCall.id);
+    await leaveLivekit();
     setIncomingCall(null);
   };
 
   const handleEndCall = async () => {
+    await leaveLivekit();
     const callRow = activeCall || incomingCall;
     const durationFormatted = formatTimer(callDuration);
     const callTypeTitle = (callRow?.type || activeCall?.type || 'audio') === 'video' ? 'Video Call' : 'Voice Call';
     if (callRow?.id) {
       await supabase.from('calls').update({ status: 'ended', ended_at: new Date().toISOString() }).eq('id', callRow.id);
     }
-    // Log call in chat so both sides see it — only if we have a real match
     if (matchId && userId) {
       const logText = `📞 ${callTypeTitle} Ended (${durationFormatted})`;
       await supabase.from('messages').insert({ match_id: matchId, sender_id: userId, content: logText });
     }
     setMessages((prev) => [...prev, { id: Date.now().toString(), text: `📞 ${callTypeTitle} Ended (${durationFormatted})`, sender: 'me', isCallLog: true, time: 'Just now' }]);
     setActiveCall(null); setIncomingCall(null); setCallDuration(0);
+  };
+
+  const toggleMute = async () => {
+    const next = !isMuted;
+    setIsMuted(next);
+    try { await roomRef.current?.localParticipant.setMicrophoneEnabled(!next); } catch {}
+  };
+
+  const toggleCamera = async () => {
+    const next = !isCameraOff;
+    setIsCameraOff(next);
+    try { await roomRef.current?.localParticipant.setCameraEnabled(!next); } catch {}
   };
 
   // --- Real send ---
@@ -274,12 +365,7 @@ export default function ChatDetailScreen({ route, navigation }) {
     const optimistic = { id: `local-${Date.now()}`, text, sender: 'me', time: 'Just now' };
     setMessages((prev) => [...prev, optimistic]);
     setSending(true);
-    try {
-      const saved = await persistMessage(text);
-      if (!saved && !matchId) {
-        // Demo mode — keep optimistic, it already shows
-      }
-    } finally { setSending(false); }
+    try { await persistMessage(text); } finally { setSending(false); }
   };
 
   const handleSendIcebreaker = async (icebreakerText) => {
@@ -295,7 +381,6 @@ export default function ChatDetailScreen({ route, navigation }) {
     const text = `📍 PROPOSED DATE: ${venueName} (${venueAddr})\n📅 ${dateTimeInput}\n${venuePerk}`;
     setMessages((prev) => [...prev, { id: Date.now().toString(), text, sender: 'me', isProposal: true, time: 'Just now' }]);
     await persistMessage(text);
-    // Best-effort: save to dates table if it exists
     try {
       if (matchId && userId && otherUserId) {
         await supabase.from('dates').insert({ match_id: matchId, user_a: userId, user_b: otherUserId, venue_name: venueName, venue_address: venueAddr, proposed_time: dateTimeInput, status: 'proposed' });
@@ -383,7 +468,7 @@ export default function ChatDetailScreen({ route, navigation }) {
         <TouchableOpacity style={styles.sendBtn} onPress={handleSend} disabled={sending}><Ionicons name="send" size={18} color="#FFFFFF" /></TouchableOpacity>
       </View>
 
-      {/* INCOMING CALL — this is what Vio was missing */}
+      {/* INCOMING CALL */}
       {incomingCall && (
         <Modal visible transparent animationType="fade">
           <View style={styles.callOverlay}>
@@ -412,23 +497,40 @@ export default function ChatDetailScreen({ route, navigation }) {
           <View style={styles.callOverlay}>
             <SafeAreaView style={styles.callContainer}>
               <View style={styles.callTopHeader}>
-                <View style={styles.encryptionBadge}><Text style={styles.encryptionText}>{activeCall.type === 'video' ? '📹 Video Call' : '📞 Voice Call'}</Text></View>
+                <View style={styles.encryptionBadge}>
+                  <Text style={styles.encryptionText}>{livekitRoom ? '🔒 Encrypted Call • DTLS-SRTP' : 'Connecting...'}</Text>
+                </View>
                 <Text style={styles.callTimerText}>{isRingingOut ? 'Ringing...' : formatTimer(callDuration)}</Text>
                 {isRingingOut && <Text style={{ color: '#94A3B8', marginTop: 6 }}>Waiting for {chat?.name} to answer...</Text>}
               </View>
+
               {activeCall.type === 'video' ? (
-                <View style={styles.videoFeedBox}>{!isCameraOff ? <Image source={{ uri: chat?.avatar || FALLBACK_PHOTO }} style={styles.remoteVideo} /> : <View style={styles.cameraOffPlaceholder}><Ionicons name="videocam-off" size={48} color="#64748B" /><Text style={{ color: '#94A3B8', marginTop: 8 }}>Camera Off</Text></View>}</View>
+                <View style={styles.videoFeedBox}>
+                  {livekitRoom ? (
+                    <LivekitVideoView room={livekitRoom} />
+                  ) : isCameraOff ? (
+                    <View style={styles.cameraOffPlaceholder}><Ionicons name="videocam-off" size={48} color="#64748B" /><Text style={{ color: '#94A3B8', marginTop: 8 }}>Camera Off</Text></View>
+                  ) : (
+                    <View style={styles.cameraOffPlaceholder}>
+                      <Text style={{ color: '#94A3B8' }}>{isLivekitConnecting ? 'Connecting encrypted media...' : 'Waiting for media...'}</Text>
+                    </View>
+                  )}
+                </View>
               ) : (
-                <View style={styles.audioCallBox}><Image source={{ uri: chat?.avatar || FALLBACK_PHOTO }} style={styles.audioCallAvatar} /><Text style={styles.callPartnerName}>{chat?.name || 'Intent User'}</Text><Text style={{ color: '#94A3B8', marginTop: 8 }}>{isRingingOut ? 'Ringing...' : 'Connected'}</Text></View>
+                <View style={styles.audioCallBox}>
+                  <Image source={{ uri: chat?.avatar || FALLBACK_PHOTO }} style={styles.audioCallAvatar} />
+                  <Text style={styles.callPartnerName}>{chat?.name || 'Intent User'}</Text>
+                  <Text style={{ color: '#94A3B8', marginTop: 8 }}>{livekitRoom ? '🔒 Encrypted • Connected' : isRingingOut ? 'Ringing...' : 'Connecting...'}</Text>
+                </View>
               )}
+
               <View style={styles.callControlsRow}>
-                <TouchableOpacity style={[styles.controlCircle, isMuted && styles.controlCircleActive]} onPress={() => setIsMuted(!isMuted)}><Ionicons name={isMuted ? 'mic-off' : 'mic'} size={24} color="#FFFFFF" /></TouchableOpacity>
+                <TouchableOpacity style={[styles.controlCircle, isMuted && styles.controlCircleActive]} onPress={toggleMute}><Ionicons name={isMuted ? 'mic-off' : 'mic'} size={24} color="#FFFFFF" /></TouchableOpacity>
                 {activeCall.type === 'video' && (
-                  <TouchableOpacity style={[styles.controlCircle, isCameraOff && styles.controlCircleActive]} onPress={() => setIsCameraOff(!isCameraOff)}><Ionicons name={isCameraOff ? 'videocam-off' : 'videocam'} size={24} color="#FFFFFF" /></TouchableOpacity>
+                  <TouchableOpacity style={[styles.controlCircle, isCameraOff && styles.controlCircleActive]} onPress={toggleCamera}><Ionicons name={isCameraOff ? 'videocam-off' : 'videocam'} size={24} color="#FFFFFF" /></TouchableOpacity>
                 )}
                 <TouchableOpacity style={styles.endCallBtn} onPress={handleEndCall}><Ionicons name="call" size={28} color="#FFFFFF" style={{ transform: [{ rotate: '135deg' }] }} /></TouchableOpacity>
               </View>
-              {!isRingingOut && <Text style={styles.callNote}>Audio/video stream requires WebRTC — signalling is connected. Add LiveKit / react-native-webrtc for real media.</Text>}
             </SafeAreaView>
           </View>
         </Modal>
