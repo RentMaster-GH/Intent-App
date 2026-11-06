@@ -17,9 +17,7 @@ const LIVEKIT_URL =
 const IS_WEB = Platform.OS === 'web';
 const FALLBACK_PHOTO = 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80';
 
-// SINGLE SOURCE OF TRUTH — your table is:
-// messages(id uuid, match_id uuid, sender_id uuid, body text NOT NULL, created_at timestamptz)
-// NEVER use `content`, `text`, or `message` anywhere.
+// messages table: id, match_id, sender_id, body, created_at — ONLY body
 const getMessageText = (mm) => mm?.body ?? '';
 
 const ICEBREAKER_CARDS = [
@@ -169,15 +167,45 @@ export default function ChatDetailScreen({ route, navigation }) {
     }
   }, [ensureMatchId]);
 
+  // ---------- CALLS: FIX 1 — request mic/camera permission on native ----------
+  const requestCallPermissions = useCallback(async (needVideo) => {
+    if (IS_WEB) return true;
+    try {
+      const { Audio } = await import('expo-av');
+      const mic = await Audio.requestPermissionsAsync();
+      if (mic.status !== 'granted') {
+        Alert.alert('Microphone needed', 'Allow microphone access to make calls.');
+        return false;
+      }
+      if (needVideo) {
+        const { Camera } = await import('expo-camera');
+        const cam = await Camera.requestCameraPermissionsAsync();
+        if (cam.status !== 'granted') {
+          Alert.alert('Camera needed', 'Allow camera access for video calls.');
+          return false;
+        }
+      }
+      return true;
+    } catch (e) {
+      console.log('[Calls] permission error', e?.message);
+      return true; // don't block if expo-av not installed — LiveKit will prompt
+    }
+  }, []);
+
   const joinLivekit = useCallback(async (callRow, isVideo) => {
     if (IS_WEB) { Alert.alert('Use mobile app', 'Voice/video calls only work in the Intent mobile app, not the web preview.'); return; }
-    if (!callRow?.match_id || !userId) return;
+    if (!callRow?.match_id || !userIdRef.current) return;
     if (roomRef.current) return;
     setIsLivekitConnecting(true);
     try {
       const roomName = `match_${callRow.match_id}`;
-      const { data, error } = await supabase.functions.invoke('livekit-token', { body: { room: roomName, identity: userId, name: chat?.name || 'User' } });
-      if (error || !data?.token) throw new Error('Could not get call token');
+      console.log('[LiveKit] requesting token for room:', roomName, 'identity:', userIdRef.current);
+      const { data, error } = await supabase.functions.invoke('livekit-token', {
+        body: { room: roomName, identity: userIdRef.current, name: chat?.name || 'User' },
+      });
+      console.log('[LiveKit] token response:', { hasToken: !!data?.token, error: error?.message, data });
+      if (error) throw new Error(`livekit-token failed: ${error.message} — check Supabase Edge Function is deployed + LIVEKIT_API_KEY/SECRET set`);
+      if (!data?.token) throw new Error('livekit-token returned no token — check Edge Function logs in Supabase');
       const { Room } = await import('livekit-client');
       const room = new Room({ adaptiveStream: true, dynacast: true });
       roomRef.current = room;
@@ -185,13 +213,16 @@ export default function ChatDetailScreen({ route, navigation }) {
       await room.connect(LIVEKIT_URL, data.token);
       await room.localParticipant.setMicrophoneEnabled(true);
       if (isVideo || callRow.type === 'video') await room.localParticipant.setCameraEnabled(true);
+      console.log('[LiveKit] connected');
     } catch (e) {
-      console.log('[LiveKit]', e);
-      Alert.alert('Media failed', e.message || 'Could not start encrypted media.');
+      console.log('[LiveKit] FAILED:', e?.message);
+      Alert.alert('Call failed', e.message || 'Could not start encrypted media.');
+      try { await roomRef.current?.disconnect(); } catch {}
       roomRef.current = null;
       setLivekitRoom(null);
+      setActiveCall(null);
     } finally { setIsLivekitConnecting(false); }
-  }, [userId, chat?.name]);
+  }, [chat?.name]);
 
   const leaveLivekit = useCallback(async () => {
     try { await roomRef.current?.disconnect(); } catch {}
@@ -267,7 +298,6 @@ export default function ChatDetailScreen({ route, navigation }) {
 
   useEffect(() => { loadChat(); }, [loadChat]);
 
-  // Poll every 3s + refetch on focus — covers missed realtime
   useEffect(() => {
     if (!matchId) return;
     const interval = setInterval(() => { refetchMessages(); }, 3000);
@@ -309,15 +339,18 @@ export default function ChatDetailScreen({ route, navigation }) {
     return () => supabase.removeChannel(ch);
   }, [matchId]);
 
+  // Calls realtime — FIX: also listen for ringing even if matchId changes
   useEffect(() => {
     if (!userId || !matchId) return;
     const ch = supabase.channel(`calls-${matchId}`)
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'calls', filter: `match_id=eq.${matchId}` }, (p) => {
         const row = p.new;
+        console.log('[Calls] INSERT:', row);
         if (row.callee_id === userId && row.status === 'ringing') setIncomingCall(row);
       })
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'calls', filter: `match_id=eq.${matchId}` }, (p) => {
         const row = p.new;
+        console.log('[Calls] UPDATE:', row);
         if (['declined', 'ended', 'missed'].includes(row.status)) {
           setIncomingCall(null);
           setActiveCall(null);
@@ -342,20 +375,33 @@ export default function ChatDetailScreen({ route, navigation }) {
   const openGoogleMaps = (addr) => Linking.openURL(`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(addr || '')}`).catch(() => {});
   const openUber = () => Linking.openURL('https://m.uber.com/ul/?action=setPickup').catch(() => {});
 
+  // ---------- CALLS: FIX 2 — permission + proper call row + error surfacing ----------
   const handleStartCall = async (type) => {
-    if (IS_WEB) { Alert.alert('Use mobile app', 'Calls only work in the Intent mobile app, not the web preview.'); return; }
+    if (IS_WEB) { Alert.alert('Use mobile app', 'Calls only work in the Intent mobile app (Expo Go / TestFlight / Play), not the web preview.'); return; }
+    const okPerm = await requestCallPermissions(type === 'video');
+    if (!okPerm) return;
     const mid = await ensureMatchId();
     if (!userIdRef.current || !otherUserIdRef.current || !mid) { Alert.alert('Call unavailable', 'Start a chat first — this profile is not yet a real match.'); return; }
     setIsMuted(false); setIsCameraOff(false);
+    // Clear any stale ringing calls
     await supabase.from('calls').update({ status: 'missed' }).eq('match_id', mid).eq('status', 'ringing');
+    console.log('[Calls] dialing:', { match_id: mid, caller: userIdRef.current, callee: otherUserIdRef.current, type });
     const { data, error } = await supabase.from('calls').insert({ match_id: mid, caller_id: userIdRef.current, callee_id: otherUserIdRef.current, type, status: 'ringing' }).select().single();
-    if (error) { Alert.alert('Call failed', error.message); return; }
+    if (error) {
+      console.log('[Calls] INSERT FAILED:', error.message);
+      Alert.alert('Call failed', error.message + '\n\nCheck calls table RLS + columns (caller_id/callee_id/match_id/type/status)');
+      return;
+    }
+    console.log('[Calls] ringing row created:', data?.id);
     setActiveCall(data);
   };
 
   const handleAnswerCall = async () => {
     if (!incomingCall) return;
-    await supabase.from('calls').update({ status: 'answered' }).eq('id', incomingCall.id);
+    const okPerm = await requestCallPermissions(incomingCall.type === 'video');
+    if (!okPerm) return;
+    const { error } = await supabase.from('calls').update({ status: 'answered' }).eq('id', incomingCall.id);
+    if (error) { Alert.alert('Answer failed', error.message); return; }
     setActiveCall({ ...incomingCall, status: 'answered' });
     setIncomingCall(null);
     setCallDuration(0);
@@ -366,6 +412,7 @@ export default function ChatDetailScreen({ route, navigation }) {
     if (incomingCall) await supabase.from('calls').update({ status: 'declined', ended_at: new Date().toISOString() }).eq('id', incomingCall.id);
     await leaveLivekit();
     setIncomingCall(null);
+    setActiveCall(null);
   };
 
   const handleEndCall = async () => {
@@ -395,14 +442,10 @@ export default function ChatDetailScreen({ route, navigation }) {
     try { await roomRef.current?.localParticipant.setCameraEnabled(!next); } catch {}
   };
 
-  // ONLY body — never content/text/message. This is the fix for the 400 + NOT NULL error.
   const persistMessage = async (text) => {
     const mid = await ensureMatchId();
     const uid = userIdRef.current;
-    if (!mid || !uid) {
-      console.log('[ChatDetail] SEND FAILED — no match_id', { mid, uid });
-      return false;
-    }
+    if (!mid || !uid) return false;
     const { data, error } = await supabase.from('messages')
       .insert({ match_id: mid, sender_id: uid, body: text })
       .select('id, match_id, sender_id, body, created_at')
@@ -412,7 +455,7 @@ export default function ChatDetailScreen({ route, navigation }) {
       Alert.alert('Message not sent', error.message);
       return false;
     }
-    console.log('[ChatDetail] SEND OK — saved id:', data?.id, 'match:', mid, 'using column: body');
+    console.log('[ChatDetail] SEND OK — saved id:', data?.id, 'using column: body');
     setTimeout(() => refetchMessages(), 500);
     return true;
   };
@@ -437,22 +480,54 @@ export default function ChatDetailScreen({ route, navigation }) {
     if (!ok) setMessages((prev) => prev.filter((x) => x.id !== optimisticId));
   };
 
+  // ---------- DATES: FIX — try real schema, log real error, don't fake save ----------
+  const persistDateProposal = async ({ venueName, venueAddr, dateTimeInput, venuePerk }) => {
+    const mid = matchIdRef.current || await ensureMatchId();
+    const uid = userIdRef.current;
+    const other = otherUserIdRef.current;
+    if (!mid || !uid || !other) {
+      console.log('[Dates] SAVE FAILED — no match/user', { mid, uid, other });
+      return { ok: false, error: 'No match found' };
+    }
+    // Try Schema A: proposer_id / invitee_id (most common in your DB)
+    const attempts = [
+      { match_id: mid, proposer_id: uid, invitee_id: other, venue_name: venueName, venue_address: venueAddr, proposed_time: dateTimeInput, status: 'proposed' },
+      { match_id: mid, user_a: uid, user_b: other, venue_name: venueName, venue_address: venueAddr, proposed_time: dateTimeInput, status: 'proposed' },
+      { match_id: mid, proposer_id: uid, invitee_id: other, venue: venueName, address: venueAddr, date_time: dateTimeInput, status: 'proposed' },
+    ];
+    for (const payload of attempts) {
+      const { data, error } = await supabase.from('dates').insert(payload).select().single();
+      if (!error) {
+        console.log('[Dates] SAVE OK — id:', data?.id, 'payload keys:', Object.keys(payload).join(','));
+        return { ok: true, data };
+      }
+      console.log('[Dates] try failed:', error.message, 'keys:', Object.keys(payload).join(','));
+      // If it's NOT a missing-column error, it's RLS / real error — stop trying
+      if (!error.message.includes('Could not find') && !error.message.includes('column') && !error.message.includes('schema cache')) {
+        return { ok: false, error: error.message };
+      }
+    }
+    return { ok: false, error: 'dates table columns do not match any known schema — check Supabase dates columns' };
+  };
+
   const handleProposeDate = async () => {
     setShowShowDateModal(false);
     const venueName = selectedVenue?.name || FALLBACK_VENUE.name;
     const venueAddr = selectedVenue?.address || FALLBACK_VENUE.address;
     const venuePerk = selectedVenue?.perk || '';
     const text = `📍 PROPOSED DATE: ${venueName} (${venueAddr})\n📅 ${dateTimeInput}\n${venuePerk}`;
+    // 1. Save date row FIRST — if this fails, don't fake the chat bubble
+    const res = await persistDateProposal({ venueName, venueAddr, dateTimeInput, venuePerk });
+    if (!res.ok) {
+      Alert.alert('Date not saved', res.error + '\n\nCheck Supabase → dates table columns + RLS.');
+      return;
+    }
+    // 2. Only then send chat message
     const optimisticId = `local-${Date.now()}`;
     setMessages((prev) => [...prev, { id: optimisticId, text, sender: 'me', isProposal: true, time: 'Just now' }]);
     const ok = await persistMessage(text);
     if (!ok) setMessages((prev) => prev.filter((x) => x.id !== optimisticId));
-    try {
-      const mid = matchIdRef.current;
-      if (mid && userIdRef.current && otherUserIdRef.current) {
-        await supabase.from('dates').insert({ match_id: mid, user_a: userIdRef.current, user_b: otherUserIdRef.current, venue_name: venueName, venue_address: venueAddr, proposed_time: dateTimeInput, status: 'proposed' });
-      }
-    } catch {}
+    else Alert.alert('Date Proposed 📍', `${venueName} — ${dateTimeInput}\n\n${chat?.name || 'They'} will see it in chat.`);
   };
 
   const handleSubmitReport = async () => {

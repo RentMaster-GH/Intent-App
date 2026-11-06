@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { View, StyleSheet, ActivityIndicator, Text, TouchableOpacity } from 'react-native';
+import { View, StyleSheet, ActivityIndicator, Text, TouchableOpacity, Platform } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
 
@@ -116,6 +116,29 @@ export default function App() {
   const currentRoute = resolveRouteName(current.name);
 
   useEffect(() => { sessionRef.current = session; }, [session]);
+
+  // FIX FOR CALLS: Configure audio mode once at app start.
+  // Without this, iOS silences LiveKit when phone is on silent / in background,
+  // and Android won't route audio to earpiece/speaker correctly.
+  useEffect(() => {
+    const setupAudio = async () => {
+      if (Platform.OS === 'web') return;
+      try {
+        const { Audio } = await import('expo-av');
+        await Audio.setAudioModeAsync({
+          allowsRecordingIOS: true,
+          playsInSilentModeIOS: true,
+          staysActiveInBackground: true,
+          shouldDuckAndroid: true,
+          playThroughEarpieceAndroid: false,
+        });
+        console.log('[App] Audio mode configured for calls');
+      } catch (e) {
+        console.log('[App] Audio setup skipped:', e?.message);
+      }
+    };
+    setupAudio();
+  }, []);
 
   const markProfileComplete = useCallback((userId) => {
     if (userId) profileCacheRef.current[userId] = true;
