@@ -6,19 +6,19 @@ import {
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { supabase } from '../lib/supabase';
-import Constants from 'expo-constants';
-import LivekitVideoView from './LivekitVideoView';
-
-const LIVEKIT_URL =
-  Constants.expoConfig?.extra?.EXPO_PUBLIC_LIVEKIT_URL ||
-  process.env.EXPO_PUBLIC_LIVEKIT_URL ||
-  'wss://intent-app-1qma00x5.livekit.cloud';
 
 const IS_WEB = Platform.OS === 'web';
 const FALLBACK_PHOTO = 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80';
 
 // messages table: id, match_id, sender_id, body, created_at — ONLY body
 const getMessageText = (mm) => mm?.body ?? '';
+
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+  { urls: 'stun:stun2.l.google.com:19302' },
+  { urls: 'stun:stun3.l.google.com:19302' },
+];
 
 const ICEBREAKER_CARDS = [
   '☕ Suggest a 20-min coffee meetup',
@@ -67,6 +67,40 @@ const getWebParams = () => {
   } catch { return {}; }
 };
 
+// ---------- WEBRTC LOADER — NO STATIC IMPORTS, WEB-SAFE ----------
+// Web build never imports react-native-webrtc or expo-camera.
+// Native loads them only when a call starts.
+let cachedWebRTC = null;
+const getWebRTC = async () => {
+  if (cachedWebRTC) return cachedWebRTC;
+  if (Platform.OS === 'web') {
+    // Web: use browser built-in WebRTC if ever needed, but calls are native-only
+    cachedWebRTC = {
+      RTCPeerConnection: window.RTCPeerConnection,
+      RTCSessionDescription: window.RTCSessionDescription,
+      RTCIceCandidate: window.RTCIceCandidate,
+      mediaDevices: navigator.mediaDevices,
+      RTCView: null,
+    };
+    return cachedWebRTC;
+  }
+  try {
+    // eslint-disable-next-line no-undef
+    const mod = await import('react-native-webrtc');
+    cachedWebRTC = {
+      RTCPeerConnection: mod.RTCPeerConnection,
+      RTCSessionDescription: mod.RTCSessionDescription,
+      RTCIceCandidate: mod.RTCIceCandidate,
+      mediaDevices: mod.mediaDevices,
+      RTCView: mod.RTCView,
+    };
+    return cachedWebRTC;
+  } catch (e) {
+    console.log('[WebRTC] load failed:', e?.message);
+    throw new Error('WebRTC not available — run: npx expo install react-native-webrtc and rebuild with npx expo prebuild');
+  }
+};
+
 export default function ChatDetailScreen({ route, navigation }) {
   const webParams = getWebParams();
   const allParams = { ...(route?.params || {}), ...webParams };
@@ -94,14 +128,18 @@ export default function ChatDetailScreen({ route, navigation }) {
   const [messages, setMessages] = useState([]);
   const [inputText, setInputText] = useState('');
   const [sending, setSending] = useState(false);
+
+  // --- CALLS STATE (P2P, no LiveKit) ---
   const [activeCall, setActiveCall] = useState(null);
   const [incomingCall, setIncomingCall] = useState(null);
   const [callDuration, setCallDuration] = useState(0);
   const [isMuted, setIsMuted] = useState(false);
   const [isCameraOff, setIsCameraOff] = useState(false);
-  const [livekitRoom, setLivekitRoom] = useState(null);
-  const [isLivekitConnecting, setIsLivekitConnecting] = useState(false);
-  const roomRef = useRef(null);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [localStream, setLocalStream] = useState(null);
+  const [remoteStream, setRemoteStream] = useState(null);
+  const [RTCViewComp, setRTCViewComp] = useState(null);
+
   const [showDateModal, setShowShowDateModal] = useState(false);
   const [selectedVibeCategory, setSelectedVibeCategory] = useState('all');
   const [selectedVenue, setSelectedVenue] = useState(FALLBACK_VENUE);
@@ -113,6 +151,11 @@ export default function ChatDetailScreen({ route, navigation }) {
   const matchIdRef = useRef(paramMatchId);
   const otherUserIdRef = useRef(paramOtherId);
   const userIdRef = useRef(null);
+  const pcRef = useRef(null);
+  const localStreamRef = useRef(null);
+  const pendingOfferRef = useRef(null);
+  const signalChannelRef = useRef(null);
+
   const setMatchIdBoth = (id) => { matchIdRef.current = id; setMatchId(id); };
   const setOtherIdBoth = (id) => { otherUserIdRef.current = id; setOtherUserId(id); };
 
@@ -167,9 +210,26 @@ export default function ChatDetailScreen({ route, navigation }) {
     }
   }, [ensureMatchId]);
 
-  // ---------- CALLS: FIX 1 — request mic/camera permission on native ----------
+  // ---------- P2P CALLS — NO LIVEKIT, NO CLOUD ----------
+  // Supabase Realtime broadcast = signaling only. Video/audio goes phone-to-phone.
+
+  const cleanupCall = useCallback(async () => {
+    try { if (signalChannelRef.current) await supabase.removeChannel(signalChannelRef.current); } catch {}
+    signalChannelRef.current = null;
+    try { pcRef.current?.close(); } catch {}
+    pcRef.current = null;
+    try { localStreamRef.current?.getTracks()?.forEach((t) => { try { t.stop(); } catch {} }); } catch {}
+    localStreamRef.current = null;
+    setLocalStream(null);
+    setRemoteStream(null);
+    setIsConnecting(false);
+  }, []);
+
+  useEffect(() => { return () => { cleanupCall(); }; }, [cleanupCall]);
+
+  // Request mic/camera via getUserMedia — NO expo-camera import, web-safe
   const requestCallPermissions = useCallback(async (needVideo) => {
-    if (IS_WEB) return true;
+    if (IS_WEB) return false;
     try {
       const { Audio } = await import('expo-av');
       const mic = await Audio.requestPermissionsAsync();
@@ -177,60 +237,85 @@ export default function ChatDetailScreen({ route, navigation }) {
         Alert.alert('Microphone needed', 'Allow microphone access to make calls.');
         return false;
       }
-      if (needVideo) {
-        const { Camera } = await import('expo-camera');
-        const cam = await Camera.requestCameraPermissionsAsync();
-        if (cam.status !== 'granted') {
-          Alert.alert('Camera needed', 'Allow camera access for video calls.');
-          return false;
-        }
-      }
+      // Camera permission is requested automatically by getUserMedia on iOS/Android
+      // No expo-camera needed — avoids web build crash
       return true;
     } catch (e) {
-      console.log('[Calls] permission error', e?.message);
-      return true; // don't block if expo-av not installed — LiveKit will prompt
+      console.log('[Calls] permission check skipped:', e?.message);
+      return true;
     }
   }, []);
 
-  const joinLivekit = useCallback(async (callRow, isVideo) => {
-    if (IS_WEB) { Alert.alert('Use mobile app', 'Voice/video calls only work in the Intent mobile app, not the web preview.'); return; }
-    if (!callRow?.match_id || !userIdRef.current) return;
-    if (roomRef.current) return;
-    setIsLivekitConnecting(true);
-    try {
-      const roomName = `match_${callRow.match_id}`;
-      console.log('[LiveKit] requesting token for room:', roomName, 'identity:', userIdRef.current);
-      const { data, error } = await supabase.functions.invoke('livekit-token', {
-        body: { room: roomName, identity: userIdRef.current, name: chat?.name || 'User' },
-      });
-      console.log('[LiveKit] token response:', { hasToken: !!data?.token, error: error?.message, data });
-      if (error) throw new Error(`livekit-token failed: ${error.message} — check Supabase Edge Function is deployed + LIVEKIT_API_KEY/SECRET set`);
-      if (!data?.token) throw new Error('livekit-token returned no token — check Edge Function logs in Supabase');
-      const { Room } = await import('livekit-client');
-      const room = new Room({ adaptiveStream: true, dynacast: true });
-      roomRef.current = room;
-      setLivekitRoom(room);
-      await room.connect(LIVEKIT_URL, data.token);
-      await room.localParticipant.setMicrophoneEnabled(true);
-      if (isVideo || callRow.type === 'video') await room.localParticipant.setCameraEnabled(true);
-      console.log('[LiveKit] connected');
-    } catch (e) {
-      console.log('[LiveKit] FAILED:', e?.message);
-      Alert.alert('Call failed', e.message || 'Could not start encrypted media.');
-      try { await roomRef.current?.disconnect(); } catch {}
-      roomRef.current = null;
-      setLivekitRoom(null);
-      setActiveCall(null);
-    } finally { setIsLivekitConnecting(false); }
-  }, [chat?.name]);
+  const createPeerConnection = useCallback(async (callId, isVideo) => {
+    const wrtc = await getWebRTC();
+    if (wrtc.RTCView && !RTCViewComp) setRTCViewComp(() => wrtc.RTCView);
 
-  const leaveLivekit = useCallback(async () => {
-    try { await roomRef.current?.disconnect(); } catch {}
-    roomRef.current = null;
-    setLivekitRoom(null);
+    const pc = new wrtc.RTCPeerConnection({ iceServers: ICE_SERVERS });
+    pcRef.current = pc;
+
+    pc.onicecandidate = async (e) => {
+      if (e.candidate && callId && signalChannelRef.current) {
+        try {
+          await signalChannelRef.current.send({
+            type: 'broadcast',
+            event: 'ice-candidate',
+            payload: { candidate: e.candidate, from: userIdRef.current },
+          });
+        } catch {}
+      }
+    };
+
+    pc.ontrack = (e) => {
+      if (e.streams && e.streams[0]) {
+        console.log('[P2P] Remote track received');
+        setRemoteStream(e.streams[0]);
+        setIsConnecting(false);
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      console.log('[P2P] connectionState:', pc.connectionState);
+      if (pc.connectionState === 'connected') setIsConnecting(false);
+      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        // Keep UI, polling will show it
+      }
+    };
+
+    return pc;
+  }, [RTCViewComp]);
+
+  // Subscribe to signaling for one callId
+  const subscribeSignaling = useCallback((callId) => {
+    if (!callId || signalChannelRef.current) return;
+    const ch = supabase.channel(`call-signal-${callId}`, { config: { broadcast: { self: false } } })
+      .on('broadcast', { event: 'offer' }, async ({ payload }) => {
+        if (!payload || payload.from === userIdRef.current) return;
+        console.log('[P2P] Got offer');
+        pendingOfferRef.current = payload.offer;
+      })
+      .on('broadcast', { event: 'answer' }, async ({ payload }) => {
+        if (!payload || payload.from === userIdRef.current) return;
+        console.log('[P2P] Got answer');
+        if (pcRef.current && payload.answer) {
+          try {
+            const wrtc = await getWebRTC();
+            await pcRef.current.setRemoteDescription(new wrtc.RTCSessionDescription(payload.answer));
+          } catch (e) { console.log('[P2P] setRemote answer error:', e?.message); }
+        }
+      })
+      .on('broadcast', { event: 'ice-candidate' }, async ({ payload }) => {
+        if (!payload || payload.from === userIdRef.current) return;
+        if (pcRef.current && payload.candidate) {
+          try {
+            const wrtc = await getWebRTC();
+            await pcRef.current.addIceCandidate(new wrtc.RTCIceCandidate(payload.candidate));
+          } catch {}
+        }
+      })
+      .subscribe((status) => console.log('[P2P] signal channel:', status));
+    signalChannelRef.current = ch;
+    return ch;
   }, []);
-
-  useEffect(() => { return () => { roomRef.current?.disconnect?.().catch(() => {}); }; }, []);
 
   const loadChat = useCallback(async () => {
     setLoading(true);
@@ -339,31 +424,28 @@ export default function ChatDetailScreen({ route, navigation }) {
     return () => supabase.removeChannel(ch);
   }, [matchId]);
 
-  // Calls realtime — FIX: also listen for ringing even if matchId changes
+  // Calls table realtime — ringing / answered / ended
   useEffect(() => {
     if (!userId || !matchId) return;
     const ch = supabase.channel(`calls-${matchId}`)
       .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'calls', filter: `match_id=eq.${matchId}` }, (p) => {
         const row = p.new;
-        console.log('[Calls] INSERT:', row);
-        if (row.callee_id === userId && row.status === 'ringing') setIncomingCall(row);
+        if (row.callee_id === userId && row.status === 'ringing') {
+          console.log('[P2P] Incoming call:', row.id);
+          setIncomingCall(row);
+        }
       })
       .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'calls', filter: `match_id=eq.${matchId}` }, (p) => {
         const row = p.new;
-        console.log('[Calls] UPDATE:', row);
         if (['declined', 'ended', 'missed'].includes(row.status)) {
           setIncomingCall(null);
           setActiveCall(null);
-          leaveLivekit();
-        }
-        if (row.status === 'answered' && row.caller_id === userId) {
-          setActiveCall(row);
-          joinLivekit(row, row.type === 'video');
+          cleanupCall();
         }
       })
       .subscribe();
     return () => supabase.removeChannel(ch);
-  }, [userId, matchId, joinLivekit, leaveLivekit]);
+  }, [userId, matchId, cleanupCall]);
 
   useEffect(() => {
     let t;
@@ -375,52 +457,112 @@ export default function ChatDetailScreen({ route, navigation }) {
   const openGoogleMaps = (addr) => Linking.openURL(`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(addr || '')}`).catch(() => {});
   const openUber = () => Linking.openURL('https://m.uber.com/ul/?action=setPickup').catch(() => {});
 
-  // ---------- CALLS: FIX 2 — permission + proper call row + error surfacing ----------
+  // ---------- CALL ACTIONS ----------
+
   const handleStartCall = async (type) => {
-    if (IS_WEB) { Alert.alert('Use mobile app', 'Calls only work in the Intent mobile app (Expo Go / TestFlight / Play), not the web preview.'); return; }
-    const okPerm = await requestCallPermissions(type === 'video');
+    if (IS_WEB) { Alert.alert('Use mobile app', 'Calls work in the Intent mobile app (Expo dev build / TestFlight / Play), not the web preview.'); return; }
+    const isVideo = type === 'video';
+    const okPerm = await requestCallPermissions(isVideo);
     if (!okPerm) return;
     const mid = await ensureMatchId();
     if (!userIdRef.current || !otherUserIdRef.current || !mid) { Alert.alert('Call unavailable', 'Start a chat first — this profile is not yet a real match.'); return; }
-    setIsMuted(false); setIsCameraOff(false);
-    // Clear any stale ringing calls
-    await supabase.from('calls').update({ status: 'missed' }).eq('match_id', mid).eq('status', 'ringing');
-    console.log('[Calls] dialing:', { match_id: mid, caller: userIdRef.current, callee: otherUserIdRef.current, type });
-    const { data, error } = await supabase.from('calls').insert({ match_id: mid, caller_id: userIdRef.current, callee_id: otherUserIdRef.current, type, status: 'ringing' }).select().single();
-    if (error) {
-      console.log('[Calls] INSERT FAILED:', error.message);
-      Alert.alert('Call failed', error.message + '\n\nCheck calls table RLS + columns (caller_id/callee_id/match_id/type/status)');
-      return;
+
+    setIsMuted(false); setIsCameraOff(false); setIsConnecting(true);
+    try {
+      const wrtc = await getWebRTC();
+      if (wrtc.RTCView) setRTCViewComp(() => wrtc.RTCView);
+
+      // 1. Local mic/camera
+      const stream = await wrtc.mediaDevices.getUserMedia({ audio: true, video: isVideo ? { facingMode: 'user' } : false });
+      localStreamRef.current = stream;
+      setLocalStream(stream);
+
+      // 2. Create ringing row
+      await supabase.from('calls').update({ status: 'missed' }).eq('match_id', mid).eq('status', 'ringing');
+      const { data: callRow, error: callErr } = await supabase.from('calls')
+        .insert({ match_id: mid, caller_id: userIdRef.current, callee_id: otherUserIdRef.current, type, status: 'ringing' })
+        .select().single();
+      if (callErr || !callRow) throw new Error(callErr?.message || 'Could not create call');
+      setActiveCall(callRow);
+
+      // 3. Signaling channel + offer
+      subscribeSignaling(callRow.id);
+      // Wait a tick for channel to subscribe
+      await new Promise((r) => setTimeout(r, 400));
+      const pc = await createPeerConnection(callRow.id, isVideo);
+      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      await signalChannelRef.current?.send({ type: 'broadcast', event: 'offer', payload: { offer, from: userIdRef.current } });
+      console.log('[P2P] Offer sent, waiting for answer...');
+    } catch (e) {
+      console.log('[P2P] Start call failed:', e?.message);
+      Alert.alert('Call failed', e.message || 'Could not start call. Check mic/camera permissions + rebuild with react-native-webrtc.');
+      setIsConnecting(false);
+      await cleanupCall();
+      setActiveCall(null);
     }
-    console.log('[Calls] ringing row created:', data?.id);
-    setActiveCall(data);
   };
 
   const handleAnswerCall = async () => {
     if (!incomingCall) return;
-    const okPerm = await requestCallPermissions(incomingCall.type === 'video');
+    if (IS_WEB) { Alert.alert('Use mobile app', 'Calls work in the Intent mobile app, not web preview.'); return; }
+    const isVideo = incomingCall.type === 'video';
+    const okPerm = await requestCallPermissions(isVideo);
     if (!okPerm) return;
-    const { error } = await supabase.from('calls').update({ status: 'answered' }).eq('id', incomingCall.id);
-    if (error) { Alert.alert('Answer failed', error.message); return; }
-    setActiveCall({ ...incomingCall, status: 'answered' });
-    setIncomingCall(null);
-    setCallDuration(0);
-    await joinLivekit(incomingCall, incomingCall.type === 'video');
+
+    setIsConnecting(true);
+    try {
+      const wrtc = await getWebRTC();
+      if (wrtc.RTCView) setRTCViewComp(() => wrtc.RTCView);
+
+      const stream = await wrtc.mediaDevices.getUserMedia({ audio: true, video: isVideo ? { facingMode: 'user' } : false });
+      localStreamRef.current = stream;
+      setLocalStream(stream);
+
+      const { error } = await supabase.from('calls').update({ status: 'answered' }).eq('id', incomingCall.id);
+      if (error) throw new Error(error.message);
+
+      setActiveCall({ ...incomingCall, status: 'answered' });
+      setIncomingCall(null);
+      setCallDuration(0);
+
+      subscribeSignaling(incomingCall.id);
+      await new Promise((r) => setTimeout(r, 400));
+      const pc = await createPeerConnection(incomingCall.id, isVideo);
+      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+      if (pendingOfferRef.current) {
+        await pc.setRemoteDescription(new wrtc.RTCSessionDescription(pendingOfferRef.current));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        await signalChannelRef.current?.send({ type: 'broadcast', event: 'answer', payload: { answer, from: userIdRef.current } });
+        console.log('[P2P] Answer sent');
+      } else {
+        console.log('[P2P] No pending offer — caller may need to redial. Waiting...');
+      }
+    } catch (e) {
+      console.log('[P2P] Answer failed:', e?.message);
+      Alert.alert('Answer failed', e.message || 'Could not answer call.');
+      setIsConnecting(false);
+      await cleanupCall();
+      setActiveCall(null);
+    }
   };
 
   const handleDeclineCall = async () => {
     if (incomingCall) await supabase.from('calls').update({ status: 'declined', ended_at: new Date().toISOString() }).eq('id', incomingCall.id);
-    await leaveLivekit();
+    await cleanupCall();
     setIncomingCall(null);
     setActiveCall(null);
   };
 
   const handleEndCall = async () => {
-    await leaveLivekit();
     const callRow = activeCall || incomingCall;
     const durationFormatted = formatTimer(callDuration);
     const callTypeTitle = (callRow?.type || activeCall?.type || 'audio') === 'video' ? 'Video Call' : 'Voice Call';
     if (callRow?.id) await supabase.from('calls').update({ status: 'ended', ended_at: new Date().toISOString() }).eq('id', callRow.id);
+    await cleanupCall();
     const mid = await ensureMatchId();
     if (mid && userIdRef.current) {
       const logText = `📞 ${callTypeTitle} Ended (${durationFormatted})`;
@@ -433,14 +575,16 @@ export default function ChatDetailScreen({ route, navigation }) {
   const toggleMute = async () => {
     const next = !isMuted;
     setIsMuted(next);
-    try { await roomRef.current?.localParticipant.setMicrophoneEnabled(!next); } catch {}
+    try { localStreamRef.current?.getAudioTracks()?.forEach((t) => { t.enabled = !next; }); } catch {}
   };
 
   const toggleCamera = async () => {
     const next = !isCameraOff;
     setIsCameraOff(next);
-    try { await roomRef.current?.localParticipant.setCameraEnabled(!next); } catch {}
+    try { localStreamRef.current?.getVideoTracks()?.forEach((t) => { t.enabled = !next; }); } catch {}
   };
+
+  // ---------- MESSAGES (body only) ----------
 
   const persistMessage = async (text) => {
     const mid = await ensureMatchId();
@@ -480,16 +624,13 @@ export default function ChatDetailScreen({ route, navigation }) {
     if (!ok) setMessages((prev) => prev.filter((x) => x.id !== optimisticId));
   };
 
-  // ---------- DATES: FIX — try real schema, log real error, don't fake save ----------
-  const persistDateProposal = async ({ venueName, venueAddr, dateTimeInput, venuePerk }) => {
+  // ---------- DATES ----------
+
+  const persistDateProposal = async ({ venueName, venueAddr, dateTimeInput }) => {
     const mid = matchIdRef.current || await ensureMatchId();
     const uid = userIdRef.current;
     const other = otherUserIdRef.current;
-    if (!mid || !uid || !other) {
-      console.log('[Dates] SAVE FAILED — no match/user', { mid, uid, other });
-      return { ok: false, error: 'No match found' };
-    }
-    // Try Schema A: proposer_id / invitee_id (most common in your DB)
+    if (!mid || !uid || !other) return { ok: false, error: 'No match found' };
     const attempts = [
       { match_id: mid, proposer_id: uid, invitee_id: other, venue_name: venueName, venue_address: venueAddr, proposed_time: dateTimeInput, status: 'proposed' },
       { match_id: mid, user_a: uid, user_b: other, venue_name: venueName, venue_address: venueAddr, proposed_time: dateTimeInput, status: 'proposed' },
@@ -498,11 +639,10 @@ export default function ChatDetailScreen({ route, navigation }) {
     for (const payload of attempts) {
       const { data, error } = await supabase.from('dates').insert(payload).select().single();
       if (!error) {
-        console.log('[Dates] SAVE OK — id:', data?.id, 'payload keys:', Object.keys(payload).join(','));
+        console.log('[Dates] SAVE OK — id:', data?.id);
         return { ok: true, data };
       }
-      console.log('[Dates] try failed:', error.message, 'keys:', Object.keys(payload).join(','));
-      // If it's NOT a missing-column error, it's RLS / real error — stop trying
+      console.log('[Dates] try failed:', error.message);
       if (!error.message.includes('Could not find') && !error.message.includes('column') && !error.message.includes('schema cache')) {
         return { ok: false, error: error.message };
       }
@@ -516,13 +656,11 @@ export default function ChatDetailScreen({ route, navigation }) {
     const venueAddr = selectedVenue?.address || FALLBACK_VENUE.address;
     const venuePerk = selectedVenue?.perk || '';
     const text = `📍 PROPOSED DATE: ${venueName} (${venueAddr})\n📅 ${dateTimeInput}\n${venuePerk}`;
-    // 1. Save date row FIRST — if this fails, don't fake the chat bubble
-    const res = await persistDateProposal({ venueName, venueAddr, dateTimeInput, venuePerk });
+    const res = await persistDateProposal({ venueName, venueAddr, dateTimeInput });
     if (!res.ok) {
       Alert.alert('Date not saved', res.error + '\n\nCheck Supabase → dates table columns + RLS.');
       return;
     }
-    // 2. Only then send chat message
     const optimisticId = `local-${Date.now()}`;
     setMessages((prev) => [...prev, { id: optimisticId, text, sender: 'me', isProposal: true, time: 'Just now' }]);
     const ok = await persistMessage(text);
@@ -618,7 +756,7 @@ export default function ChatDetailScreen({ route, navigation }) {
           <View style={styles.callOverlay}>
             <SafeAreaView style={styles.callContainer}>
               <View style={styles.callTopHeader}>
-                <View style={styles.encryptionBadge}><Text style={styles.encryptionText}>{incomingCall.type === 'video' ? '📹 Video Call' : '📞 Voice Call'}</Text></View>
+                <View style={styles.encryptionBadge}><Text style={styles.encryptionText}>{incomingCall.type === 'video' ? '📹 Video Call' : '📞 Voice Call'} • P2P</Text></View>
                 <Text style={styles.callTimerText}>Incoming...</Text>
               </View>
               <View style={styles.audioCallBox}>
@@ -640,21 +778,29 @@ export default function ChatDetailScreen({ route, navigation }) {
           <View style={styles.callOverlay}>
             <SafeAreaView style={styles.callContainer}>
               <View style={styles.callTopHeader}>
-                <View style={styles.encryptionBadge}><Text style={styles.encryptionText}>{livekitRoom ? '🔒 Encrypted Call • DTLS-SRTP' : 'Connecting...'}</Text></View>
+                <View style={styles.encryptionBadge}><Text style={styles.encryptionText}>{remoteStream ? '🔒 P2P Encrypted • DTLS-SRTP' : 'Connecting P2P...'}</Text></View>
                 <Text style={styles.callTimerText}>{isRingingOut ? 'Ringing...' : formatTimer(callDuration)}</Text>
                 {isRingingOut && <Text style={{ color: '#94A3B8', marginTop: 6 }}>Waiting for {chat?.name} to answer...</Text>}
+                {isConnecting && !isRingingOut && <Text style={{ color: '#94A3B8', marginTop: 6 }}>Connecting directly phone-to-phone...</Text>}
               </View>
               {activeCall.type === 'video' ? (
                 <View style={styles.videoFeedBox}>
-                  {livekitRoom ? <LivekitVideoView room={livekitRoom} /> : (
-                    <View style={styles.cameraOffPlaceholder}><Text style={{ color: '#94A3B8' }}>{isLivekitConnecting ? 'Connecting encrypted media...' : 'Waiting for media...'}</Text></View>
+                  {remoteStream && RTCViewComp ? (
+                    <RTCViewComp streamURL={remoteStream.toURL()} style={{ flex: 1 }} objectFit="cover" />
+                  ) : (
+                    <View style={styles.cameraOffPlaceholder}>
+                      <Text style={{ color: '#94A3B8' }}>{isConnecting ? 'Connecting peer-to-peer...' : 'Waiting for video...'}</Text>
+                    </View>
+                  )}
+                  {localStream && RTCViewComp && (
+                    <RTCViewComp streamURL={localStream.toURL()} style={{ position: 'absolute', width: 100, height: 140, bottom: 12, right: 12, borderRadius: 12 }} objectFit="cover" />
                   )}
                 </View>
               ) : (
                 <View style={styles.audioCallBox}>
                   <Image source={{ uri: chat?.avatar || FALLBACK_PHOTO }} style={styles.audioCallAvatar} />
                   <Text style={styles.callPartnerName}>{chat?.name || 'Intent User'}</Text>
-                  <Text style={{ color: '#94A3B8', marginTop: 8 }}>{livekitRoom ? '🔒 Encrypted • Connected' : isRingingOut ? 'Ringing...' : 'Connecting...'}</Text>
+                  <Text style={{ color: '#94A3B8', marginTop: 8 }}>{remoteStream ? '🔒 P2P Encrypted • Connected' : isRingingOut ? 'Ringing...' : 'Connecting...'}</Text>
                 </View>
               )}
               <View style={styles.callControlsRow}>
@@ -764,7 +910,7 @@ const styles = StyleSheet.create({
   audioCallBox: { alignItems: 'center', justifyContent: 'center' },
   audioCallAvatar: { width: 120, height: 120, borderRadius: 60, marginBottom: 16 },
   callPartnerName: { fontSize: 26, fontWeight: '800', color: '#F8FAFC' },
-  videoFeedBox: { flex: 1, borderRadius: 24, overflow: 'hidden', backgroundColor: '#1E293B', marginVertical: 20 },
+  videoFeedBox: { flex: 1, borderRadius: 24, overflow: 'hidden', backgroundColor: '#1E293B', marginVertical: 20, position: 'relative' },
   cameraOffPlaceholder: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   callControlsRow: { flexDirection: 'row', justifyContent: 'space-evenly', alignItems: 'center', marginBottom: 20 },
   controlCircle: { width: 56, height: 56, borderRadius: 28, backgroundColor: '#1E293B', justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: '#334155' },
