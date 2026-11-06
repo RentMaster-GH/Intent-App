@@ -45,7 +45,6 @@ const formatTimer = (sec) => {
 };
 const isUuidLike = (v) => typeof v === 'string' && v.length > 20 && v.includes('-');
 
-// Web params without expo-router — read window.location directly
 const getWebParams = () => {
   if (Platform.OS !== 'web') return {};
   try {
@@ -54,9 +53,8 @@ const getWebParams = () => {
       const sp = new URLSearchParams(window.location.search || '');
       sp.forEach((v, k) => { out[k] = v; });
       const pathParts = window.location.pathname.split('/').filter(Boolean);
-      // /chat/<uuid> — could be match_id OR otherUserId, resolved in loadChat
       if (pathParts[0] === 'chat' && pathParts[1]) out.id = pathParts[1];
-      if (pathParts[0] === 'chat' && pathParts[1] && !out.matchId && !out.otherUserId) out.rawChatId = pathParts[1];
+      if (pathParts[0] === 'chat' && pathParts[1]) out.rawChatId = pathParts[1];
       if (window.location.hash && window.location.hash.includes('?')) {
         const hashSearch = window.location.hash.split('?')[1] || '';
         new URLSearchParams(hashSearch).forEach((v, k) => { out[k] = v; });
@@ -72,7 +70,6 @@ export default function ChatDetailScreen({ route, navigation }) {
 
   const paramChat = allParams?.chat;
   const rawId = String(allParams?.id || allParams?.rawChatId || allParams?.matchId || allParams?.match_id || '');
-  // Keep explicit params if passed from native, otherwise rawId is ambiguous — resolved in loadChat
   const paramMatchId = allParams?.matchId || allParams?.match_id || null;
   const paramOtherId = allParams?.otherUserId || allParams?.userId || allParams?.other_id || allParams?.otherId || null;
   const paramId = rawId;
@@ -110,19 +107,55 @@ export default function ChatDetailScreen({ route, navigation }) {
   const [reportReason, setReportReason] = useState('Harassment or disrespectful behavior');
   const listRef = useRef(null);
 
-  const joinLivekit = useCallback(async (callRow, isVideo) => {
-    if (IS_WEB) {
-      Alert.alert('Use mobile app', 'Voice/video calls only work in the Intent mobile app, not the web preview.');
-      return;
+  // --- REFS: fix stale-closure bug — send must use latest ids, not old render ---
+  const matchIdRef = useRef(paramMatchId);
+  const otherUserIdRef = useRef(paramOtherId);
+  const userIdRef = useRef(null);
+  const setMatchIdBoth = (id) => { matchIdRef.current = id; setMatchId(id); };
+  const setOtherIdBoth = (id) => { otherUserIdRef.current = id; setOtherUserId(id); };
+
+  // Resolve match_id at send-time, never rely on state alone
+  const ensureMatchId = useCallback(async () => {
+    if (matchIdRef.current) return matchIdRef.current;
+    const uid = userIdRef.current;
+    if (!uid) return null;
+    // 1) rawId is match_id?
+    if (rawId && isUuidLike(rawId)) {
+      const { data: m } = await supabase.from('matches').select('id, user_a, user_b').eq('id', rawId).maybeSingle();
+      if (m) {
+        const other = m.user_a === uid ? m.user_b : m.user_a;
+        setOtherIdBoth(other);
+        setMatchIdBoth(m.id);
+        return m.id;
+      }
+      // 2) rawId is otherUserId
+      const { data: existing } = await supabase.from('matches').select('id')
+        .or(`and(user_a.eq.${uid},user_b.eq.${rawId}),and(user_a.eq.${rawId},user_b.eq.${uid})`)
+        .maybeSingle();
+      if (existing) {
+        setOtherIdBoth(rawId);
+        setMatchIdBoth(existing.id);
+        return existing.id;
+      }
     }
+    // 3) otherUserId known
+    if (otherUserIdRef.current) {
+      const { data: existing } = await supabase.from('matches').select('id')
+        .or(`and(user_a.eq.${uid},user_b.eq.${otherUserIdRef.current}),and(user_a.eq.${otherUserIdRef.current},user_b.eq.${uid})`)
+        .maybeSingle();
+      if (existing) { setMatchIdBoth(existing.id); return existing.id; }
+    }
+    return null;
+  }, [rawId]);
+
+  const joinLivekit = useCallback(async (callRow, isVideo) => {
+    if (IS_WEB) { Alert.alert('Use mobile app', 'Voice/video calls only work in the Intent mobile app, not the web preview.'); return; }
     if (!callRow?.match_id || !userId) return;
     if (roomRef.current) return;
     setIsLivekitConnecting(true);
     try {
       const roomName = `match_${callRow.match_id}`;
-      const { data, error } = await supabase.functions.invoke('livekit-token', {
-        body: { room: roomName, identity: userId, name: chat?.name || 'User' },
-      });
+      const { data, error } = await supabase.functions.invoke('livekit-token', { body: { room: roomName, identity: userId, name: chat?.name || 'User' } });
       if (error || !data?.token) throw new Error('Could not get call token');
       const { Room } = await import('livekit-client');
       const room = new Room({ adaptiveStream: true, dynacast: true });
@@ -153,6 +186,7 @@ export default function ChatDetailScreen({ route, navigation }) {
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) { navigation.reset({ index: 0, routes: [{ name: 'AuthPortal' }] }); return; }
       setUserId(user.id);
+      userIdRef.current = user.id;
 
       let resolvedOtherId = paramOtherId;
       let resolvedMatchId = paramMatchId;
@@ -160,48 +194,37 @@ export default function ChatDetailScreen({ route, navigation }) {
 
       console.log('[ChatDetail] params:', { paramOtherId, paramMatchId, rawId, ambiguousId });
 
-      // CASE A: explicit match_id passed
       if (resolvedMatchId) {
         const { data: m } = await supabase.from('matches').select('id, user_a, user_b').eq('id', resolvedMatchId).maybeSingle();
         if (m) {
           resolvedOtherId = m.user_a === user.id ? m.user_b : m.user_a;
-          setOtherUserId(resolvedOtherId);
+          setOtherIdBoth(resolvedOtherId);
         }
       }
 
-      // CASE B: ambiguous /chat/<uuid> — try as match_id FIRST
       if (!resolvedMatchId && ambiguousId && isUuidLike(ambiguousId)) {
         const { data: m } = await supabase.from('matches').select('id, user_a, user_b').eq('id', ambiguousId).maybeSingle();
         if (m) {
           console.log('[ChatDetail] id was match_id:', m.id);
           resolvedMatchId = m.id;
-          setMatchId(m.id);
+          setMatchIdBoth(m.id);
           resolvedOtherId = m.user_a === user.id ? m.user_b : m.user_a;
-          setOtherUserId(resolvedOtherId);
+          setOtherIdBoth(resolvedOtherId);
         } else {
-          // CASE C: id was otherUserId — find match between me + them
-          console.log('[ChatDetail] id was otherUserId, finding match...');
           resolvedOtherId = ambiguousId;
-          setOtherUserId(ambiguousId);
+          setOtherIdBoth(ambiguousId);
           const { data: existing } = await supabase.from('matches').select('id')
             .or(`and(user_a.eq.${user.id},user_b.eq.${ambiguousId}),and(user_a.eq.${ambiguousId},user_b.eq.${user.id})`)
             .maybeSingle();
-          if (existing) {
-            resolvedMatchId = existing.id;
-            setMatchId(existing.id);
-          }
+          if (existing) { resolvedMatchId = existing.id; setMatchIdBoth(existing.id); }
         }
       }
 
-      // CASE D: only otherUserId known — find match
       if (!resolvedMatchId && resolvedOtherId && isUuidLike(String(resolvedOtherId))) {
         const { data: existing } = await supabase.from('matches').select('id')
           .or(`and(user_a.eq.${user.id},user_b.eq.${resolvedOtherId}),and(user_a.eq.${resolvedOtherId},user_b.eq.${user.id})`)
           .maybeSingle();
-        if (existing) {
-          resolvedMatchId = existing.id;
-          setMatchId(existing.id);
-        }
+        if (existing) { resolvedMatchId = existing.id; setMatchIdBoth(existing.id); }
       }
 
       if (resolvedOtherId && isUuidLike(String(resolvedOtherId))) {
@@ -252,10 +275,12 @@ export default function ChatDetailScreen({ route, navigation }) {
         const mm = p.new;
         setMessages((prev) => {
           if (prev.some((x) => String(x.id) === String(mm.id))) return prev;
-          return [...prev, {
+          // Remove optimistic duplicate with same text sent just now
+          const filtered = prev.filter((x) => !(String(x.id).startsWith('local-') && x.text === mm.content && x.sender === (mm.sender_id === userIdRef.current ? 'me' : 'them')));
+          return [...filtered, {
             id: String(mm.id),
             text: mm.content || '',
-            sender: mm.sender_id === userId ? 'me' : 'them',
+            sender: mm.sender_id === userIdRef.current ? 'me' : 'them',
             time: mm.created_at ? new Date(mm.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Just now',
             isProposal: String(mm.content || '').startsWith('📍 PROPOSED DATE'),
             isCallLog: String(mm.content || '').includes('Call Ended'),
@@ -264,7 +289,7 @@ export default function ChatDetailScreen({ route, navigation }) {
       })
       .subscribe();
     return () => supabase.removeChannel(ch);
-  }, [matchId, userId]);
+  }, [matchId]);
 
   useEffect(() => {
     if (!userId || !matchId) return;
@@ -301,10 +326,11 @@ export default function ChatDetailScreen({ route, navigation }) {
 
   const handleStartCall = async (type) => {
     if (IS_WEB) { Alert.alert('Use mobile app', 'Calls only work in the Intent mobile app, not the web preview.'); return; }
-    if (!userId || !otherUserId || !matchId) { Alert.alert('Call unavailable', 'Start a chat first — this profile is not yet a real match.'); return; }
+    const mid = await ensureMatchId();
+    if (!userIdRef.current || !otherUserIdRef.current || !mid) { Alert.alert('Call unavailable', 'Start a chat first — this profile is not yet a real match.'); return; }
     setIsMuted(false); setIsCameraOff(false);
-    await supabase.from('calls').update({ status: 'missed' }).eq('match_id', matchId).eq('status', 'ringing');
-    const { data, error } = await supabase.from('calls').insert({ match_id: matchId, caller_id: userId, callee_id: otherUserId, type, status: 'ringing' }).select().single();
+    await supabase.from('calls').update({ status: 'missed' }).eq('match_id', mid).eq('status', 'ringing');
+    const { data, error } = await supabase.from('calls').insert({ match_id: mid, caller_id: userIdRef.current, callee_id: otherUserIdRef.current, type, status: 'ringing' }).select().single();
     if (error) { Alert.alert('Call failed', error.message); return; }
     setActiveCall(data);
   };
@@ -330,9 +356,10 @@ export default function ChatDetailScreen({ route, navigation }) {
     const durationFormatted = formatTimer(callDuration);
     const callTypeTitle = (callRow?.type || activeCall?.type || 'audio') === 'video' ? 'Video Call' : 'Voice Call';
     if (callRow?.id) await supabase.from('calls').update({ status: 'ended', ended_at: new Date().toISOString() }).eq('id', callRow.id);
-    if (matchId && userId) {
+    const mid = await ensureMatchId();
+    if (mid && userIdRef.current) {
       const logText = `📞 ${callTypeTitle} Ended (${durationFormatted})`;
-      await supabase.from('messages').insert({ match_id: matchId, sender_id: userId, content: logText });
+      await supabase.from('messages').insert({ match_id: mid, sender_id: userIdRef.current, content: logText });
     }
     setMessages((prev) => [...prev, { id: Date.now().toString(), text: `📞 ${callTypeTitle} Ended (${durationFormatted})`, sender: 'me', isCallLog: true, time: 'Just now' }]);
     setActiveCall(null); setIncomingCall(null); setCallDuration(0);
@@ -350,25 +377,49 @@ export default function ChatDetailScreen({ route, navigation }) {
     try { await roomRef.current?.localParticipant.setCameraEnabled(!next); } catch {}
   };
 
+  // --- FIXED SEND: resolves match_id live, logs real Supabase error ---
   const persistMessage = async (text) => {
-    if (!matchId || !userId) return false;
-    const { error } = await supabase.from('messages').insert({ match_id: matchId, sender_id: userId, content: text });
-    return !error;
+    const mid = await ensureMatchId();
+    const uid = userIdRef.current;
+    if (!mid || !uid) {
+      console.log('[ChatDetail] SEND FAILED — no match_id', { mid, uid, rawId });
+      return false;
+    }
+    const { data, error } = await supabase.from('messages')
+      .insert({ match_id: mid, sender_id: uid, content: text })
+      .select()
+      .single();
+    if (error) {
+      console.log('[ChatDetail] SEND FAILED — Supabase error:', error.message, error);
+      Alert.alert('Message not sent', error.message + '\n\nCheck Supabase → messages table RLS: insert must allow sender = auth.uid()');
+      return false;
+    }
+    console.log('[ChatDetail] SEND OK — saved id:', data?.id, 'match:', mid);
+    return true;
   };
 
   const handleSend = async () => {
     if (!inputText.trim() || sending) return;
     const text = inputText.trim();
     setInputText('');
-    const optimistic = { id: `local-${Date.now()}`, text, sender: 'me', time: 'Just now' };
+    const optimisticId = `local-${Date.now()}`;
+    const optimistic = { id: optimisticId, text, sender: 'me', time: 'Just now' };
     setMessages((prev) => [...prev, optimistic]);
     setSending(true);
-    try { await persistMessage(text); } finally { setSending(false); }
+    try {
+      const ok = await persistMessage(text);
+      if (!ok) {
+        // Roll back optimistic bubble if save failed, so Kay doesn't think it sent
+        setMessages((prev) => prev.filter((x) => x.id !== optimisticId));
+      }
+    } finally { setSending(false); }
   };
 
   const handleSendIcebreaker = async (icebreakerText) => {
-    setMessages((prev) => [...prev, { id: Date.now().toString(), text: icebreakerText, sender: 'me', time: 'Just now' }]);
-    await persistMessage(icebreakerText);
+    const optimisticId = `local-${Date.now()}`;
+    setMessages((prev) => [...prev, { id: optimisticId, text: icebreakerText, sender: 'me', time: 'Just now' }]);
+    const ok = await persistMessage(icebreakerText);
+    if (!ok) setMessages((prev) => prev.filter((x) => x.id !== optimisticId));
   };
 
   const handleProposeDate = async () => {
@@ -377,11 +428,14 @@ export default function ChatDetailScreen({ route, navigation }) {
     const venueAddr = selectedVenue?.address || FALLBACK_VENUE.address;
     const venuePerk = selectedVenue?.perk || '';
     const text = `📍 PROPOSED DATE: ${venueName} (${venueAddr})\n📅 ${dateTimeInput}\n${venuePerk}`;
-    setMessages((prev) => [...prev, { id: Date.now().toString(), text, sender: 'me', isProposal: true, time: 'Just now' }]);
-    await persistMessage(text);
+    const optimisticId = `local-${Date.now()}`;
+    setMessages((prev) => [...prev, { id: optimisticId, text, sender: 'me', isProposal: true, time: 'Just now' }]);
+    const ok = await persistMessage(text);
+    if (!ok) setMessages((prev) => prev.filter((x) => x.id !== optimisticId));
     try {
-      if (matchId && userId && otherUserId) {
-        await supabase.from('dates').insert({ match_id: matchId, user_a: userId, user_b: otherUserId, venue_name: venueName, venue_address: venueAddr, proposed_time: dateTimeInput, status: 'proposed' });
+      const mid = matchIdRef.current;
+      if (mid && userIdRef.current && otherUserIdRef.current) {
+        await supabase.from('dates').insert({ match_id: mid, user_a: userIdRef.current, user_b: otherUserIdRef.current, venue_name: venueName, venue_address: venueAddr, proposed_time: dateTimeInput, status: 'proposed' });
       }
     } catch {}
   };
