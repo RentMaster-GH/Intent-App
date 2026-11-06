@@ -17,6 +17,10 @@ const LIVEKIT_URL =
 const IS_WEB = Platform.OS === 'web';
 const FALLBACK_PHOTO = 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80';
 
+// YOUR TABLE USES `body` — NOT `content`, NOT `text`
+// messages: id, match_id, sender_id, body, created_at
+const getMessageText = (mm) => mm?.body ?? mm?.content ?? mm?.text ?? mm?.message ?? '';
+
 const ICEBREAKER_CARDS = [
   '☕ Suggest a 20-min coffee meetup',
   '🎨 Ask about their favorite weekend spot',
@@ -44,10 +48,6 @@ const formatTimer = (sec) => {
   return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 };
 const isUuidLike = (v) => typeof v === 'string' && v.length > 20 && v.includes('-');
-
-// --- FIX: messages table column is inconsistent — read any of these ---
-const getMessageText = (mm) => mm?.content ?? mm?.text ?? mm?.message ?? mm?.body ?? mm?.message_text ?? '';
-const MSG_TEXT_COLS = ['content', 'text', 'message', 'body'];
 
 const getWebParams = () => {
   if (Platform.OS !== 'web') return {};
@@ -114,7 +114,6 @@ export default function ChatDetailScreen({ route, navigation }) {
   const matchIdRef = useRef(paramMatchId);
   const otherUserIdRef = useRef(paramOtherId);
   const userIdRef = useRef(null);
-  const textColRef = useRef('content'); // learned working column, cached
   const setMatchIdBoth = (id) => { matchIdRef.current = id; setMatchId(id); };
   const setOtherIdBoth = (id) => { otherUserIdRef.current = id; setOtherUserId(id); };
 
@@ -236,14 +235,13 @@ export default function ChatDetailScreen({ route, navigation }) {
       }
 
       if (resolvedMatchId) {
-        // FIX: select * — never hard-code 'content', it 400s if column is named differently
+        // FIXED: select id, match_id, sender_id, body, created_at — matches your real table
         const { data: msgs, error: msgError } = await supabase.from('messages')
-          .select('*')
+          .select('id, match_id, sender_id, body, created_at')
           .eq('match_id', resolvedMatchId)
           .order('created_at', { ascending: true })
           .limit(200);
         console.log('[ChatDetail] match:', resolvedMatchId, 'messages:', msgs?.length, msgError?.message);
-        if (msgError) console.log('[ChatDetail] LOAD ERROR:', msgError.message);
         if (Array.isArray(msgs)) {
           setMessages(msgs.map((mm) => {
             const txt = getMessageText(mm);
@@ -376,7 +374,7 @@ export default function ChatDetailScreen({ route, navigation }) {
     try { await roomRef.current?.localParticipant.setCameraEnabled(!next); } catch {}
   };
 
-  // --- FIXED SEND: tries content → text → message → body, learns working column ---
+  // FIXED: insert uses `body` — your real column
   const persistMessage = async (text) => {
     const mid = await ensureMatchId();
     const uid = userIdRef.current;
@@ -384,24 +382,17 @@ export default function ChatDetailScreen({ route, navigation }) {
       console.log('[ChatDetail] SEND FAILED — no match_id', { mid, uid, rawId });
       return false;
     }
-    const colsToTry = [textColRef.current, ...MSG_TEXT_COLS.filter((c) => c !== textColRef.current)];
-    for (const col of colsToTry) {
-      const payload = { match_id: mid, sender_id: uid, [col]: text };
-      const { data, error } = await supabase.from('messages').insert(payload).select().single();
-      if (!error) {
-        textColRef.current = col;
-        console.log('[ChatDetail] SEND OK — saved id:', data?.id, 'match:', mid, 'using column:', col);
-        return true;
-      }
-      console.log(`[ChatDetail] SEND try column '${col}' failed:`, error.message);
-      // If error is NOT about missing column, don't keep trying — it's RLS / real error
-      if (!error.message.includes(`Could not find the '${col}'`) && !error.message.includes('schema cache')) {
-        Alert.alert('Message not sent', error.message);
-        return false;
-      }
+    const { data, error } = await supabase.from('messages')
+      .insert({ match_id: mid, sender_id: uid, body: text })
+      .select()
+      .single();
+    if (error) {
+      console.log('[ChatDetail] SEND FAILED:', error.message, error);
+      Alert.alert('Message not sent', error.message);
+      return false;
     }
-    Alert.alert('Message not sent', "Your messages table has no text column (no content / text / message / body). Run the SQL fix in Supabase.");
-    return false;
+    console.log('[ChatDetail] SEND OK — saved id:', data?.id, 'match:', mid, 'using column: body');
+    return true;
   };
 
   const handleSend = async () => {
