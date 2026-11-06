@@ -17,8 +17,7 @@ const LIVEKIT_URL =
 const IS_WEB = Platform.OS === 'web';
 const FALLBACK_PHOTO = 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80';
 
-// YOUR TABLE USES `body` — NOT `content`, NOT `text`
-// messages: id, match_id, sender_id, body, created_at
+// YOUR REAL TABLE: messages(id, match_id, sender_id, body, created_at)
 const getMessageText = (mm) => mm?.body ?? mm?.content ?? mm?.text ?? mm?.message ?? '';
 
 const ICEBREAKER_CARDS = [
@@ -143,6 +142,31 @@ export default function ChatDetailScreen({ route, navigation }) {
     return null;
   }, [rawId]);
 
+  // --- NEW: refetch messages from DB — used for polling + after send + on focus ---
+  const refetchMessages = useCallback(async () => {
+    const mid = matchIdRef.current || await ensureMatchId();
+    const uid = userIdRef.current;
+    if (!mid || !uid) return;
+    const { data: msgs } = await supabase.from('messages')
+      .select('id, match_id, sender_id, body, created_at')
+      .eq('match_id', mid)
+      .order('created_at', { ascending: true })
+      .limit(200);
+    if (Array.isArray(msgs)) {
+      setMessages(msgs.map((mm) => {
+        const txt = getMessageText(mm);
+        return {
+          id: String(mm.id),
+          text: txt,
+          sender: mm.sender_id === uid ? 'me' : 'them',
+          time: mm.created_at ? new Date(mm.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '',
+          isProposal: String(txt).startsWith('📍 PROPOSED DATE'),
+          isCallLog: String(txt).includes('Call Ended'),
+        };
+      }));
+    }
+  }, [ensureMatchId]);
+
   const joinLivekit = useCallback(async (callRow, isVideo) => {
     if (IS_WEB) { Alert.alert('Use mobile app', 'Voice/video calls only work in the Intent mobile app, not the web preview.'); return; }
     if (!callRow?.match_id || !userId) return;
@@ -186,8 +210,6 @@ export default function ChatDetailScreen({ route, navigation }) {
       let resolvedOtherId = paramOtherId;
       let resolvedMatchId = paramMatchId;
       const ambiguousId = !resolvedMatchId && !resolvedOtherId ? rawId : null;
-
-      console.log('[ChatDetail] params:', { paramOtherId, paramMatchId, rawId, ambiguousId });
 
       if (resolvedMatchId) {
         const { data: m } = await supabase.from('matches').select('id, user_a, user_b').eq('id', resolvedMatchId).maybeSingle();
@@ -235,35 +257,35 @@ export default function ChatDetailScreen({ route, navigation }) {
       }
 
       if (resolvedMatchId) {
-        // FIXED: select id, match_id, sender_id, body, created_at — matches your real table
-        const { data: msgs, error: msgError } = await supabase.from('messages')
-          .select('id, match_id, sender_id, body, created_at')
-          .eq('match_id', resolvedMatchId)
-          .order('created_at', { ascending: true })
-          .limit(200);
-        console.log('[ChatDetail] match:', resolvedMatchId, 'messages:', msgs?.length, msgError?.message);
-        if (Array.isArray(msgs)) {
-          setMessages(msgs.map((mm) => {
-            const txt = getMessageText(mm);
-            return {
-              id: String(mm.id),
-              text: txt,
-              sender: mm.sender_id === user.id ? 'me' : 'them',
-              time: mm.created_at ? new Date(mm.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '',
-              isProposal: String(txt).startsWith('📍 PROPOSED DATE'),
-              isCallLog: String(txt).includes('Call Ended'),
-            };
-          }));
-        }
+        await refetchMessages();
       } else {
         setMessages([]);
       }
     } catch (e) {
       console.log('[ChatDetail] load error', e?.message);
     } finally { setLoading(false); }
-  }, [navigation, paramOtherId, paramMatchId, paramId, rawId]);
+  }, [navigation, paramOtherId, paramMatchId, paramId, rawId, refetchMessages]);
 
   useEffect(() => { loadChat(); }, [loadChat]);
+
+  // --- NEW: Poll every 3s + refetch when tab regains focus — fixes missed realtime ---
+  useEffect(() => {
+    if (!matchId) return;
+    const interval = setInterval(() => { refetchMessages(); }, 3000);
+    const onFocus = () => refetchMessages();
+    const onVisibility = () => { if (typeof document !== 'undefined' && !document.hidden) refetchMessages(); };
+    if (typeof window !== 'undefined') {
+      window.addEventListener('focus', onFocus);
+      document.addEventListener('visibilitychange', onVisibility);
+    }
+    return () => {
+      clearInterval(interval);
+      if (typeof window !== 'undefined') {
+        window.removeEventListener('focus', onFocus);
+        document.removeEventListener('visibilitychange', onVisibility);
+      }
+    };
+  }, [matchId, refetchMessages]);
 
   useEffect(() => {
     if (!matchId) return;
@@ -374,24 +396,22 @@ export default function ChatDetailScreen({ route, navigation }) {
     try { await roomRef.current?.localParticipant.setCameraEnabled(!next); } catch {}
   };
 
-  // FIXED: insert uses `body` — your real column
   const persistMessage = async (text) => {
     const mid = await ensureMatchId();
     const uid = userIdRef.current;
-    if (!mid || !uid) {
-      console.log('[ChatDetail] SEND FAILED — no match_id', { mid, uid, rawId });
-      return false;
-    }
+    if (!mid || !uid) return false;
     const { data, error } = await supabase.from('messages')
       .insert({ match_id: mid, sender_id: uid, body: text })
       .select()
       .single();
     if (error) {
-      console.log('[ChatDetail] SEND FAILED:', error.message, error);
+      console.log('[ChatDetail] SEND FAILED:', error.message);
       Alert.alert('Message not sent', error.message);
       return false;
     }
     console.log('[ChatDetail] SEND OK — saved id:', data?.id, 'match:', mid, 'using column: body');
+    // Immediately refetch so both sides see it even if realtime misses
+    setTimeout(() => refetchMessages(), 500);
     return true;
   };
 
