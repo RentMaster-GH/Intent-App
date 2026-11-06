@@ -103,29 +103,36 @@ export default function ProfileScreen({ navigation, route }) {
   const saveToggle = async (column, value, setFn) => {
     if (!userId) return;
     setFn(value);
-    const { error } = await supabase.from('profiles').update({ [column]: value }).eq('id', userId);
+    const { error } = await supabase.from('profiles').upsert({ id: userId, email, [column]: value }, { onConflict: 'id' });
+    if (error) { setFn(!value); Alert.alert('Could not save', error.message); }
+};
     if (error) { setFn(!value); Alert.alert('Could not save', 'Setting not saved.'); }
   };
 
   const handleSaveProfile = async () => {
-    if (!userId) return;
-    if (!name.trim()) { Alert.alert('Name required', 'Enter your name.'); return; }
-    setSaving(true);
-    try {
-      const { error } = await supabase.from('profiles').update({
-        name: name.trim(),
-        bio: bio.trim(),
-        intent,
-        location: location.trim(),
-        age: age ? parseInt(age, 10) : null,
-        photos,
-        updated_at: new Date().toISOString(),
-      }).eq('id', userId);
-      if (error) throw error;
-      Alert.alert('Saved', 'Your profile has been updated.');
-    } catch (e) { Alert.alert('Save failed', e.message || 'Could not save profile.'); }
-    finally { setSaving(false); }
-  };
+  if (!userId) return;
+  if (!name.trim()) { Alert.alert('Name required', 'Enter your name.'); return; }
+  if (bio.trim().length > 0 && bio.trim().length < 10) { Alert.alert('Bio too short', 'Write at least 10 characters so people know your intent.'); return; }
+  setSaving(true);
+  try {
+    const { error } = await supabase.from('profiles').upsert({
+      id: userId,
+      email,
+      name: name.trim(),
+      bio: bio.trim(),
+      intent,
+      location: location.trim(),
+      age: age ? parseInt(age, 10) : null,
+      photos,
+      notifications,
+      show_on_discovery: showOnDiscovery,
+      updated_at: new Date().toISOString(),
+    }, { onConflict: 'id' });
+    if (error) throw error;
+    Alert.alert('Saved', 'Your profile has been updated.');
+  } catch (e) { Alert.alert('Save failed', e.message || 'Could not save profile.'); }
+  finally { setSaving(false); }
+};
 
   const addPhotoFromUrl = () => {
     const url = photoUrlInput.trim();
