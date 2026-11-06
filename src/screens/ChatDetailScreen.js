@@ -1,19 +1,10 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
-  View,
-  Text,
-  Image,
-  TouchableOpacity,
-  StyleSheet,
-  SafeAreaView,
-  FlatList,
-  TextInput,
-  Modal,
-  ScrollView,
-  Linking,
-  Alert,
+  View, Text, Image, TouchableOpacity, StyleSheet, SafeAreaView,
+  FlatList, TextInput, Modal, ScrollView, Linking, Alert, ActivityIndicator,
 } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
+import { supabase } from '../lib/supabase';
 
 const FALLBACK_PHOTO = 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80';
 
@@ -25,108 +16,57 @@ const ICEBREAKER_CARDS = [
 ];
 
 const RECOMMENDED_DATE_SPOTS = [
-  {
-    id: 'v1',
-    name: 'Devoción Coffee & Vinyl Lounge',
-    vibe: 'Cozy & Casual',
-    category: 'coffee',
-    rating: '4.9',
-    address: '69 Grand St, Williamsburg',
-    perk: '🎁 15% off with Intent',
-  },
-  {
-    id: 'v2',
-    name: 'Apex Cocktail Bistro & Lounge',
-    vibe: 'Romantic & Fine Dining',
-    category: 'dining',
-    rating: '4.8',
-    address: '142 Market St, Downtown',
-    perk: '🎁 Free Appetizer on First Date',
-  },
-  {
-    id: 'v3',
-    name: 'Chelsea Contemporary Art Walk',
-    vibe: 'Cultural & Quiet',
-    category: 'art',
-    rating: '4.9',
-    address: '522 W 26th St, Chelsea',
-    perk: '🎁 Complimentary Gallery Pass',
-  },
-  {
-    id: 'v4',
-    name: 'Conservatory Scenic Garden Walk',
-    vibe: 'Outdoor & Scenic',
-    category: 'parks',
-    rating: '4.9',
-    address: 'Central Park East & 105th St',
-    perk: '🎁 Free Entry',
-  },
+  { id: 'v1', name: 'Devoción Coffee & Vinyl Lounge', vibe: 'Cozy & Casual', category: 'coffee', rating: '4.9', address: '69 Grand St, Williamsburg', perk: '🎁 15% off with Intent' },
+  { id: 'v2', name: 'Apex Cocktail Bistro & Lounge', vibe: 'Romantic & Fine Dining', category: 'dining', rating: '4.8', address: '142 Market St, Downtown', perk: '🎁 Free Appetizer on First Date' },
+  { id: 'v3', name: 'Chelsea Contemporary Art Walk', vibe: 'Cultural & Quiet', category: 'art', rating: '4.9', address: '522 W 26th St, Chelsea', perk: '🎁 Complimentary Gallery Pass' },
+  { id: 'v4', name: 'Conservatory Scenic Garden Walk', vibe: 'Outdoor & Scenic', category: 'parks', rating: '4.9', address: 'Central Park East & 105th St', perk: '🎁 Free Entry' },
 ];
 
-// ✅ FIX: SAFE FALLBACK — NEVER READS [0] ON UNDEFINED
 const FALLBACK_VENUE = RECOMMENDED_DATE_SPOTS?.[0] || {
-  id: 'fallback',
-  name: 'Local Coffee Shop',
-  vibe: 'Cozy & Casual',
-  category: 'coffee',
-  rating: '4.9',
-  address: 'Nearby — Search on Maps',
-  perk: '🎁 Intent perk',
+  id: 'fallback', name: 'Local Coffee Shop', vibe: 'Cozy & Casual', category: 'coffee', rating: '4.9', address: 'Nearby — Search on Maps', perk: '🎁 Intent perk',
 };
 
-// ✅ FIX: SINGLE SOURCE OF TRUTH FOR DISCOVERY PEOPLE
-// Must match DiscoveryScreen.js ids + names + intents.
-// Used when user refreshes (F5) or types /chat/2 directly — params.name is lost then, but id survives in the URL.
 const PEOPLE_BY_ID = {
-  '1': {
-    name: 'Ama',
-    avatar: 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80',
-    intent: 'Long-term Relationship 💛',
-    location: 'Accra, Ghana',
-  },
-  '2': {
-    name: 'Kwame',
-    avatar: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=400&auto=format&fit=crop&q=80',
-    intent: 'Friendship First 🤝',
-    location: 'Accra, Ghana',
-  },
-  '3': {
-    name: 'Efua',
-    avatar: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=400&auto=format&fit=crop&q=80',
-    intent: 'Marriage Minded 💍',
-    location: 'Kumasi, Ghana',
-  },
+  '1': { name: 'Ama', avatar: 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80', intent: 'Long-term Relationship 💛', location: 'Accra, Ghana' },
+  '2': { name: 'Kwame', avatar: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=400&auto=format&fit=crop&q=80', intent: 'Friendship First 🤝', location: 'Accra, Ghana' },
+  '3': { name: 'Efua', avatar: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=400&auto=format&fit=crop&q=80', intent: 'Marriage Minded 💍', location: 'Kumasi, Ghana' },
+};
+
+const formatTimer = (sec) => {
+  const m = Math.floor(sec / 60);
+  const s = sec % 60;
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`;
 };
 
 export default function ChatDetailScreen({ route, navigation }) {
-  // ✅ FIX: RESOLVE CHAT IN PRIORITY ORDER — chat object > flat params > id lookup > Elena fallback
-  const rawChat =
-    route.params?.chat ||
-    (route.params?.name
-      ? {
-          name: route.params.name,
-          avatar: route.params.avatar || route.params.img || FALLBACK_PHOTO,
-          intent: route.params.intent || 'Long-term Relationship',
-          location: route.params.location || '',
-        }
-      : PEOPLE_BY_ID[String(route.params?.id || '')] || {
-          name: 'Elena Rostova',
-          avatar: FALLBACK_PHOTO,
-          intent: 'Long-term Relationship',
-        });
+  // --- Resolve chat: chat object > flat params > id lookup > fallback ---
+  const paramChat = route.params?.chat;
+  const paramId = String(route.params?.id || route.params?.matchId || route.params?.match_id || '');
+  const paramMatchId = route.params?.matchId || route.params?.match_id || null;
+  const paramOtherId = route.params?.otherUserId || route.params?.userId || route.params?.other_id || null;
 
-  // ✅ FIX: SAFE AVATAR — handles avatar, photos[0], or fallback
-  const safeChatAvatar = rawChat?.avatar || rawChat?.photos?.[0] || FALLBACK_PHOTO;
-  const chat = { ...rawChat, avatar: safeChatAvatar };
+  const initialChat =
+    paramChat ||
+    (route.params?.name ? {
+      name: route.params.name,
+      avatar: route.params.avatar || route.params.img || FALLBACK_PHOTO,
+      intent: route.params.intent || 'Long-term Relationship',
+      location: route.params.location || '',
+    } : PEOPLE_BY_ID[paramId] || { name: 'Elena Rostova', avatar: FALLBACK_PHOTO, intent: 'Long-term Relationship' });
 
-  const [messages, setMessages] = useState([
-    { id: 'm1', text: "Hey! Loved your prompt about urban architecture.", sender: 'them', time: '10:30 AM' },
-    { id: 'm2', text: "Thanks Alex! It's rare finding someone who appreciates design.", sender: 'me', time: '10:35 AM' },
-    { id: 'm3', text: "I'd love to check out that new coffee spot on Saturday!", sender: 'them', time: '10:42 AM' },
-  ]);
+  const [userId, setUserId] = useState(null);
+  const [otherUserId, setOtherUserId] = useState(paramOtherId);
+  const [matchId, setMatchId] = useState(paramMatchId);
+  const [chat, setChat] = useState({ ...initialChat, avatar: initialChat?.avatar || initialChat?.photos?.[0] || FALLBACK_PHOTO });
+  const [loading, setLoading] = useState(true);
+
+  const [messages, setMessages] = useState([]);
   const [inputText, setInputText] = useState('');
+  const [sending, setSending] = useState(false);
 
-  const [activeCall, setActiveCall] = useState(null);
+  // --- Calls: real signalling, not local-only ---
+  const [activeCall, setActiveCall] = useState(null); // call row for caller
+  const [incomingCall, setIncomingCall] = useState(null); // call row for callee
   const [callDuration, setCallDuration] = useState(0);
   const [isMuted, setIsMuted] = useState(false);
   const [isCameraOff, setIsCameraOff] = useState(false);
@@ -139,92 +79,266 @@ export default function ChatDetailScreen({ route, navigation }) {
   const [showReportModal, setShowReportModal] = useState(false);
   const [reportReason, setReportReason] = useState('Harassment or disrespectful behavior');
 
+  const listRef = useRef(null);
+
+  // --- Load me + other user + match ---
+  const loadChat = useCallback(async () => {
+    setLoading(true);
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) { navigation.reset({ index: 0, routes: [{ name: 'AuthPortal' }] }); return; }
+      setUserId(user.id);
+
+      let resolvedOtherId = otherUserId;
+      let resolvedMatchId = matchId;
+
+      // If we only have a Discovery id (1,2,3) and no real match, keep fallback profile
+      // If we have a real matchId, find the other participant
+      if (resolvedMatchId) {
+        const { data: m } = await supabase.from('matches').select('id, user_a, user_b').eq('id', resolvedMatchId).maybeSingle();
+        if (m) {
+          resolvedOtherId = m.user_a === user.id ? m.user_b : m.user_a;
+          setOtherUserId(resolvedOtherId);
+        }
+      }
+
+      // Load other user's real profile if we have a UUID
+      if (resolvedOtherId && String(resolvedOtherId).length > 10) {
+        const { data: p } = await supabase.from('profiles').select('id, name, bio, intent, location, photos').eq('id', resolvedOtherId).maybeSingle();
+        if (p) {
+          setChat((prev) => ({
+            ...prev,
+            name: p.name || prev.name,
+            intent: p.intent || prev.intent,
+            location: p.location || prev.location,
+            avatar: (Array.isArray(p.photos) && p.photos[0]) || prev.avatar || FALLBACK_PHOTO,
+          }));
+        }
+      }
+
+      // If no matchId but we have both user ids, find or create match row for messages/calls
+      if (!resolvedMatchId && resolvedOtherId && String(resolvedOtherId).length > 10) {
+        const { data: existing } = await supabase.from('matches')
+          .select('id')
+          .or(`and(user_a.eq.${user.id},user_b.eq.${resolvedOtherId}),and(user_a.eq.${resolvedOtherId},user_b.eq.${user.id})`)
+          .maybeSingle();
+        if (existing) {
+          resolvedMatchId = existing.id;
+          setMatchId(existing.id);
+        }
+      }
+
+      // Load messages for this match (if we have one)
+      if (resolvedMatchId) {
+        const { data: msgs } = await supabase.from('messages')
+          .select('id, match_id, sender_id, content, created_at')
+          .eq('match_id', resolvedMatchId)
+          .order('created_at', { ascending: true })
+          .limit(200);
+        if (Array.isArray(msgs)) {
+          setMessages(msgs.map((mm) => ({
+            id: String(mm.id),
+            text: mm.content || '',
+            sender: mm.sender_id === user.id ? 'me' : 'them',
+            time: mm.created_at ? new Date(mm.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '',
+            isProposal: String(mm.content || '').startsWith('📍 PROPOSED DATE'),
+            isCallLog: String(mm.content || '').includes('Call Ended'),
+          })));
+        }
+      } else {
+        // Demo fallback when no real match exists yet (Discovery id 1-3)
+        setMessages([
+          { id: 'm1', text: "Hey! Loved your prompt about urban architecture.", sender: 'them', time: '10:30 AM' },
+          { id: 'm2', text: "Thanks! It's rare finding someone who appreciates design.", sender: 'me', time: '10:35 AM' },
+        ]);
+      }
+    } catch (e) {
+      console.log('[ChatDetail] load error', e?.message);
+    } finally { setLoading(false); }
+  }, [navigation]);
+
+  useEffect(() => { loadChat(); }, [loadChat]);
+
+  // --- Realtime: new messages ---
   useEffect(() => {
-    let timer;
-    if (activeCall) {
-      timer = setInterval(() => setCallDuration((prev) => prev + 1), 1000);
-    } else {
-      setCallDuration(0);
+    if (!matchId) return;
+    const ch = supabase.channel(`messages-${matchId}`)
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages', filter: `match_id=eq.${matchId}` }, (p) => {
+        const mm = p.new;
+        setMessages((prev) => {
+          if (prev.some((x) => String(x.id) === String(mm.id))) return prev;
+          return [...prev, {
+            id: String(mm.id),
+            text: mm.content || '',
+            sender: mm.sender_id === userId ? 'me' : 'them',
+            time: mm.created_at ? new Date(mm.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : 'Just now',
+            isProposal: String(mm.content || '').startsWith('📍 PROPOSED DATE'),
+            isCallLog: String(mm.content || '').includes('Call Ended'),
+          }];
+        });
+      })
+      .subscribe();
+    return () => supabase.removeChannel(ch);
+  }, [matchId, userId]);
+
+  // --- Realtime: incoming calls ---
+  useEffect(() => {
+    if (!userId || !matchId) return;
+    const ch = supabase.channel(`calls-${matchId}`)
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'calls', filter: `match_id=eq.${matchId}` }, (p) => {
+        const row = p.new;
+        if (row.callee_id === userId && row.status === 'ringing') setIncomingCall(row);
+      })
+      .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'calls', filter: `match_id=eq.${matchId}` }, (p) => {
+        const row = p.new;
+        if (['declined', 'ended', 'missed'].includes(row.status)) { setIncomingCall(null); setActiveCall(null); }
+        if (row.status === 'answered' && row.caller_id === userId) setActiveCall(row);
+      })
+      .subscribe();
+    return () => supabase.removeChannel(ch);
+  }, [userId, matchId]);
+
+  // --- Call timer ---
+  useEffect(() => {
+    let t;
+    if (activeCall || incomingCall) {
+      // Timer only counts when answered, not while ringing — caller sees Ringing until answer
+      const isConnected = activeCall?.status === 'answered' || (activeCall && incomingCall === null && activeCall.status !== 'ringing');
+      if (activeCall?.status === 'answered') {
+        t = setInterval(() => setCallDuration((v) => v + 1), 1000);
+      } else setCallDuration(0);
+    } else setCallDuration(0);
+    return () => clearInterval(t);
+  }, [activeCall, incomingCall]);
+
+  const openGoogleMaps = (addr) => {
+    Linking.openURL(`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(addr || '')}`).catch(() => {});
+  };
+  const openUber = () => Linking.openURL('https://m.uber.com/ul/?action=setPickup').catch(() => {});
+
+  // --- Real call start: inserts row Vio can hear ---
+  const handleStartCall = async (type) => {
+    if (!userId || !otherUserId || !matchId) {
+      Alert.alert('Call unavailable', 'Start a chat first — this profile is not yet a real match. Like them on Discovery to unlock calls.');
+      return;
     }
-    return () => clearInterval(timer);
-  }, [activeCall]);
-
-  const formatTimer = (sec) => {
-    const mins = Math.floor(sec / 60);
-    const secs = sec % 60;
-    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    setIsMuted(false); setIsCameraOff(false);
+    await supabase.from('calls').update({ status: 'missed' }).eq('match_id', matchId).eq('status', 'ringing');
+    const { data, error } = await supabase.from('calls').insert({
+      match_id: matchId, caller_id: userId, callee_id: otherUserId, type, status: 'ringing',
+    }).select().single();
+    if (error) { Alert.alert('Call failed', error.message); return; }
+    setActiveCall(data);
   };
 
-  const openGoogleMaps = (venueAddress) => {
-    const url = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(venueAddress || '')}`;
-    Linking.openURL(url).catch(() => {});
+  const handleAnswerCall = async () => {
+    if (!incomingCall) return;
+    await supabase.from('calls').update({ status: 'answered' }).eq('id', incomingCall.id);
+    setActiveCall({ ...incomingCall, status: 'answered' });
+    setIncomingCall(null);
+    setCallDuration(0);
   };
 
-  const openUber = () => {
-    const url = 'https://m.uber.com/ul/?action=setPickup';
-    Linking.openURL(url).catch(() => {});
+  const handleDeclineCall = async () => {
+    if (incomingCall) await supabase.from('calls').update({ status: 'declined', ended_at: new Date().toISOString() }).eq('id', incomingCall.id);
+    setIncomingCall(null);
   };
 
-  const handleStartCall = (type) => {
-    setIsMuted(false);
-    setIsCameraOff(false);
-    setActiveCall(type);
-  };
-
-  const handleEndCall = () => {
+  const handleEndCall = async () => {
+    const callRow = activeCall || incomingCall;
     const durationFormatted = formatTimer(callDuration);
-    const callTypeTitle = activeCall === 'video' ? 'Video Call' : 'Voice Call';
-    setMessages((prev) => [
-      ...(prev || []),
-      {
-        id: Date.now().toString(),
-        text: `📞 In-App ${callTypeTitle} Ended (${durationFormatted})`,
-        sender: 'me',
-        isCallLog: true,
-        time: 'Just now',
-      },
-    ]);
-    setActiveCall(null);
+    const callTypeTitle = (callRow?.type || activeCall?.type || 'audio') === 'video' ? 'Video Call' : 'Voice Call';
+    if (callRow?.id) {
+      await supabase.from('calls').update({ status: 'ended', ended_at: new Date().toISOString() }).eq('id', callRow.id);
+    }
+    // Log call in chat so both sides see it — only if we have a real match
+    if (matchId && userId) {
+      const logText = `📞 ${callTypeTitle} Ended (${durationFormatted})`;
+      await supabase.from('messages').insert({ match_id: matchId, sender_id: userId, content: logText });
+    }
+    setMessages((prev) => [...prev, { id: Date.now().toString(), text: `📞 ${callTypeTitle} Ended (${durationFormatted})`, sender: 'me', isCallLog: true, time: 'Just now' }]);
+    setActiveCall(null); setIncomingCall(null); setCallDuration(0);
   };
 
-  const handleSend = () => {
-    if (!inputText.trim()) return;
-    setMessages([...(messages || []), { id: Date.now().toString(), text: inputText, sender: 'me', time: 'Just now' }]);
+  // --- Real send ---
+  const persistMessage = async (text) => {
+    if (!matchId || !userId) return false;
+    const { error } = await supabase.from('messages').insert({ match_id: matchId, sender_id: userId, content: text });
+    return !error;
+  };
+
+  const handleSend = async () => {
+    if (!inputText.trim() || sending) return;
+    const text = inputText.trim();
     setInputText('');
+    const optimistic = { id: `local-${Date.now()}`, text, sender: 'me', time: 'Just now' };
+    setMessages((prev) => [...prev, optimistic]);
+    setSending(true);
+    try {
+      const saved = await persistMessage(text);
+      if (!saved && !matchId) {
+        // Demo mode — keep optimistic, it already shows
+      }
+    } finally { setSending(false); }
   };
 
-  const handleSendIcebreaker = (icebreakerText) => {
-    setMessages((prev) => [...(prev || []), { id: Date.now().toString(), text: icebreakerText, sender: 'me', time: 'Just now' }]);
+  const handleSendIcebreaker = async (icebreakerText) => {
+    setMessages((prev) => [...prev, { id: Date.now().toString(), text: icebreakerText, sender: 'me', time: 'Just now' }]);
+    await persistMessage(icebreakerText);
   };
 
-  const handleProposeDate = () => {
+  const handleProposeDate = async () => {
     setShowShowDateModal(false);
     const venueName = selectedVenue?.name || FALLBACK_VENUE.name;
     const venueAddr = selectedVenue?.address || FALLBACK_VENUE.address;
     const venuePerk = selectedVenue?.perk || '';
-    setMessages([...(messages || []), {
-      id: Date.now().toString(),
-      text: `📍 PROPOSED DATE: ${venueName} (${venueAddr})\n📅 ${dateTimeInput}\n${venuePerk}`,
-      sender: 'me',
-      isProposal: true,
-      time: 'Just now',
-    }]);
+    const text = `📍 PROPOSED DATE: ${venueName} (${venueAddr})\n📅 ${dateTimeInput}\n${venuePerk}`;
+    setMessages((prev) => [...prev, { id: Date.now().toString(), text, sender: 'me', isProposal: true, time: 'Just now' }]);
+    await persistMessage(text);
+    // Best-effort: save to dates table if it exists
+    try {
+      if (matchId && userId && otherUserId) {
+        await supabase.from('dates').insert({ match_id: matchId, user_a: userId, user_b: otherUserId, venue_name: venueName, venue_address: venueAddr, proposed_time: dateTimeInput, status: 'proposed' });
+      }
+    } catch {}
   };
 
-  const handleSubmitReport = () => {
+  const handleSubmitReport = async () => {
     setShowReportModal(false);
+    try {
+      const { data: { user } } = await supabase.auth.getUser();
+      if (user) {
+        await supabase.from('customer_support').insert({
+          user_id: user.id,
+          user_email: user.email,
+          ticket_type: 'complaint',
+          subject: `Report: ${chat?.name || 'User'} — ${reportReason}`,
+          message: `Reported ${chat?.name || ''} (ID: ${otherUserId || paramId}) for: ${reportReason}. From chat ${matchId || paramId}.`,
+          status: 'under_review',
+        });
+      }
+    } catch {}
     Alert.alert('Report Received 🛡️', `Thank you. Your report against ${chat?.name || 'this user'} has been submitted to the Intent App Manager for review.`);
   };
 
-  // ✅ FIX: SAFE FILTER — never crashes if RECOMMENDED_DATE_SPOTS undefined
-  const filteredVenues = (RECOMMENDED_DATE_SPOTS || []).filter(
-    (v) => selectedVibeCategory === 'all' || v?.category === selectedVibeCategory
-  );
+  const filteredVenues = (RECOMMENDED_DATE_SPOTS || []).filter((v) => selectedVibeCategory === 'all' || v?.category === selectedVibeCategory);
+
+  const inCall = activeCall || incomingCall;
+  const isRingingOut = activeCall && activeCall.status === 'ringing' && !incomingCall;
+
+  if (loading) {
+    return (
+      <SafeAreaView style={[styles.safeArea, { justifyContent: 'center', alignItems: 'center' }]}>
+        <ActivityIndicator color="#F97316" size="large" />
+        <Text style={{ color: '#94A3B8', marginTop: 12 }}>Loading chat...</Text>
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.safeArea}>
       <View style={styles.header}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}><Ionicons name="arrow-back" size={24} color="#F8FAFC" /></TouchableOpacity>
+        <TouchableOpacity onPress={() => navigation.canGoBack() ? navigation.goBack() : navigation.navigate('ActiveChats')} style={styles.backBtn}><Ionicons name="arrow-back" size={24} color="#F8FAFC" /></TouchableOpacity>
         <Image source={{ uri: chat?.avatar || FALLBACK_PHOTO }} style={styles.avatar} />
         <View style={styles.headerInfo}><Text style={styles.name}>{chat?.name || 'Intent User'}</Text><Text style={styles.intentLabel}>Seeking: {chat?.intent || 'Intentional'}</Text></View>
         <View style={styles.callHeaderActions}>
@@ -236,9 +350,11 @@ export default function ChatDetailScreen({ route, navigation }) {
       </View>
 
       <FlatList
+        ref={listRef}
         data={messages || []}
-        keyExtractor={(item) => item?.id || Math.random().toString()}
+        keyExtractor={(item) => String(item?.id || Math.random().toString())}
         contentContainerStyle={styles.msgList}
+        onContentSizeChange={() => listRef.current?.scrollToEnd({ animated: true })}
         renderItem={({ item }) => {
           const isMe = item?.sender === 'me';
           if (item?.isCallLog) {
@@ -263,26 +379,60 @@ export default function ChatDetailScreen({ route, navigation }) {
       </View>
 
       <View style={styles.inputBar}>
-        <TextInput style={styles.input} placeholder="Type intentional message..." placeholderTextColor="#64748B" value={inputText} onChangeText={setInputText} />
-        <TouchableOpacity style={styles.sendBtn} onPress={handleSend}><Ionicons name="send" size={18} color="#FFFFFF" /></TouchableOpacity>
+        <TextInput style={styles.input} placeholder="Type intentional message..." placeholderTextColor="#64748B" value={inputText} onChangeText={setInputText} onSubmitEditing={handleSend} />
+        <TouchableOpacity style={styles.sendBtn} onPress={handleSend} disabled={sending}><Ionicons name="send" size={18} color="#FFFFFF" /></TouchableOpacity>
       </View>
 
-      <Modal visible={activeCall !== null} transparent animationType="fade">
-        <View style={styles.callOverlay}>
-          <SafeAreaView style={styles.callContainer}>
-            <View style={styles.callTopHeader}><View style={styles.encryptionBadge}><Ionicons name="lock-closed" size={12} color="#FBBF24" /><Text style={styles.encryptionText}>Intent Encrypted Call</Text></View><Text style={styles.callTimerText}>{formatTimer(callDuration)}</Text></View>
-            {activeCall === 'video' ? (
-              <View style={styles.videoFeedBox}>{!isCameraOff ? <Image source={{ uri: chat?.avatar || FALLBACK_PHOTO }} style={styles.remoteVideo} /> : <View style={styles.cameraOffPlaceholder}><Ionicons name="videocam-off" size={48} color="#64748B" /></View>}</View>
-            ) : (
-              <View style={styles.audioCallBox}><Image source={{ uri: chat?.avatar || FALLBACK_PHOTO }} style={styles.audioCallAvatar} /><Text style={styles.callPartnerName}>{chat?.name || 'Intent User'}</Text></View>
-            )}
-            <View style={styles.callControlsRow}>
-              <TouchableOpacity style={[styles.controlCircle, isMuted && styles.controlCircleActive]} onPress={() => setIsMuted(!isMuted)}><Ionicons name={isMuted ? 'mic-off' : 'mic'} size={24} color="#FFFFFF" /></TouchableOpacity>
-              <TouchableOpacity style={styles.endCallBtn} onPress={handleEndCall}><Ionicons name="call" size={28} color="#FFFFFF" style={{ transform: [{ rotate: '135deg' }] }} /></TouchableOpacity>
-            </View>
-          </SafeAreaView>
-        </View>
-      </Modal>
+      {/* INCOMING CALL — this is what Vio was missing */}
+      {incomingCall && (
+        <Modal visible transparent animationType="fade">
+          <View style={styles.callOverlay}>
+            <SafeAreaView style={styles.callContainer}>
+              <View style={styles.callTopHeader}>
+                <View style={styles.encryptionBadge}><Text style={styles.encryptionText}>{incomingCall.type === 'video' ? '📹 Video Call' : '📞 Voice Call'}</Text></View>
+                <Text style={styles.callTimerText}>Incoming...</Text>
+              </View>
+              <View style={styles.audioCallBox}>
+                <Image source={{ uri: chat?.avatar || FALLBACK_PHOTO }} style={styles.audioCallAvatar} />
+                <Text style={styles.callPartnerName}>{chat?.name || 'Intent User'}</Text>
+                <Text style={{ color: '#94A3B8', marginTop: 8 }}>{incomingCall.type === 'video' ? 'Video Call' : 'Voice Call'} • Tap Accept to answer</Text>
+              </View>
+              <View style={styles.callControlsRow}>
+                <TouchableOpacity style={[styles.controlCircle, { backgroundColor: '#EF4444' }]} onPress={handleDeclineCall}><Ionicons name="call" size={24} color="#FFFFFF" style={{ transform: [{ rotate: '135deg' }] }} /></TouchableOpacity>
+                <TouchableOpacity style={[styles.controlCircle, { backgroundColor: '#22C55E' }]} onPress={handleAnswerCall}><Ionicons name="call" size={24} color="#FFFFFF" /></TouchableOpacity>
+              </View>
+            </SafeAreaView>
+          </View>
+        </Modal>
+      )}
+
+      {/* OUTGOING / ACTIVE CALL */}
+      {activeCall && !incomingCall && (
+        <Modal visible transparent animationType="fade">
+          <View style={styles.callOverlay}>
+            <SafeAreaView style={styles.callContainer}>
+              <View style={styles.callTopHeader}>
+                <View style={styles.encryptionBadge}><Text style={styles.encryptionText}>{activeCall.type === 'video' ? '📹 Video Call' : '📞 Voice Call'}</Text></View>
+                <Text style={styles.callTimerText}>{isRingingOut ? 'Ringing...' : formatTimer(callDuration)}</Text>
+                {isRingingOut && <Text style={{ color: '#94A3B8', marginTop: 6 }}>Waiting for {chat?.name} to answer...</Text>}
+              </View>
+              {activeCall.type === 'video' ? (
+                <View style={styles.videoFeedBox}>{!isCameraOff ? <Image source={{ uri: chat?.avatar || FALLBACK_PHOTO }} style={styles.remoteVideo} /> : <View style={styles.cameraOffPlaceholder}><Ionicons name="videocam-off" size={48} color="#64748B" /><Text style={{ color: '#94A3B8', marginTop: 8 }}>Camera Off</Text></View>}</View>
+              ) : (
+                <View style={styles.audioCallBox}><Image source={{ uri: chat?.avatar || FALLBACK_PHOTO }} style={styles.audioCallAvatar} /><Text style={styles.callPartnerName}>{chat?.name || 'Intent User'}</Text><Text style={{ color: '#94A3B8', marginTop: 8 }}>{isRingingOut ? 'Ringing...' : 'Connected'}</Text></View>
+              )}
+              <View style={styles.callControlsRow}>
+                <TouchableOpacity style={[styles.controlCircle, isMuted && styles.controlCircleActive]} onPress={() => setIsMuted(!isMuted)}><Ionicons name={isMuted ? 'mic-off' : 'mic'} size={24} color="#FFFFFF" /></TouchableOpacity>
+                {activeCall.type === 'video' && (
+                  <TouchableOpacity style={[styles.controlCircle, isCameraOff && styles.controlCircleActive]} onPress={() => setIsCameraOff(!isCameraOff)}><Ionicons name={isCameraOff ? 'videocam-off' : 'videocam'} size={24} color="#FFFFFF" /></TouchableOpacity>
+                )}
+                <TouchableOpacity style={styles.endCallBtn} onPress={handleEndCall}><Ionicons name="call" size={28} color="#FFFFFF" style={{ transform: [{ rotate: '135deg' }] }} /></TouchableOpacity>
+              </View>
+              {!isRingingOut && <Text style={styles.callNote}>Audio/video stream requires WebRTC — signalling is connected. Add LiveKit / react-native-webrtc for real media.</Text>}
+            </SafeAreaView>
+          </View>
+        </Modal>
+      )}
 
       <Modal visible={showDateModal} transparent animationType="slide">
         <View style={styles.modalBg}>
@@ -290,20 +440,22 @@ export default function ChatDetailScreen({ route, navigation }) {
             <View style={styles.recommenderHeader}><View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}><Ionicons name="location" size={20} color="#FBBF24" /><Text style={styles.modalTitle}>Date Venue & Vibe Recommender</Text></View><TouchableOpacity onPress={() => setShowShowDateModal(false)} style={{ padding: 4 }}><Ionicons name="close" size={20} color="#94A3B8" /></TouchableOpacity></View>
             <Text style={styles.modalSub}>Pick a top-rated date spot and time to invite {chat?.name || 'them'}.</Text>
             <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.vibeChipsRow}>
-              <TouchableOpacity style={[styles.vibeChip, selectedVibeCategory === 'all' && styles.vibeChipActive]} onPress={() => setSelectedVibeCategory('all')}><Text style={[styles.vibeChipText, selectedVibeCategory === 'all' && styles.vibeChipTextActive]}>✨ All Vibes</Text></TouchableOpacity>
-              <TouchableOpacity style={[styles.vibeChip, selectedVibeCategory === 'coffee' && styles.vibeChipActive]} onPress={() => setSelectedVibeCategory('coffee')}><Text style={[styles.vibeChipText, selectedVibeCategory === 'coffee' && styles.vibeChipTextActive]}>☕ Coffee & Tea</Text></TouchableOpacity>
-              <TouchableOpacity style={[styles.vibeChip, selectedVibeCategory === 'dining' && styles.vibeChipActive]} onPress={() => setSelectedVibeCategory('dining')}><Text style={[styles.vibeChipText, selectedVibeCategory === 'dining' && styles.vibeChipTextActive]}>🍷 Fine Dining</Text></TouchableOpacity>
-              <TouchableOpacity style={[styles.vibeChip, selectedVibeCategory === 'art' && styles.vibeChipActive]} onPress={() => setSelectedVibeCategory('art')}><Text style={[styles.vibeChipText, selectedVibeCategory === 'art' && styles.vibeChipTextActive]}>🎨 Art Galleries</Text></TouchableOpacity>
-              <TouchableOpacity style={[styles.vibeChip, selectedVibeCategory === 'parks' && styles.vibeChipActive]} onPress={() => setSelectedVibeCategory('parks')}><Text style={[styles.vibeChipText, selectedVibeCategory === 'parks' && styles.vibeChipTextActive]}>🌳 Parks & Walks</Text></TouchableOpacity>
+              {['all', 'coffee', 'dining', 'art', 'parks'].map((c) => (
+                <TouchableOpacity key={c} style={[styles.vibeChip, selectedVibeCategory === c && styles.vibeChipActive]} onPress={() => setSelectedVibeCategory(c)}><Text style={[styles.vibeChipText, selectedVibeCategory === c && styles.vibeChipTextActive]}>{c === 'all' ? '✨ All Vibes' : c === 'coffee' ? '☕ Coffee & Tea' : c === 'dining' ? '🍷 Fine Dining' : c === 'art' ? '🎨 Art Galleries' : '🌳 Parks & Walks'}</Text></TouchableOpacity>
+              ))}
             </ScrollView>
-            <ScrollView style={{ maxHeight: 220 }} showsVerticalScrollIndicator={true}>
+            <ScrollView style={{ maxHeight: 220 }} showsVerticalScrollIndicator>
               {(filteredVenues || []).map((spot) => {
                 const isSelected = selectedVenue?.id === spot?.id;
                 return (
-                  <TouchableOpacity key={spot?.id} style={[styles.spotCard, isSelected && styles.spotCardSelected]} onPress={() => setSelectedVenue(spot)}>
-                    <View style={{ flex: 1 }}><View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}><Text style={styles.spotName}>{spot?.name || ''}</Text><Text style={styles.spotRating}>⭐ {spot?.rating || ''}</Text></View><Text style={styles.spotAddress}>📍 {spot?.address || ''}</Text><Text style={styles.spotPerk}>{spot?.perk || ''}</Text></View>
+                  <View key={spot?.id} style={[styles.spotCard, isSelected && styles.spotCardSelected]}>
+                    <TouchableOpacity style={{ flex: 1 }} onPress={() => setSelectedVenue(spot)}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}><Text style={styles.spotName}>{spot?.name || ''}</Text><Text style={styles.spotRating}>⭐ {spot?.rating || ''}</Text></View>
+                      <Text style={styles.spotAddress}>📍 {spot?.address || ''}</Text>
+                      <Text style={styles.spotPerk}>{spot?.perk || ''}</Text>
+                    </TouchableOpacity>
                     <TouchableOpacity style={styles.mapsBtn} onPress={() => openGoogleMaps(spot?.address)}><Ionicons name="navigate-outline" size={16} color="#FBBF24" /></TouchableOpacity>
-                  </TouchableOpacity>
+                  </View>
                 );
               })}
             </ScrollView>
@@ -380,6 +532,7 @@ const styles = StyleSheet.create({
   controlCircle: { width: 56, height: 56, borderRadius: 28, backgroundColor: '#1E293B', justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: '#334155' },
   controlCircleActive: { backgroundColor: '#EF4444' },
   endCallBtn: { width: 68, height: 68, borderRadius: 34, backgroundColor: '#EF4444', justifyContent: 'center', alignItems: 'center' },
+  callNote: { color: '#64748B', fontSize: 11, textAlign: 'center', marginBottom: 12 },
   modalBg: { flex: 1, backgroundColor: 'rgba(2, 6, 23, 0.85)', justifyContent: 'center', padding: 20 },
   dateModalCard: { backgroundColor: '#1E293B', borderRadius: 20, padding: 20, borderWidth: 1, borderColor: '#334155', maxHeight: '90%' },
   recommenderHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
