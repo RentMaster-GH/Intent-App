@@ -1,69 +1,83 @@
 import React, { useState, useEffect, useCallback } from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Image, ActivityIndicator, RefreshControl } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, ActivityIndicator, RefreshControl } from 'react-native';
+import { Image } from 'expo-image';
 import { supabase } from '../lib/supabase';
 
-export default function ActiveChatsScreen({ navigation, route }) {
-  const isDemo = route?.params?.isDemo === true;
+export default function ActiveChatsScreen({ navigation }) {
   const [chats, setChats] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
   const loadChats = useCallback(async () => {
     try {
-      if (isDemo) {
-        setChats([
-          { id: 'demo-1', matchId: 'demo-1', name: 'Ama', age: 27, location: 'Accra, Ghana', intent: 'Long-term Relationship 💛', img: 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80', lastMessage: 'I love ceramic art! Are you free Thursday?', lastAt: '2m ago', unread: 1, isDemo: true },
-          { id: 'demo-2', matchId: 'demo-2', name: 'Kwame', age: 29, location: 'Accra, Ghana', intent: 'Friendship First 🤝', img: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=400&auto=format&fit=crop&q=80', lastMessage: 'Hey! Did you see my prompt about jazz bars.', lastAt: '1h ago', unread: 0, isDemo: true },
-        ]);
-        setLoading(false); setRefreshing(false); return;
-      }
       const { data: { user } } = await supabase.auth.getUser();
-      if (!user) { setChats([]); setLoading(false); setRefreshing(false); return; }
+      if (!user) { setChats([]); return; }
 
       // 1. My matches
-      const { data: matches, error } = await supabase.from('matches').select('*').or(`user_a.eq.${user.id},user_b.eq.${user.id}`).order('created_at', { ascending: false });
-      if (error) throw error;
-      if (!matches?.length) { setChats([]); setLoading(false); setRefreshing(false); return; }
+      const { data: matches, error } = await supabase.from('matches')
+        .select('*')
+        .or(`user_a.eq.${user.id},user_b.eq.${user.id}`)
+        .order('created_at', { ascending: false });
+      if (error) {
+        if (error.message?.includes('does not exist') || error.code === '42P01') { setChats([]); return; }
+        throw error;
+      }
+      if (!matches?.length) { setChats([]); return; }
 
-      // 2. Other user profiles
-      const otherIds = matches.map((m) => (m.user_a === user.id ? m.user_b : m.user_a));
-      const { data: profiles } = await supabase.from('profiles').select('*').in('id', otherIds);
+      // 2. Other user profiles — real columns: name, location, intent, photos, photo_url
+      const otherIds = [...new Set(matches.map((m) => (m.user_a === user.id ? m.user_b : m.user_a)))];
+      const { data: profiles } = await supabase.from('profiles')
+        .select('id, name, age, location, intent, photos, photo_url')
+        .in('id', otherIds);
       const byId = {};
       (profiles || []).forEach((p) => { byId[p.id] = p; });
 
       // 3. Last message per match
       const matchIds = matches.map((m) => m.id);
-      const { data: msgs } = await supabase.from('messages').select('*').in('match_id', matchIds).order('created_at', { ascending: false }).limit(200);
+      const { data: msgs } = await supabase.from('messages')
+        .select('match_id, sender_id, content, is_read, created_at')
+        .in('match_id', matchIds)
+        .order('created_at', { ascending: false })
+        .limit(200);
       const lastByMatch = {};
       (msgs || []).forEach((msg) => { if (!lastByMatch[msg.match_id]) lastByMatch[msg.match_id] = msg; });
 
-      // 4. Unread count (messages from other user, not read)
+      // 4. Unread count
       const unreadByMatch = {};
       (msgs || []).forEach((msg) => { if (msg.sender_id !== user.id && !msg.is_read) unreadByMatch[msg.match_id] = (unreadByMatch[msg.match_id] || 0) + 1; });
 
-      const list = matches.map((m) => {
-        const otherId = m.user_a === user.id ? m.user_b : m.user_a;
-        const p = byId[otherId] || {};
-        const last = lastByMatch[m.id];
-        return {
-          id: m.id, matchId: m.id, otherUserId: otherId,
-          name: p.full_name || 'Intent User', age: p.age || '',
-          location: [p.city, p.country].filter(Boolean).join(', ') || 'Accra, Ghana',
-          intent: p.intent || 'Long-term Relationship 💍',
-          img: p.avatar_url || p.photos?.[0] || 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80',
-          lastMessage: last?.content || 'Say hi 👋 — you matched!',
-          lastAt: last ? new Date(last.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '',
-          unread: unreadByMatch[m.id] || 0, isDemo: false,
-        };
-      });
-      // Sort by last message time, matches with no messages last
-      list.sort((a, b) => (b.lastMessage === 'Say hi 👋 — you matched!' ? -1 : 0));
+      const list = matches
+        // FIX: Hide ghost matches — if the other user has no profile row, don't render "Intent User"
+        .filter((m) => {
+          const otherId = m.user_a === user.id ? m.user_b : m.user_a;
+          return !!byId[otherId];
+        })
+        .map((m) => {
+          const otherId = m.user_a === user.id ? m.user_b : m.user_a;
+          const p = byId[otherId] || {};
+          const last = lastByMatch[m.id];
+          const photo = Array.isArray(p.photos) && p.photos[0] ? p.photos[0] : p.photo_url || null;
+          return {
+            id: m.id, matchId: m.id, otherUserId: otherId,
+            name: p.name || 'Matched User',
+            age: p.age || '',
+            location: p.location || '',
+            intent: p.intent || '',
+            img: photo,
+            lastMessage: last?.content || 'Say hi — you matched!',
+            lastAt: last ? new Date(last.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '',
+            lastAtMs: last ? new Date(last.created_at).getTime() : new Date(m.created_at).getTime(),
+            unread: unreadByMatch[m.id] || 0,
+          };
+        });
+      // FIX: Real sort — most recent message first
+      list.sort((a, b) => b.lastAtMs - a.lastAtMs);
       setChats(list);
     } catch (e) {
       console.error('[Chats] load failed:', e);
       setChats([]);
     } finally { setLoading(false); setRefreshing(false); }
-  }, [isDemo]);
+  }, []);
 
   useEffect(() => { loadChats(); }, [loadChats]);
 
@@ -98,10 +112,14 @@ export default function ActiveChatsScreen({ navigation, route }) {
         </View>
       ) : chats.map((c) => (
         <TouchableOpacity key={c.id} style={styles.card} onPress={() => navigation.navigate('ChatDetail', { id: c.matchId, matchId: c.matchId, name: c.name, avatar: c.img, img: c.img, intent: c.intent, location: c.location, otherUserId: c.otherUserId })}>
-          <Image source={{ uri: c.img }} style={styles.avatar} />
+          {c.img ? (
+            <Image source={{ uri: c.img }} style={styles.avatar} contentFit="cover" />
+          ) : (
+            <View style={[styles.avatar, styles.avatarPlaceholder]}><Text style={styles.avatarLetter}>{c.name ? c.name[0].toUpperCase() : '?'}</Text></View>
+          )}
           <View style={{ flex: 1 }}>
-            <View style={styles.rowBetween}><Text style={styles.name}>{c.name}</Text><Text style={styles.time}>{c.lastAt}</Text></View>
-            <Text style={styles.intent}>{c.intent} • {c.location}</Text>
+            <View style={styles.rowBetween}><Text style={styles.name}>{c.name}{c.age ? `, ${c.age}` : ''}</Text><Text style={styles.time}>{c.lastAt}</Text></View>
+            <Text style={styles.intent}>{[c.intent, c.location].filter(Boolean).join(' • ')}</Text>
             <Text style={styles.lastMsg} numberOfLines={1}>{c.lastMessage}</Text>
             <TouchableOpacity style={styles.graduateBtn} onPress={() => navigation.navigate('Dates')}><Text style={styles.graduateText}>Graduate to Date</Text></TouchableOpacity>
           </View>
@@ -136,6 +154,8 @@ const styles = StyleSheet.create({
   sectionTitle: { color: '#FFF', fontWeight: '800', fontSize: 14, marginBottom: 12 },
   card: { flexDirection: 'row', backgroundColor: '#1E293B', borderRadius: 16, padding: 12, borderWidth: 1, borderColor: '#334155', marginBottom: 12, gap: 12 },
   avatar: { width: 56, height: 56, borderRadius: 28, backgroundColor: '#0F172A' },
+  avatarPlaceholder: { backgroundColor: '#334155', justifyContent: 'center', alignItems: 'center' },
+  avatarLetter: { color: '#FBBF24', fontSize: 22, fontWeight: '800' },
   rowBetween: { flexDirection: 'row', justifyContent: 'space-between' },
   name: { color: '#FFF', fontWeight: '800', fontSize: 16 },
   time: { color: '#64748B', fontSize: 11 },
