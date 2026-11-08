@@ -12,9 +12,17 @@ import DatesScreen from './src/screens/DatesScreen';
 import ProfileScreen from './src/screens/ProfileScreen';
 import SettingsPortalScreen from './src/screens/SettingsPortalScreen';
 import CustomerSupportScreen from './src/screens/CustomerSupportScreen';
-import { supabase } from './src/lib/supabase';
+import { supabase, isSupabaseConfigured } from './src/lib/supabase';
 import ErrorBoundary from './src/components/ErrorBoundary';
-import UpdateChecker from './src/components/UpdateChecker';
+
+// UpdateChecker is optional - never let it crash the app.
+// If the file exports default, use it. If it exports named / nothing, render null.
+import UpdateCheckerRaw from './src/components/UpdateChecker';
+const UpdateChecker = typeof UpdateCheckerRaw === 'function'
+  ? UpdateCheckerRaw
+  : (UpdateCheckerRaw && typeof UpdateCheckerRaw.default === 'function'
+      ? UpdateCheckerRaw.default
+      : () => null);
 
 const FRESH_SIGNUP_KEY = 'intent_fresh_signup';
 
@@ -77,6 +85,7 @@ const routeToPath = (name, params = {}) => {
 
 const checkProfileExists = async (userId) => {
   if (!userId) return { exists: false, error: null };
+  if (!isSupabaseConfigured) return { exists: false, error: null };
   try {
     const { data, error } = await supabase.from('profiles').select('id').eq('id', userId).maybeSingle();
     if (error) return { exists: false, error: error.message };
@@ -86,7 +95,6 @@ const checkProfileExists = async (userId) => {
   }
 };
 
-// Web-only helpers. On native these are no-ops.
 const readFreshSignupFlag = () => {
   try {
     if (Platform.OS === 'web' && typeof window !== 'undefined') {
@@ -114,25 +122,26 @@ export default function App() {
   const [errorBoundaryKey, setErrorBoundaryKey] = useState(0);
   const isPoppingRef = useRef(false);
   const sessionRef = useRef(null);
+  const stackRef = useRef([{ name: 'AuthPortal', params: {} }]);
   const profileCacheRef = useRef({});
   const bootAttemptRef = useRef(0);
+  const mountedRef = useRef(true);
+
+  useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
+  useEffect(() => { sessionRef.current = session; }, [session]);
+  useEffect(() => { stackRef.current = stack; }, [stack]);
 
   const current = stack[stack.length - 1];
-  const currentRoute = resolveRouteName(current.name);
+  const currentRoute = resolveRouteName(current?.name || 'AuthPortal');
 
-  useEffect(() => { sessionRef.current = session; }, [session]);
-
-  // Audio setup - safe on native, skipped on web
+  // Audio setup - safe, never crashes boot
   useEffect(() => {
     const setupAudio = async () => {
       if (Platform.OS === 'web') return;
       try {
         const mod = await import('expo-av');
         const Audio = mod?.Audio || mod?.default?.Audio;
-        if (!Audio?.setAudioModeAsync) {
-          console.log('[App] Audio setup skipped: expo-av not available in this build');
-          return;
-        }
+        if (typeof Audio?.setAudioModeAsync !== 'function') return;
         await Audio.setAudioModeAsync({
           allowsRecordingIOS: true,
           playsInSilentModeIOS: true,
@@ -162,14 +171,26 @@ export default function App() {
   }, []);
 
   const boot = useCallback(async () => {
+    if (!mountedRef.current) return;
     bootAttemptRef.current += 1;
     setIsLoading(true);
     setBootError('');
-    setErrorBoundaryKey((k) => k + 1);
     try {
+      // If Supabase is not configured (EAS build without env vars),
+      // do NOT crash - just show AuthPortal so user can still see the app.
+      if (!isSupabaseConfigured || typeof supabase?.auth?.getSession !== 'function') {
+        console.warn('[App] Supabase not configured, showing AuthPortal');
+        setSession(null);
+        sessionRef.current = null;
+        setStack([{ name: 'AuthPortal', params: {} }]);
+        setIsLoading(false);
+        return;
+      }
+
       const { data, error: sessionError } = await supabase.auth.getSession();
       if (sessionError) throw sessionError;
       const sess = data?.session || null;
+      if (!mountedRef.current) return;
       setSession(sess);
       sessionRef.current = sess;
 
@@ -203,135 +224,148 @@ export default function App() {
           window.history.replaceState(null, '', routeToPath(initial.name, initial.params));
         }
       } catch {}
+      if (!mountedRef.current) return;
       setStack([{ name: resolveRouteName(initial.name), params: initial.params || {} }]);
       setIsLoading(false);
     } catch (e) {
-      setBootError(e.message || 'Could not load Intent. Check your connection and try again.');
+      if (!mountedRef.current) return;
+      console.warn('[App] boot failed:', e?.message);
+      setBootError(e?.message || 'Could not load Intent. Check your connection and try again.');
       setIsLoading(false);
     }
   }, []);
 
   useEffect(() => { boot(); }, [boot]);
 
-  // Auth listener - handles both Supabase v1 and v2 return shapes
+  // Auth listener - guarded, no stale closure, handles v1 + v2
   useEffect(() => {
-    const listener = supabase.auth.onAuthStateChange(async (event, sess) => {
-      if (event === 'SIGNED_UP') {
-        try {
-          if (Platform.OS === 'web' && typeof window !== 'undefined') window.sessionStorage?.setItem(FRESH_SIGNUP_KEY, '1');
-        } catch {}
-        return;
+    let subscription = null;
+    try {
+      if (typeof supabase?.auth?.onAuthStateChange !== 'function') {
+        console.warn('[App] supabase.auth.onAuthStateChange not available');
+        return undefined;
       }
-      if (event === 'SIGNED_IN' && sess) {
-        setSession(sess);
-        sessionRef.current = sess;
-        const topNow = stack[stack.length - 1];
-        if (topNow?.params?.isDemo) return;
-        const isFresh = readFreshSignupFlag();
-        if (isFresh) {
-          consumeFreshSignupFlag();
-          profileCacheRef.current[sess.user.id] = false;
-          setStack((prev) => {
-            const topName = resolveRouteName(prev[prev.length - 1]?.name);
-            if (topName === 'SignupOnboarding') return prev;
-            return [{ name: 'SignupOnboarding', params: {} }];
-          });
-          return;
-        }
+      const result = supabase.auth.onAuthStateChange(async (event, sess) => {
         try {
-          const exists = await getProfileExists(sess.user);
-          setStack((prev) => {
-            const top = prev[prev.length - 1];
-            const topName = resolveRouteName(top?.name);
-            if (top?.params?.isDemo) return prev;
-            if (!exists) {
-              if (topName === 'SignupOnboarding') return prev;
-              return [{ name: 'SignupOnboarding', params: {} }];
+          if (event === 'SIGNED_UP') {
+            try {
+              if (Platform.OS === 'web' && typeof window !== 'undefined') window.sessionStorage?.setItem(FRESH_SIGNUP_KEY, '1');
+            } catch {}
+            return;
+          }
+          if (event === 'SIGNED_IN' && sess) {
+            setSession(sess);
+            sessionRef.current = sess;
+            const topNow = stackRef.current[stackRef.current.length - 1];
+            if (topNow?.params?.isDemo) return;
+            if (readFreshSignupFlag()) {
+              consumeFreshSignupFlag();
+              profileCacheRef.current[sess.user.id] = false;
+              setStack((prev) => {
+                const topName = resolveRouteName(prev[prev.length - 1]?.name);
+                if (topName === 'SignupOnboarding') return prev;
+                return [{ name: 'SignupOnboarding', params: {} }];
+              });
+              return;
             }
-            if (topName === 'AuthPortal' || topName === 'SignupOnboarding') {
-              return [{ name: 'Discovery', params: {} }];
+            try {
+              const exists = await getProfileExists(sess.user);
+              setStack((prev) => {
+                const top = prev[prev.length - 1];
+                const topName = resolveRouteName(top?.name);
+                if (top?.params?.isDemo) return prev;
+                if (!exists) {
+                  if (topName === 'SignupOnboarding') return prev;
+                  return [{ name: 'SignupOnboarding', params: {} }];
+                }
+                if (topName === 'AuthPortal' || topName === 'SignupOnboarding') {
+                  return [{ name: 'Discovery', params: {} }];
+                }
+                return prev;
+              });
+            } catch (e) {
+              setBootError(`Could not load your profile: ${e?.message}`);
             }
-            return prev;
-          });
+            return;
+          }
+          if (event === 'SIGNED_OUT') {
+            setSession(null);
+            sessionRef.current = null;
+            profileCacheRef.current = {};
+            clearFreshSignupFlag();
+            setStack([{ name: 'AuthPortal', params: {} }]);
+          }
+          if (event === 'TOKEN_REFRESHED' && sess) {
+            setSession(sess);
+            sessionRef.current = sess;
+          }
         } catch (e) {
-          setBootError(`Could not load your profile: ${e.message}`);
+          console.warn('[App] auth event failed:', e?.message);
         }
-        return;
-      }
-      if (event === 'SIGNED_OUT') {
-        setSession(null);
-        sessionRef.current = null;
-        profileCacheRef.current = {};
-        clearFreshSignupFlag();
-        setStack([{ name: 'AuthPortal', params: {} }]);
-      }
-      if (event === 'TOKEN_REFRESHED' && sess) {
-        setSession(sess);
-        sessionRef.current = sess;
-      }
-    });
-
-    const subscription = listener?.data?.subscription || listener?.subscription || listener;
-
+      });
+      subscription = result?.data?.subscription || result?.subscription || null;
+    } catch (e) {
+      console.warn('[App] auth listener failed:', e?.message);
+    }
     return () => {
       try {
-        if (subscription?.unsubscribe) subscription.unsubscribe();
-        else if (typeof listener?.unsubscribe === 'function') listener.unsubscribe();
+        if (typeof subscription?.unsubscribe === 'function') subscription.unsubscribe();
       } catch {}
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [getProfileExists]);
 
   // Web-only back button handling
   useEffect(() => {
     if (Platform.OS !== 'web' || typeof window === 'undefined') return;
     const onPop = async () => {
-      const parsed = pathToRoute(window.location.pathname);
-      if (!parsed) return;
-      if (!sessionRef.current && AUTH_REQUIRED_ROUTES.includes(parsed.name)) {
-        isPoppingRef.current = true;
-        setStack([{ name: 'AuthPortal', params: {} }]);
-        setTimeout(() => { isPoppingRef.current = false; }, 50);
-        return;
-      }
-      if (sessionRef.current && PROTECTED_ROUTES.includes(parsed.name)) {
-        try {
-          const exists = await getProfileExists(sessionRef.current.user);
-          if (!exists) {
-            isPoppingRef.current = true;
-            setStack([{ name: 'SignupOnboarding', params: {} }]);
-            try { window.history.pushState(null, '', '/onboarding'); } catch {}
-            setTimeout(() => { isPoppingRef.current = false; }, 50);
-            return;
-          }
-        } catch { return; }
-      }
-      isPoppingRef.current = true;
-      setStack((prev) => {
-        if (prev.length > 1) {
-          const prevEntry = prev[prev.length - 2];
-          if (resolveRouteName(prevEntry.name) === parsed.name) return prev.slice(0, -1);
+      try {
+        const parsed = pathToRoute(window.location.pathname);
+        if (!parsed) return;
+        if (!sessionRef.current && AUTH_REQUIRED_ROUTES.includes(parsed.name)) {
+          isPoppingRef.current = true;
+          setStack([{ name: 'AuthPortal', params: {} }]);
+          setTimeout(() => { isPoppingRef.current = false; }, 50);
+          return;
         }
-        return [parsed];
-      });
-      setTimeout(() => { isPoppingRef.current = false; }, 50);
+        if (sessionRef.current && PROTECTED_ROUTES.includes(parsed.name)) {
+          try {
+            const exists = await getProfileExists(sessionRef.current.user);
+            if (!exists) {
+              isPoppingRef.current = true;
+              setStack([{ name: 'SignupOnboarding', params: {} }]);
+              try { window.history.pushState(null, '', '/onboarding'); } catch {}
+              setTimeout(() => { isPoppingRef.current = false; }, 50);
+              return;
+            }
+          } catch { return; }
+        }
+        isPoppingRef.current = true;
+        setStack((prev) => {
+          if (prev.length > 1) {
+            const prevEntry = prev[prev.length - 2];
+            if (resolveRouteName(prevEntry.name) === parsed.name) return prev.slice(0, -1);
+          }
+          return [parsed];
+        });
+        setTimeout(() => { isPoppingRef.current = false; }, 50);
+      } catch {}
     };
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
-  }, [stack, getProfileExists]);
+  }, [getProfileExists]);
 
   // Web-only URL sync
   useEffect(() => {
     if (isLoading) return;
     try {
-      if (Platform.OS !== 'web' || typeof window === 'undefined') return;
+      if (Platform.OS !== 'web' || typeof window !== 'undefined') return;
       if (isPoppingRef.current) return;
-      const path = routeToPath(currentRoute, current.params);
+      const path = routeToPath(currentRoute, current?.params);
       if (window.location.pathname !== path) {
         window.history.pushState(null, '', path);
       }
     } catch {}
-  }, [currentRoute, current.params, isLoading]);
+  }, [currentRoute, current?.params, isLoading]);
 
   const guardProtected = useCallback((name, params = {}) => {
     const canonical = resolveRouteName(name);
@@ -379,15 +413,15 @@ export default function App() {
   }, [guardProtected]);
 
   const goBack = useCallback(() => {
-    const top = stack[stack.length - 1];
+    const top = stackRef.current[stackRef.current.length - 1];
     if (resolveRouteName(top?.name) === 'SignupOnboarding') {
       const cached = sessionRef.current ? profileCacheRef.current[sessionRef.current.user.id] : undefined;
       if (cached === false) return;
     }
     setStack((prev) => (prev.length <= 1 ? [{ name: 'Discovery', params: {} }] : prev.slice(0, -1)));
-  }, [stack]);
+  }, []);
 
-  const canGoBack = useCallback(() => stack.length > 1, [stack.length]);
+  const canGoBack = useCallback(() => stackRef.current.length > 1, []);
 
   const navigation = {
     navigate, reset, goBack, canGoBack,
@@ -396,7 +430,7 @@ export default function App() {
       copy[copy.length - 1] = { ...copy[copy.length - 1], params: { ...copy[copy.length - 1].params, ...params } };
       return copy;
     }),
-    getState: () => ({ routes: stack, index: stack.length - 1 }),
+    getState: () => ({ routes: stackRef.current, index: stackRef.current.length - 1 }),
     markProfileComplete,
   };
 
@@ -430,16 +464,16 @@ export default function App() {
     );
   }
 
-  const route = { name: currentRoute, params: current.params || {}, key: currentRoute };
+  const route = { name: currentRoute, params: current?.params || {}, key: currentRoute };
   const screenProps = { navigation, route, currentRoute };
 
   return (
     <SafeAreaProvider>
-      <UpdateChecker />
       <ErrorBoundary key={errorBoundaryKey} onReset={() => { setErrorBoundaryKey((k) => k + 1); setStack([{ name: 'Discovery', params: {} }]); }}>
         <View style={styles.outer}>
           <StatusBar style="light" />
-          <View key={`${currentRoute}-${JSON.stringify(current.params || {})}`} style={styles.inner}>
+          <UpdateChecker />
+          <View key={`${currentRoute}-${JSON.stringify(current?.params || {})}`} style={styles.inner}>
             {currentRoute === 'AuthPortal' && <AuthPortalScreen {...screenProps} session={session} />}
             {currentRoute === 'SignupOnboarding' && <SignupOnboardingScreen {...screenProps} session={session} />}
             {currentRoute === 'Discovery' && <DiscoveryScreen {...screenProps} session={session} />}
