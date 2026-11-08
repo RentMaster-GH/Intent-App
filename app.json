@@ -2,29 +2,73 @@
   "expo": {
     "name": "Intent",
     "slug": "intent-app",
-    "version": "1.0.0",
+    "version": "1.1.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
+    "scheme": "intent",
     "userInterfaceStyle": "dark",
-    "backgroundColor": "#0F172A",
     "splash": {
       "image": "./assets/splash.png",
       "resizeMode": "contain",
-      "backgroundColor": "#0F172A"
+      "backgroundColor": "#000000"
     },
     "ios": {
-      "supportsTablet": false,
-      "bundleIdentifier": "com.intent.app"
+      "supportsTablet": true,
+      "bundleIdentifier": "com.rentmaster.intent",
+      "buildNumber": "2",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Intent needs camera access to take profile photos and verify your profile.",
+        "NSPhotoLibraryUsageDescription": "Intent needs photo access to upload profile photos.",
+        "NSMicrophoneUsageDescription": "Intent needs microphone access for voice and video calls with matches.",
+        "NSLocationWhenInUseUsageDescription": "Intent uses your location to show matches near you in Accra and Ghana."
+      }
     },
     "android": {
+      "package": "com.rentmaster.intent",
+      "versionCode": 2,
       "adaptiveIcon": {
         "foregroundImage": "./assets/adaptive-icon.png",
-        "backgroundColor": "#0F172A"
+        "backgroundColor": "#000000"
       },
-      "package": "com.intent.app"
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.READ_EXTERNAL_STORAGE",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.MODIFY_AUDIO_SETTINGS"
+      ],
+      "intentFilters": [
+        {
+          "action": "VIEW",
+          "data": [
+            {
+              "scheme": "intent"
+            }
+          ],
+          "category": [
+            "BROWSABLE",
+            "DEFAULT"
+          ]
+        }
+      ]
     },
     "web": {
-      "favicon": "./assets/favicon.png"
-    }
+      "favicon": "./assets/favicon.png",
+      "bundler": "metro"
+    },
+    "plugins": [
+      "expo-av",
+      "expo-location",
+      "expo-notifications",
+      "expo-image-picker"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "b7b52a59-419f-4e56-b8df-cc92d685bdb7"
+      }
+    },
+    "owner": "intent-app-production"
   }
 }

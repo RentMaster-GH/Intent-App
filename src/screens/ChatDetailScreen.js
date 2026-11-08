@@ -16,8 +16,16 @@ const getMessageText = (mm) => mm?.body ?? '';
 const ICE_SERVERS = [
   { urls: 'stun:stun.l.google.com:19302' },
   { urls: 'stun:stun1.l.google.com:19302' },
-  { urls: 'stun:stun2.l.google.com:19302' },
-  { urls: 'stun:stun3.l.google.com:19302' },
+  // Metered TURN — your values from Step 4
+  {
+    urls: [
+      'turn:global.turn.metered.ca:80',
+      'turn:global.turn.metered.ca:80?transport=tcp',
+      'turns:global.turn.metered.ca:443?transport=tcp',
+    ],
+    username: 'a4c2c35204beeb3c11a57ab6',
+    credential: 'CLbp4Y73gh5PW0oT',
+  },
 ];
 
 const ICEBREAKER_CARDS = [
@@ -74,7 +82,6 @@ let cachedWebRTC = null;
 const getWebRTC = async () => {
   if (cachedWebRTC) return cachedWebRTC;
   if (Platform.OS === 'web') {
-    // Web: use browser built-in WebRTC if ever needed, but calls are native-only
     cachedWebRTC = {
       RTCPeerConnection: window.RTCPeerConnection,
       RTCSessionDescription: window.RTCSessionDescription,
@@ -129,7 +136,7 @@ export default function ChatDetailScreen({ route, navigation }) {
   const [inputText, setInputText] = useState('');
   const [sending, setSending] = useState(false);
 
-  // --- CALLS STATE (P2P, no LiveKit) ---
+  // --- CALLS STATE (P2P, no LiveKit, no middleman) ---
   const [activeCall, setActiveCall] = useState(null);
   const [incomingCall, setIncomingCall] = useState(null);
   const [callDuration, setCallDuration] = useState(0);
@@ -211,7 +218,8 @@ export default function ChatDetailScreen({ route, navigation }) {
   }, [ensureMatchId]);
 
   // ---------- P2P CALLS — NO LIVEKIT, NO CLOUD ----------
-  // Supabase Realtime broadcast = signaling only. Video/audio goes phone-to-phone.
+  // Supabase Realtime broadcast = signaling only. Video/audio goes phone-to-phone,
+  // or via Metered TURN when carriers block direct P2P (mobile data).
 
   const cleanupCall = useCallback(async () => {
     try { if (signalChannelRef.current) await supabase.removeChannel(signalChannelRef.current); } catch {}
@@ -276,9 +284,6 @@ export default function ChatDetailScreen({ route, navigation }) {
     pc.onconnectionstatechange = () => {
       console.log('[P2P] connectionState:', pc.connectionState);
       if (pc.connectionState === 'connected') setIsConnecting(false);
-      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
-        // Keep UI, polling will show it
-      }
     };
 
     return pc;

@@ -1,11 +1,16 @@
 import { createClient } from '@supabase/supabase-js';
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import { Platform } from 'react-native';
 
-// FIX: Fail loudly if keys are missing — "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImptdW5tYnlwaXRndGpwa3F1b3F3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODc2NzIwMTksImV4cCI6MjEwMzI0ODAxOX0.HZiOQwgwkpvnBun-qoTAUijq8nPb9OGF-LVFcppmJ6I" was causing silent Failed to fetch
+// Supabase keys come from .env (local) and EAS / Vercel env vars (builds).
+// They must be EXPO_PUBLIC_ prefixed to be inlined by Expo.
 const supabaseUrl = process.env.EXPO_PUBLIC_SUPABASE_URL || '';
 const supabaseAnonKey = process.env.EXPO_PUBLIC_SUPABASE_ANON_KEY || '';
 
-if (typeof window !== 'undefined') {
-  if (!supabaseUrl || !supabaseAnonKey || supabaseAnonKey === 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImptdW5tYnlwaXRndGpwa3F1b3F3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODc2NzIwMTksImV4cCI6MjEwMzI0ODAxOX0.HZiOQwgwkpvnBun-qoTAUijq8nPb9OGF-LVFcppmJ6I') {
+const FALLBACK_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImptdW5tYnlwaXRndGpwa3F1b3F3Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODc2NzIwMTksImV4cCI6MjEwMzI0ODAxOX0.HZiOQwgwkpvnBun-qoTAUijq8nPb9OGF-LVFcppmJ6I';
+
+if (Platform.OS === 'web' && typeof window !== 'undefined') {
+  if (!supabaseUrl || !supabaseAnonKey || supabaseAnonKey === FALLBACK_ANON_KEY) {
     console.error(
       '[INTENT] Missing Supabase keys. Set EXPO_PUBLIC_SUPABASE_URL and EXPO_PUBLIC_SUPABASE_ANON_KEY in .env AND in Vercel > Settings > Environment Variables, then redeploy.'
     );
@@ -19,12 +24,16 @@ export const supabase = createClient(
   supabaseAnonKey || 'placeholder-key',
   {
     auth: {
+      // FIX: On Android/iOS there is no window.localStorage.
+      // Without this, Supabase crashes on getSession() / onAuthStateChange()
+      // with "TypeError: undefined is not a function" and the app white-screens.
+      storage: AsyncStorage,
       persistSession: true,
       autoRefreshToken: true,
-      detectSessionInUrl: true,
+      // Only try to read session from URL on web
+      detectSessionInUrl: Platform.OS === 'web',
     },
     global: {
-      // FIX: Give fetch a clear error so AuthPortal can show "Check internet / Supabase paused" instead of generic Failed to fetch
       fetch: (...args) => fetch(...args),
     },
   }

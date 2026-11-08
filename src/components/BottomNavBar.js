@@ -5,8 +5,8 @@ import { Ionicons } from '@expo/vector-icons';
 export default function BottomNavBar({ navigation, currentRoute }) {
   const navItems = [
     { key: 'Discovery', label: 'Explore', icon: 'compass-outline', activeIcon: 'compass' },
-    { key: 'ActiveChats', label: 'Chats', icon: 'chatbubbles-outline', activeIcon: 'chatbubbles', badge: 1 },
-    { key: 'Dates', label: 'Dates', icon: 'calendar-outline', activeIcon: 'calendar', badge: 2 },
+    { key: 'ActiveChats', label: 'Chats', icon: 'chatbubbles-outline', activeIcon: 'chatbubbles' },
+    { key: 'Dates', label: 'Dates', icon: 'calendar-outline', activeIcon: 'calendar' },
     { key: 'Profile', label: 'Profile', icon: 'person-outline', activeIcon: 'person' },
   ];
 

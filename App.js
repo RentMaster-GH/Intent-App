@@ -14,12 +14,10 @@ import SettingsPortalScreen from './src/screens/SettingsPortalScreen';
 import CustomerSupportScreen from './src/screens/CustomerSupportScreen';
 import { supabase } from './src/lib/supabase';
 import ErrorBoundary from './src/components/ErrorBoundary';
+import UpdateChecker from './src/components/UpdateChecker';
 
 const FRESH_SIGNUP_KEY = 'intent_fresh_signup';
 
-// FIX: Canonical names only. Aliases map old / short names to canonical names.
-// This is why Support crashed — Settings used 'Support', App only knew 'CustomerSupport'.
-// Same for Chats / Deck / Settings.
 const ROUTE_ALIASES = {
   Support: 'CustomerSupport',
   CustomerSupportPortal: 'CustomerSupport',
@@ -88,17 +86,24 @@ const checkProfileExists = async (userId) => {
   }
 };
 
+// Web-only helpers. On native these are no-ops.
 const readFreshSignupFlag = () => {
   try {
-    if (typeof window !== 'undefined') return window.sessionStorage?.getItem(FRESH_SIGNUP_KEY) === '1';
+    if (Platform.OS === 'web' && typeof window !== 'undefined') {
+      return window.sessionStorage?.getItem(FRESH_SIGNUP_KEY) === '1';
+    }
   } catch {}
   return false;
 };
 const consumeFreshSignupFlag = () => {
-  try { if (typeof window !== 'undefined') window.sessionStorage?.removeItem(FRESH_SIGNUP_KEY); } catch {}
+  try {
+    if (Platform.OS === 'web' && typeof window !== 'undefined') window.sessionStorage?.removeItem(FRESH_SIGNUP_KEY);
+  } catch {}
 };
 const clearFreshSignupFlag = () => {
-  try { if (typeof window !== 'undefined') window.sessionStorage?.removeItem(FRESH_SIGNUP_KEY); } catch {}
+  try {
+    if (Platform.OS === 'web' && typeof window !== 'undefined') window.sessionStorage?.removeItem(FRESH_SIGNUP_KEY);
+  } catch {}
 };
 
 export default function App() {
@@ -117,14 +122,17 @@ export default function App() {
 
   useEffect(() => { sessionRef.current = session; }, [session]);
 
-  // FIX FOR CALLS: Configure audio mode once at app start.
-  // Without this, iOS silences LiveKit when phone is on silent / in background,
-  // and Android won't route audio to earpiece/speaker correctly.
+  // Audio setup - safe on native, skipped on web
   useEffect(() => {
     const setupAudio = async () => {
       if (Platform.OS === 'web') return;
       try {
-        const { Audio } = await import('expo-av');
+        const mod = await import('expo-av');
+        const Audio = mod?.Audio || mod?.default?.Audio;
+        if (!Audio?.setAudioModeAsync) {
+          console.log('[App] Audio setup skipped: expo-av not available in this build');
+          return;
+        }
         await Audio.setAudioModeAsync({
           allowsRecordingIOS: true,
           playsInSilentModeIOS: true,
@@ -132,7 +140,6 @@ export default function App() {
           shouldDuckAndroid: true,
           playThroughEarpieceAndroid: false,
         });
-        console.log('[App] Audio mode configured for calls');
       } catch (e) {
         console.log('[App] Audio setup skipped:', e?.message);
       }
@@ -168,7 +175,7 @@ export default function App() {
 
       let initial = null;
       try {
-        if (typeof window !== 'undefined' && window.location?.pathname) {
+        if (Platform.OS === 'web' && typeof window !== 'undefined' && window.location?.pathname) {
           initial = pathToRoute(window.location.pathname);
         }
       } catch {}
@@ -182,7 +189,6 @@ export default function App() {
         const { exists, error: profileError } = await checkProfileExists(sess.user.id);
         if (profileError) throw new Error(`Could not load your profile: ${profileError}`);
         profileCacheRef.current[sess.user.id] = exists;
-
         if (!exists) {
           initial = { name: 'SignupOnboarding', params: {} };
         } else {
@@ -193,7 +199,7 @@ export default function App() {
       }
 
       try {
-        if (typeof window !== 'undefined') {
+        if (Platform.OS === 'web' && typeof window !== 'undefined') {
           window.history.replaceState(null, '', routeToPath(initial.name, initial.params));
         }
       } catch {}
@@ -207,10 +213,13 @@ export default function App() {
 
   useEffect(() => { boot(); }, [boot]);
 
+  // Auth listener - handles both Supabase v1 and v2 return shapes
   useEffect(() => {
-    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, sess) => {
+    const listener = supabase.auth.onAuthStateChange(async (event, sess) => {
       if (event === 'SIGNED_UP') {
-        try { if (typeof window !== 'undefined') window.sessionStorage?.setItem(FRESH_SIGNUP_KEY, '1'); } catch {}
+        try {
+          if (Platform.OS === 'web' && typeof window !== 'undefined') window.sessionStorage?.setItem(FRESH_SIGNUP_KEY, '1');
+        } catch {}
         return;
       }
       if (event === 'SIGNED_IN' && sess) {
@@ -218,7 +227,6 @@ export default function App() {
         sessionRef.current = sess;
         const topNow = stack[stack.length - 1];
         if (topNow?.params?.isDemo) return;
-
         const isFresh = readFreshSignupFlag();
         if (isFresh) {
           consumeFreshSignupFlag();
@@ -230,7 +238,6 @@ export default function App() {
           });
           return;
         }
-
         try {
           const exists = await getProfileExists(sess.user);
           setStack((prev) => {
@@ -263,23 +270,30 @@ export default function App() {
         sessionRef.current = sess;
       }
     });
-    return () => subscription.unsubscribe();
+
+    const subscription = listener?.data?.subscription || listener?.subscription || listener;
+
+    return () => {
+      try {
+        if (subscription?.unsubscribe) subscription.unsubscribe();
+        else if (typeof listener?.unsubscribe === 'function') listener.unsubscribe();
+      } catch {}
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [getProfileExists]);
 
+  // Web-only back button handling
   useEffect(() => {
-    if (typeof window === 'undefined') return;
+    if (Platform.OS !== 'web' || typeof window === 'undefined') return;
     const onPop = async () => {
       const parsed = pathToRoute(window.location.pathname);
       if (!parsed) return;
-
       if (!sessionRef.current && AUTH_REQUIRED_ROUTES.includes(parsed.name)) {
         isPoppingRef.current = true;
         setStack([{ name: 'AuthPortal', params: {} }]);
         setTimeout(() => { isPoppingRef.current = false; }, 50);
         return;
       }
-
       if (sessionRef.current && PROTECTED_ROUTES.includes(parsed.name)) {
         try {
           const exists = await getProfileExists(sessionRef.current.user);
@@ -290,11 +304,8 @@ export default function App() {
             setTimeout(() => { isPoppingRef.current = false; }, 50);
             return;
           }
-        } catch {
-          return;
-        }
+        } catch { return; }
       }
-
       isPoppingRef.current = true;
       setStack((prev) => {
         if (prev.length > 1) {
@@ -309,10 +320,11 @@ export default function App() {
     return () => window.removeEventListener('popstate', onPop);
   }, [stack, getProfileExists]);
 
+  // Web-only URL sync
   useEffect(() => {
     if (isLoading) return;
     try {
-      if (typeof window === 'undefined') return;
+      if (Platform.OS !== 'web' || typeof window === 'undefined') return;
       if (isPoppingRef.current) return;
       const path = routeToPath(currentRoute, current.params);
       if (window.location.pathname !== path) {
@@ -332,12 +344,10 @@ export default function App() {
   }, []);
 
   const navigate = useCallback((name, params = {}) => {
-    // FIX: Resolve alias FIRST, then validate. Unknown names fall back to Discovery, never crash.
     const canonical = resolveRouteName(name);
     const known = Object.keys(ROUTE_TO_PATH).includes(canonical);
     const target = known ? canonical : 'Discovery';
     const targetParams = known ? params : {};
-
     if (guardProtected(target, targetParams)) {
       if (!sessionRef.current) setStack([{ name: 'AuthPortal', params: {} }]);
       else setStack([{ name: 'SignupOnboarding', params: {} }]);
@@ -351,17 +361,11 @@ export default function App() {
   }, [guardProtected]);
 
   const reset = useCallback((opts) => {
-    // Handles: reset('Discovery'), reset({ index:0, routes:[{name:'AuthPortal'}] }), reset({ name:'Discovery' })
     let first = null;
-    if (typeof opts === 'string') {
-      first = { name: opts, params: {} };
-    } else if (Array.isArray(opts)) {
-      first = opts[0];
-    } else if (Array.isArray(opts?.routes)) {
-      first = opts.routes[0];
-    } else if (opts?.name) {
-      first = opts;
-    }
+    if (typeof opts === 'string') first = { name: opts, params: {} };
+    else if (Array.isArray(opts)) first = opts[0];
+    else if (Array.isArray(opts?.routes)) first = opts.routes[0];
+    else if (opts?.name) first = opts;
     if (!first) return;
     const canonical = resolveRouteName(first.name);
     const known = Object.keys(ROUTE_TO_PATH).includes(canonical);
@@ -380,18 +384,13 @@ export default function App() {
       const cached = sessionRef.current ? profileCacheRef.current[sessionRef.current.user.id] : undefined;
       if (cached === false) return;
     }
-    // FIX: Don't call window.history.back() AND slice stack — that double-pops.
-    // Just slice stack, URL sync effect will push the correct path.
     setStack((prev) => (prev.length <= 1 ? [{ name: 'Discovery', params: {} }] : prev.slice(0, -1)));
   }, [stack]);
 
   const canGoBack = useCallback(() => stack.length > 1, [stack.length]);
 
   const navigation = {
-    navigate,
-    reset,
-    goBack,
-    canGoBack,
+    navigate, reset, goBack, canGoBack,
     setParams: (params) => setStack((prev) => {
       const copy = [...prev];
       copy[copy.length - 1] = { ...copy[copy.length - 1], params: { ...copy[copy.length - 1].params, ...params } };
@@ -403,11 +402,13 @@ export default function App() {
 
   if (isLoading) {
     return (
-      <View style={styles.loading}>
-        <Text style={styles.loadingLogo}>I</Text>
-        <Text style={styles.loadingText}>INTENT</Text>
-        <ActivityIndicator color="#F97316" style={{ marginTop: 16 }} />
-      </View>
+      <SafeAreaProvider>
+        <View style={styles.loading}>
+          <Text style={styles.loadingLogo}>I</Text>
+          <Text style={styles.loadingText}>INTENT</Text>
+          <ActivityIndicator color="#F97316" style={{ marginTop: 16 }} />
+        </View>
+      </SafeAreaProvider>
     );
   }
 
@@ -434,6 +435,7 @@ export default function App() {
 
   return (
     <SafeAreaProvider>
+      <UpdateChecker />
       <ErrorBoundary key={errorBoundaryKey} onReset={() => { setErrorBoundaryKey((k) => k + 1); setStack([{ name: 'Discovery', params: {} }]); }}>
         <View style={styles.outer}>
           <StatusBar style="light" />

@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Image, Alert, ActivityIndicator, RefreshControl } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Image, Alert, ActivityIndicator, RefreshControl, Share, Platform } from 'react-native';
 import { supabase } from '../lib/supabase';
 
 const DEMO_PREVIEW = [
@@ -9,6 +9,8 @@ const DEMO_PREVIEW = [
 
 const CITY_FILTERS = ['All', 'Accra', 'Kumasi', 'Lagos', 'Tema'];
 const INTENT_FILTERS = ['All Intents', 'Long-term Relationship 💛', 'Marriage Minded 💍', 'Friendship First 🤝'];
+
+const INTENT_WEB_URL = 'https://intent-app-zeta.vercel.app';
 
 // FIX: Real columns are name / location / photos. NOT full_name / city / country / avatar_url.
 // location is a single string like "Accra" or "Accra, Ghana" — parse city from it.
@@ -207,6 +209,30 @@ export default function DiscoveryScreen({ navigation, route }) {
     navigation.navigate('ChatDetail', { id: existingMatchId, matchId: existingMatchId, name: person.name, avatar: person.img, img: person.img, intent: person.intent, location: person.location, otherUserId: person.id });
   };
 
+  const handleShareIntent = async () => {
+    const message = `Intent — Date with intention 💛\nFind people who actually want something real.\n${INTENT_WEB_URL}`;
+    try {
+      if (Platform.OS === 'web' && typeof navigator !== 'undefined' && navigator.share) {
+        await navigator.share({ title: 'Intent', text: message, url: INTENT_WEB_URL });
+        return;
+      }
+      if (Platform.OS === 'web' && typeof navigator !== 'undefined' && navigator.clipboard) {
+        await navigator.clipboard.writeText(INTENT_WEB_URL);
+        Alert.alert('Link copied', 'Share it with a friend — they will appear here when they join.');
+        return;
+      }
+      await Share.share({ message });
+    } catch (e) {
+      // User cancelled share — do nothing
+    }
+  };
+
+  const handleClearFilters = () => {
+    setCityFilter('All');
+    setIntentFilter('All Intents');
+    setIndex(0);
+  };
+
   if (loading) {
     return (
       <View style={styles.centerBox}>
@@ -217,6 +243,8 @@ export default function DiscoveryScreen({ navigation, route }) {
   }
 
   if (!person) {
+    const isTrulyEmpty = people.length === 0;
+    const isFilteredOut = !isTrulyEmpty && filtered.length === 0;
     return (
       <ScrollView style={styles.wrap} contentContainerStyle={styles.c} refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor="#F97316" />}>
         <View style={styles.header}>
@@ -227,16 +255,38 @@ export default function DiscoveryScreen({ navigation, route }) {
         <Text style={styles.sub}>People near you — max 3 active chats worldwide.{isDemo ? ' Preview Mode' : ''}</Text>
         <View style={styles.emptyCard}>
           <Text style={styles.emptyEmoji}>🔍</Text>
-          <Text style={styles.emptyTitle}>{loadError ? 'Could not load people' : people.length === 0 ? 'No one nearby yet' : 'No more people nearby'}</Text>
-          <Text style={styles.emptySub}>
-            {loadError || (people.length === 0
-              ? 'Be the first in your area. Share Intent with friends — new profiles appear here as they join.'
-              : 'You have seen everyone matching your filters. Try clearing filters or pull to refresh.')}
+          <Text style={styles.emptyTitle}>
+            {loadError ? 'Could not load people'
+              : isTrulyEmpty ? 'No one nearby yet'
+              : 'No more people nearby'}
           </Text>
+          <Text style={styles.emptySub}>
+            {loadError
+              ? 'Check your connection and pull to refresh.'
+              : isTrulyEmpty
+              ? 'Be the first in your area. Share Intent with a friend — they will appear here as soon as they join.'
+              : 'You have seen everyone matching your filters. Clear them to see everyone in Ghana again.'}
+          </Text>
+
+          {/* Only show Share when DB is truly empty — not when user just filtered everyone out */}
+          {!loadError && isTrulyEmpty ? (
+            <TouchableOpacity style={styles.shareBtn} onPress={handleShareIntent}>
+              <Text style={styles.shareBtnText}>💛 Share Intent</Text>
+            </TouchableOpacity>
+          ) : null}
+
           <TouchableOpacity style={styles.refreshBtn} onPress={onRefresh}><Text style={styles.btnText}>↻ Refresh</Text></TouchableOpacity>
-          <TouchableOpacity style={styles.clearBtn} onPress={() => { setCityFilter('All'); setIntentFilter('All Intents'); setIndex(0); }}>
-            <Text style={styles.clearBtnText}>Clear Filters</Text>
+
+          {isFilteredOut ? (
+            <TouchableOpacity style={styles.clearBtn} onPress={handleClearFilters}>
+              <Text style={styles.clearBtnText}>Clear Filters</Text>
+            </TouchableOpacity>
+          ) : null}
+
+          <TouchableOpacity style={styles.clearBtn} onPress={() => navigation.navigate('Profile')}>
+            <Text style={styles.clearBtnText}>Complete Your Profile →</Text>
           </TouchableOpacity>
+
           {isDemo ? (
             <TouchableOpacity style={styles.clearBtn} onPress={() => navigation.reset({ index: 0, routes: [{ name: 'AuthPortal', params: {} }] })}>
               <Text style={styles.clearBtnText}>Create Free Account →</Text>
@@ -356,7 +406,9 @@ const styles = StyleSheet.create({
   emptyEmoji: { fontSize: 40 },
   emptyTitle: { color: '#FFF', fontSize: 18, fontWeight: '800', marginTop: 12, textAlign: 'center' },
   emptySub: { color: '#94A3B8', marginTop: 8, textAlign: 'center', lineHeight: 20 },
-  refreshBtn: { backgroundColor: '#F97316', height: 48, borderRadius: 12, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 24, marginTop: 16 },
+  shareBtn: { backgroundColor: '#FBBF24', height: 48, borderRadius: 12, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 24, marginTop: 16, width: '100%' },
+  shareBtnText: { color: '#0F172A', fontWeight: '800' },
+  refreshBtn: { backgroundColor: '#F97316', height: 48, borderRadius: 12, justifyContent: 'center', alignItems: 'center', paddingHorizontal: 24, marginTop: 12, width: '100%' },
   clearBtn: { height: 44, justifyContent: 'center', alignItems: 'center', marginTop: 8 },
   clearBtnText: { color: '#FBBF24', fontWeight: '700' },
 });
