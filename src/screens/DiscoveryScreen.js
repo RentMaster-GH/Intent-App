@@ -1,10 +1,39 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
-import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Image, Alert, ActivityIndicator, RefreshControl, Share, Platform } from 'react-native';
+import { View, Text, StyleSheet, ScrollView, TouchableOpacity, Alert, ActivityIndicator, RefreshControl, Share, Platform } from 'react-native';
 import { supabase } from '../lib/supabase';
+import ProfileCard from '../components/ProfileCard';
 
 const DEMO_PREVIEW = [
-  { id: 'demo-1', name: 'Ama', age: 27, location: 'Accra, Ghana', city: 'Accra', intent: 'Long-term Relationship 💛', bio: 'Intentional. Coffee lover. Looking for something real.', img: 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80', isDemo: true },
-  { id: 'demo-2', name: 'Kwame', age: 29, location: 'Accra, Ghana', city: 'Accra', intent: 'Friendship First 🤝', bio: 'Gym, Afrobeats, and good conversation.', img: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=400&auto=format&fit=crop&q=80', isDemo: true },
+  {
+    id: 'demo-1',
+    name: 'Ama',
+    age: 27,
+    location: 'Accra, Ghana',
+    city: 'Accra',
+    intent: 'Long-term Relationship 💛',
+    bio: 'Intentional. Coffee lover. Looking for something real.',
+    img: 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=800&auto=format&fit=crop&q=80',
+    photos: [
+      'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=800&auto=format&fit=crop&q=80',
+      'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=800&auto=format&fit=crop&q=80',
+    ],
+    isDemo: true,
+  },
+  {
+    id: 'demo-2',
+    name: 'Kwame',
+    age: 29,
+    location: 'Accra, Ghana',
+    city: 'Accra',
+    intent: 'Friendship First 🤝',
+    bio: 'Gym, Afrobeats, and good conversation.',
+    img: 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=800&auto=format&fit=crop&q=80',
+    photos: [
+      'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=800&auto=format&fit=crop&q=80',
+      'https://images.unsplash.com/photo-1500648767791-00dcc994a43e?w=800&auto=format&fit=crop&q=80',
+    ],
+    isDemo: true,
+  },
 ];
 
 const CITY_FILTERS = ['All', 'Accra', 'Kumasi', 'Lagos', 'Tema'];
@@ -12,12 +41,11 @@ const INTENT_FILTERS = ['All Intents', 'Long-term Relationship 💛', 'Marriage 
 
 const INTENT_WEB_URL = 'https://intent-app-zeta.vercel.app';
 
-// FIX: Real columns are name / location / photos. NOT full_name / city / country / avatar_url.
-// location is a single string like "Accra" or "Accra, Ghana" — parse city from it.
+// Real columns: name / location / photos. NOT full_name / city / country / avatar_url.
+// location is a single string like "Accra" or "Accra, Ghana" - parse city from it.
 const normalizeProfile = (p) => {
-  const photos = Array.isArray(p.photos) ? p.photos.filter(Boolean) : [];
+  const photos = (Array.isArray(p.photos) ? p.photos.filter(Boolean) : []).slice(0, 6);
   const location = p.location || '';
-  // City = part before comma. "Accra, Ghana" -> "Accra". "Tema" -> "Tema".
   const city = location.split(',')[0]?.trim() || null;
   return {
     id: p.id,
@@ -60,7 +88,6 @@ export default function DiscoveryScreen({ navigation, route }) {
         setLoading(false); setRefreshing(false);
         return;
       }
-
       const { data: { user } } = await supabase.auth.getUser();
       if (!user) {
         setPeople([]);
@@ -69,14 +96,12 @@ export default function DiscoveryScreen({ navigation, route }) {
         return;
       }
       setMyId(user.id);
-
       const [likesRes, matchesRes] = await Promise.all([
         supabase.from('likes').select('liked_id').eq('liker_id', user.id),
         supabase.from('matches').select('id, user_a, user_b').or(`user_a.eq.${user.id},user_b.eq.${user.id}`),
       ]);
       const alreadyLiked = new Set((likesRes.data || []).map((l) => l.liked_id));
       setLikedIds(alreadyLiked);
-
       const matched = new Set();
       const matchMap = {};
       (matchesRes.data || []).forEach((m) => {
@@ -86,27 +111,20 @@ export default function DiscoveryScreen({ navigation, route }) {
       });
       setMatchedIds(matched);
       setMatchIdByUser(matchMap);
-
-      // FIX: Select only real columns. select('*') worked, but normalize now uses real names.
-      // Also: NO location filter here. Accra must see Tema. Ghana-wide / Global.
       const { data, error } = await supabase.from('profiles')
         .select('id, name, age, location, intent, bio, photos, show_on_discovery, created_at')
         .neq('id', user.id)
         .order('created_at', { ascending: false })
         .limit(50);
       if (error) throw error;
-
       const real = (data || [])
         .map(normalizeProfile)
-        // FIX: name + photo required. img now comes from photos[0], so this works.
         .filter((p) => p.id && p.name && p.img)
         .filter((p) => !alreadyLiked.has(p.id) && !matched.has(p.id))
-        // Respect opt-out only. No gender/seeking filter — you don't collect gender.
         .filter((p) => {
           const raw = (data || []).find(d => d.id === p.id);
           return raw?.show_on_discovery !== false;
         });
-
       if (!mountedRef.current) return;
       setPeople(real);
       setIndex(0);
@@ -129,8 +147,6 @@ export default function DiscoveryScreen({ navigation, route }) {
 
   const filtered = useMemo(() => {
     return people.filter((p) => {
-      // City filter now works because city is parsed from location string.
-      // Default is 'All', so Accra sees Tema unless user taps a city chip.
       if (cityFilter !== 'All' && p.city !== cityFilter) return false;
       if (intentFilter !== 'All Intents') {
         if (intentFilter === 'Long-term Relationship 💛' && !p.intent?.includes('Long-term')) return false;
@@ -162,7 +178,6 @@ export default function DiscoveryScreen({ navigation, route }) {
       const { error: likeError } = await supabase.from('likes').insert({ liker_id: myId, liked_id: person.id });
       if (likeError && likeError.code !== '23505') throw likeError;
       setLikedIds((prev) => new Set(prev).add(person.id));
-
       const { data: mutual } = await supabase.from('likes').select('id').eq('liker_id', person.id).eq('liked_id', myId).maybeSingle();
       if (mutual) {
         const [a, b] = myId < person.id ? [myId, person.id] : [person.id, myId];
@@ -222,9 +237,7 @@ export default function DiscoveryScreen({ navigation, route }) {
         return;
       }
       await Share.share({ message });
-    } catch (e) {
-      // User cancelled share — do nothing
-    }
+    } catch (e) {}
   };
 
   const handleClearFilters = () => {
@@ -256,37 +269,25 @@ export default function DiscoveryScreen({ navigation, route }) {
         <View style={styles.emptyCard}>
           <Text style={styles.emptyEmoji}>🔍</Text>
           <Text style={styles.emptyTitle}>
-            {loadError ? 'Could not load people'
-              : isTrulyEmpty ? 'No one nearby yet'
-              : 'No more people nearby'}
+            {loadError ? 'Could not load people' : isTrulyEmpty ? 'No one nearby yet' : 'No more people nearby'}
           </Text>
           <Text style={styles.emptySub}>
-            {loadError
-              ? 'Check your connection and pull to refresh.'
-              : isTrulyEmpty
-              ? 'Be the first in your area. Share Intent with a friend — they will appear here as soon as they join.'
-              : 'You have seen everyone matching your filters. Clear them to see everyone in Ghana again.'}
+            {loadError ? 'Check your connection and pull to refresh.' : isTrulyEmpty ? 'Be the first in your area. Share Intent with a friend — they will appear here as soon as they join.' : 'You have seen everyone matching your filters. Clear them to see everyone in Ghana again.'}
           </Text>
-
-          {/* Only show Share when DB is truly empty — not when user just filtered everyone out */}
           {!loadError && isTrulyEmpty ? (
             <TouchableOpacity style={styles.shareBtn} onPress={handleShareIntent}>
               <Text style={styles.shareBtnText}>💛 Share Intent</Text>
             </TouchableOpacity>
           ) : null}
-
           <TouchableOpacity style={styles.refreshBtn} onPress={onRefresh}><Text style={styles.btnText}>↻ Refresh</Text></TouchableOpacity>
-
           {isFilteredOut ? (
             <TouchableOpacity style={styles.clearBtn} onPress={handleClearFilters}>
               <Text style={styles.clearBtnText}>Clear Filters</Text>
             </TouchableOpacity>
           ) : null}
-
           <TouchableOpacity style={styles.clearBtn} onPress={() => navigation.navigate('Profile')}>
             <Text style={styles.clearBtnText}>Complete Your Profile →</Text>
           </TouchableOpacity>
-
           {isDemo ? (
             <TouchableOpacity style={styles.clearBtn} onPress={() => navigation.reset({ index: 0, routes: [{ name: 'AuthPortal', params: {} }] })}>
               <Text style={styles.clearBtnText}>Create Free Account →</Text>
@@ -310,11 +311,9 @@ export default function DiscoveryScreen({ navigation, route }) {
         <Text style={styles.logo}>INTENT</Text>
         <TouchableOpacity style={styles.profileBtn} onPress={() => navigation.navigate('Profile')}><Text style={styles.profileBtnText}>👤 Profile</Text></TouchableOpacity>
       </View>
-
       <Text style={styles.title}>Discovery</Text>
       <Text style={styles.sub}>People near you — max 3 active chats worldwide.{isDemo ? ' Preview Mode' : ''}</Text>
       {loadError ? <Text style={styles.errorText}>⚠️ {loadError}</Text> : null}
-
       <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.filterRow}>
         {CITY_FILTERS.map((c) => (
           <TouchableOpacity key={c} style={[styles.filterChip, cityFilter === c && styles.filterChipActive]} onPress={() => { setCityFilter(c); setIndex(0); }}>
@@ -330,18 +329,15 @@ export default function DiscoveryScreen({ navigation, route }) {
         ))}
       </ScrollView>
 
-      <View style={styles.card}>
-        {person.img ? (
-          <Image source={{ uri: person.img }} style={styles.img} />
-        ) : (
-          <View style={[styles.img, styles.imgPlaceholder]}><Text style={styles.imgLetter}>{person.name?.[0]?.toUpperCase() || '?'}</Text></View>
-        )}
+      {/* 6-PHOTO GALLERY + ZOOM - ProfileCard handles photos, fit, tap zones, PhotoViewer */}
+      <ProfileCard key={person.id} profile={person} onLike={handleLike} onPass={handlePass} />
+
+      <View style={styles.detailsCard}>
         <Text style={styles.name}>{person.name}{person.age ? `, ${person.age}` : ''} ✓</Text>
         {person.intent ? <Text style={styles.intent}>{person.intent}</Text> : null}
         {person.location ? <Text style={styles.meta}>{person.location}</Text> : null}
         {person.bio ? <Text style={styles.bio}>{person.bio}</Text> : null}
-        <Text style={styles.counter}>{`${index + 1} of ${filtered.length}`}</Text>
-
+        <Text style={styles.counter}>{`${index + 1} of ${filtered.length} people • ${person.photos?.length || 0} photos`}</Text>
         <View style={styles.actions}>
           <TouchableOpacity style={[styles.btn, styles.pass]} onPress={handlePass}><Text style={styles.btnText}>✕ Pass</Text></TouchableOpacity>
           <TouchableOpacity style={[styles.btn, styles.like, liking && styles.btnDisabled]} onPress={handleLike} disabled={liking}>
@@ -381,11 +377,8 @@ const styles = StyleSheet.create({
   filterChipActive: { backgroundColor: '#F97316', borderColor: '#F97316' },
   filterText: { color: '#94A3B8', fontSize: 12, fontWeight: '700' },
   filterTextActive: { color: '#fff' },
-  card: { width: '100%', backgroundColor: '#1E293B', borderRadius: 20, padding: 16, borderWidth: 1, borderColor: '#334155', marginTop: 8 },
-  img: { width: '100%', height: 320, borderRadius: 14, backgroundColor: '#0F172A' },
-  imgPlaceholder: { justifyContent: 'center', alignItems: 'center' },
-  imgLetter: { color: '#FBBF24', fontSize: 80, fontWeight: '800' },
-  name: { color: '#FFF', fontSize: 22, fontWeight: '800', marginTop: 12 },
+  detailsCard: { width: '100%', backgroundColor: '#1E293B', borderRadius: 20, padding: 16, borderWidth: 1, borderColor: '#334155', marginTop: 12 },
+  name: { color: '#FFF', fontSize: 22, fontWeight: '800' },
   intent: { color: '#FBBF24', marginTop: 4, fontWeight: '700' },
   meta: { color: '#94A3B8', marginTop: 4 },
   bio: { color: '#CBD5E1', marginTop: 8, lineHeight: 20 },

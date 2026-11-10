@@ -59,10 +59,11 @@
       "bundler": "metro"
     },
     "plugins": [
-      "expo-av",
+      "./plugins/with-gradle-dist.js",
       "expo-location",
       "expo-notifications",
-      "expo-image-picker"
+      "expo-image-picker",
+      "expo-audio"
     ],
     "extra": {
       "eas": {

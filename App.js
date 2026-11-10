@@ -1,7 +1,9 @@
+import 'react-native-gesture-handler';
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { View, StyleSheet, ActivityIndicator, Text, TouchableOpacity, Platform } from 'react-native';
 import { StatusBar } from 'expo-status-bar';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { GestureHandlerRootView } from 'react-native-gesture-handler';
 
 import AuthPortalScreen from './src/screens/AuthPortalScreen';
 import SignupOnboardingScreen from './src/screens/SignupOnboardingScreen';
@@ -12,11 +14,10 @@ import DatesScreen from './src/screens/DatesScreen';
 import ProfileScreen from './src/screens/ProfileScreen';
 import SettingsPortalScreen from './src/screens/SettingsPortalScreen';
 import CustomerSupportScreen from './src/screens/CustomerSupportScreen';
-import { supabase, isSupabaseConfigured } from './src/lib/supabase';
+import { supabase, isSupabaseConfigured, checkProfileExists } from './src/lib/supabase';
 import ErrorBoundary from './src/components/ErrorBoundary';
 
 // UpdateChecker is optional - never let it crash the app.
-// If the file exports default, use it. If it exports named / nothing, render null.
 import UpdateCheckerRaw from './src/components/UpdateChecker';
 const UpdateChecker = typeof UpdateCheckerRaw === 'function'
   ? UpdateCheckerRaw
@@ -83,18 +84,6 @@ const routeToPath = (name, params = {}) => {
   return path;
 };
 
-const checkProfileExists = async (userId) => {
-  if (!userId) return { exists: false, error: null };
-  if (!isSupabaseConfigured) return { exists: false, error: null };
-  try {
-    const { data, error } = await supabase.from('profiles').select('id').eq('id', userId).maybeSingle();
-    if (error) return { exists: false, error: error.message };
-    return { exists: !!data, error: null };
-  } catch (e) {
-    return { exists: false, error: e?.message || 'Profile check failed' };
-  }
-};
-
 const readFreshSignupFlag = () => {
   try {
     if (Platform.OS === 'web' && typeof window !== 'undefined') {
@@ -124,7 +113,6 @@ export default function App() {
   const sessionRef = useRef(null);
   const stackRef = useRef([{ name: 'AuthPortal', params: {} }]);
   const profileCacheRef = useRef({});
-  const bootAttemptRef = useRef(0);
   const mountedRef = useRef(true);
 
   useEffect(() => { mountedRef.current = true; return () => { mountedRef.current = false; }; }, []);
@@ -134,17 +122,14 @@ export default function App() {
   const current = stack[stack.length - 1];
   const currentRoute = resolveRouteName(current?.name || 'AuthPortal');
 
-  // Audio setup - safe, never crashes boot
   useEffect(() => {
     const setupAudio = async () => {
       if (Platform.OS === 'web') return;
       try {
-        const mod = await import('expo-av');
-        const Audio = mod?.Audio || mod?.default?.Audio;
-        if (typeof Audio?.setAudioModeAsync !== 'function') return;
-        await Audio.setAudioModeAsync({
-          allowsRecordingIOS: true,
-          playsInSilentModeIOS: true,
+        const { AudioModule } = await import('expo-audio');
+        await AudioModule.setAudioModeAsync({
+          allowsRecording: true,
+          playsInSilentMode: true,
           staysActiveInBackground: true,
           shouldDuckAndroid: true,
           playThroughEarpieceAndroid: false,
@@ -172,12 +157,9 @@ export default function App() {
 
   const boot = useCallback(async () => {
     if (!mountedRef.current) return;
-    bootAttemptRef.current += 1;
     setIsLoading(true);
     setBootError('');
     try {
-      // If Supabase is not configured (EAS build without env vars),
-      // do NOT crash - just show AuthPortal so user can still see the app.
       if (!isSupabaseConfigured || typeof supabase?.auth?.getSession !== 'function') {
         console.warn('[App] Supabase not configured, showing AuthPortal');
         setSession(null);
@@ -186,21 +168,18 @@ export default function App() {
         setIsLoading(false);
         return;
       }
-
       const { data, error: sessionError } = await supabase.auth.getSession();
       if (sessionError) throw sessionError;
       const sess = data?.session || null;
       if (!mountedRef.current) return;
       setSession(sess);
       sessionRef.current = sess;
-
       let initial = null;
       try {
         if (Platform.OS === 'web' && typeof window !== 'undefined' && window.location?.pathname) {
           initial = pathToRoute(window.location.pathname);
         }
       } catch {}
-
       if (!sess) {
         if (initial && AUTH_REQUIRED_ROUTES.includes(initial.name)) {
           initial = { name: 'AuthPortal', params: {} };
@@ -218,7 +197,6 @@ export default function App() {
           if (initial.name === 'SignupOnboarding') initial = { name: 'Discovery', params: {} };
         }
       }
-
       try {
         if (Platform.OS === 'web' && typeof window !== 'undefined') {
           window.history.replaceState(null, '', routeToPath(initial.name, initial.params));
@@ -237,7 +215,6 @@ export default function App() {
 
   useEffect(() => { boot(); }, [boot]);
 
-  // Auth listener - guarded, no stale closure, handles v1 + v2
   useEffect(() => {
     let subscription = null;
     try {
@@ -314,7 +291,6 @@ export default function App() {
     };
   }, [getProfileExists]);
 
-  // Web-only back button handling
   useEffect(() => {
     if (Platform.OS !== 'web' || typeof window === 'undefined') return;
     const onPop = async () => {
@@ -354,11 +330,10 @@ export default function App() {
     return () => window.removeEventListener('popstate', onPop);
   }, [getProfileExists]);
 
-  // Web-only URL sync
   useEffect(() => {
     if (isLoading) return;
     try {
-      if (Platform.OS !== 'web' || typeof window !== 'undefined') return;
+      if (Platform.OS !== 'web' || typeof window === 'undefined') return;
       if (isPoppingRef.current) return;
       const path = routeToPath(currentRoute, current?.params);
       if (window.location.pathname !== path) {
@@ -394,6 +369,23 @@ export default function App() {
     });
   }, [guardProtected]);
 
+  const replace = useCallback((name, params = {}) => {
+    const canonical = resolveRouteName(name);
+    const known = Object.keys(ROUTE_TO_PATH).includes(canonical);
+    const target = known ? canonical : 'Discovery';
+    const targetParams = known ? params : {};
+    if (guardProtected(target, targetParams)) {
+      if (!sessionRef.current) setStack([{ name: 'AuthPortal', params: {} }]);
+      else setStack([{ name: 'SignupOnboarding', params: {} }]);
+      return;
+    }
+    setStack((prev) => {
+      const newRoute = { name: target, params: targetParams };
+      if (prev.length === 0) return [newRoute];
+      return [...prev.slice(0, -1), newRoute];
+    });
+  }, [guardProtected]);
+
   const reset = useCallback((opts) => {
     let first = null;
     if (typeof opts === 'string') first = { name: opts, params: {} };
@@ -424,7 +416,7 @@ export default function App() {
   const canGoBack = useCallback(() => stackRef.current.length > 1, []);
 
   const navigation = {
-    navigate, reset, goBack, canGoBack,
+    navigate, replace, reset, goBack, canGoBack,
     setParams: (params) => setStack((prev) => {
       const copy = [...prev];
       copy[copy.length - 1] = { ...copy[copy.length - 1], params: { ...copy[copy.length - 1].params, ...params } };
@@ -436,31 +428,35 @@ export default function App() {
 
   if (isLoading) {
     return (
-      <SafeAreaProvider>
-        <View style={styles.loading}>
-          <Text style={styles.loadingLogo}>I</Text>
-          <Text style={styles.loadingText}>INTENT</Text>
-          <ActivityIndicator color="#F97316" style={{ marginTop: 16 }} />
-        </View>
-      </SafeAreaProvider>
+      <GestureHandlerRootView style={styles.flex}>
+        <SafeAreaProvider>
+          <View style={styles.loading}>
+            <Text style={styles.loadingLogo}>I</Text>
+            <Text style={styles.loadingText}>INTENT</Text>
+            <ActivityIndicator color="#F97316" style={{ marginTop: 16 }} />
+          </View>
+        </SafeAreaProvider>
+      </GestureHandlerRootView>
     );
   }
 
   if (bootError) {
     return (
-      <SafeAreaProvider>
-        <View style={styles.errorWrap}>
-          <Text style={styles.loadingLogo}>I</Text>
-          <Text style={styles.errorTitle}>Couldn’t load Intent</Text>
-          <Text style={styles.errorText}>{bootError}</Text>
-          <TouchableOpacity style={styles.retryBtn} onPress={boot}>
-            <Text style={styles.retryText}>Try Again</Text>
-          </TouchableOpacity>
-          <TouchableOpacity style={styles.secondaryBtn} onPress={() => { setBootError(''); setStack([{ name: 'AuthPortal', params: {} }]); }}>
-            <Text style={styles.secondaryText}>Go to Sign In</Text>
-          </TouchableOpacity>
-        </View>
-      </SafeAreaProvider>
+      <GestureHandlerRootView style={styles.flex}>
+        <SafeAreaProvider>
+          <View style={styles.errorWrap}>
+            <Text style={styles.loadingLogo}>I</Text>
+            <Text style={styles.errorTitle}>Couldn’t load Intent</Text>
+            <Text style={styles.errorText}>{bootError}</Text>
+            <TouchableOpacity style={styles.retryBtn} onPress={boot}>
+              <Text style={styles.retryText}>Try Again</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.secondaryBtn} onPress={() => { setBootError(''); setStack([{ name: 'AuthPortal', params: {} }]); }}>
+              <Text style={styles.secondaryText}>Go to Sign In</Text>
+            </TouchableOpacity>
+          </View>
+        </SafeAreaProvider>
+      </GestureHandlerRootView>
     );
   }
 
@@ -468,29 +464,32 @@ export default function App() {
   const screenProps = { navigation, route, currentRoute };
 
   return (
-    <SafeAreaProvider>
-      <ErrorBoundary key={errorBoundaryKey} onReset={() => { setErrorBoundaryKey((k) => k + 1); setStack([{ name: 'Discovery', params: {} }]); }}>
-        <View style={styles.outer}>
-          <StatusBar style="light" />
-          <UpdateChecker />
-          <View key={`${currentRoute}-${JSON.stringify(current?.params || {})}`} style={styles.inner}>
-            {currentRoute === 'AuthPortal' && <AuthPortalScreen {...screenProps} session={session} />}
-            {currentRoute === 'SignupOnboarding' && <SignupOnboardingScreen {...screenProps} session={session} />}
-            {currentRoute === 'Discovery' && <DiscoveryScreen {...screenProps} session={session} />}
-            {currentRoute === 'ActiveChats' && <ActiveChatsScreen {...screenProps} session={session} />}
-            {currentRoute === 'ChatDetail' && <ChatDetailScreen {...screenProps} session={session} />}
-            {currentRoute === 'Dates' && <DatesScreen {...screenProps} session={session} />}
-            {currentRoute === 'Profile' && <ProfileScreen {...screenProps} session={session} />}
-            {currentRoute === 'SettingsPortal' && <SettingsPortalScreen {...screenProps} session={session} />}
-            {currentRoute === 'CustomerSupport' && <CustomerSupportScreen {...screenProps} session={session} />}
+    <GestureHandlerRootView style={styles.flex}>
+      <SafeAreaProvider>
+        <ErrorBoundary key={errorBoundaryKey} onReset={() => { setErrorBoundaryKey((k) => k + 1); setStack([{ name: 'Discovery', params: {} }]); }}>
+          <View style={styles.outer}>
+            <StatusBar style="light" />
+            <UpdateChecker />
+            <View key={`${currentRoute}-${JSON.stringify(current?.params || {})}`} style={styles.inner}>
+              {currentRoute === 'AuthPortal' && <AuthPortalScreen {...screenProps} session={session} />}
+              {currentRoute === 'SignupOnboarding' && <SignupOnboardingScreen {...screenProps} session={session} />}
+              {currentRoute === 'Discovery' && <DiscoveryScreen {...screenProps} session={session} />}
+              {currentRoute === 'ActiveChats' && <ActiveChatsScreen {...screenProps} session={session} />}
+              {currentRoute === 'ChatDetail' && <ChatDetailScreen {...screenProps} session={session} />}
+              {currentRoute === 'Dates' && <DatesScreen {...screenProps} session={session} />}
+              {currentRoute === 'Profile' && <ProfileScreen {...screenProps} session={session} />}
+              {currentRoute === 'SettingsPortal' && <SettingsPortalScreen {...screenProps} session={session} />}
+              {currentRoute === 'CustomerSupport' && <CustomerSupportScreen {...screenProps} session={session} />}
+            </View>
           </View>
-        </View>
-      </ErrorBoundary>
-    </SafeAreaProvider>
+        </ErrorBoundary>
+      </SafeAreaProvider>
+    </GestureHandlerRootView>
   );
 }
 
 const styles = StyleSheet.create({
+  flex: { flex: 1 },
   loading: { flex: 1, backgroundColor: '#0F172A', justifyContent: 'center', alignItems: 'center' },
   loadingLogo: { fontSize: 32, fontWeight: '900', color: '#F97316' },
   loadingText: { color: '#F8FAFC', fontWeight: '900', letterSpacing: 4, marginTop: 8 },

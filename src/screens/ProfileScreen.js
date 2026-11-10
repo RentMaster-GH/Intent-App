@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { View, Text, TextInput, TouchableOpacity, StyleSheet, ScrollView, Modal, Switch, Alert, ActivityIndicator } from 'react-native';
 import { Image } from 'expo-image';
 import * as ImagePicker from 'expo-image-picker';
@@ -11,9 +11,22 @@ const maskEmail = (email) => {
   return `${name[0]}***@${domain}`;
 };
 
-const INTENTS = ['Long-term Relationship 💛', 'Activity & Event Buddy 🎟️', 'Friendship First 🤝', 'Marriage Minded 💍'];
+const INTENTS = [
+  'Long-term Relationship',
+  'Activity & Event Buddy',
+  'Friendship First',
+  'Marriage Minded',
+];
 
-export default function ProfileScreen({ navigation, route }) {
+const withTimeout = (promise, ms = 8000) =>
+  Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Request timed out. Check your connection and try again.')), ms)
+    ),
+  ]);
+
+export default function ProfileScreen({ navigation, route, session }) {
   const previousRoute = route?.params?.from || 'Discovery';
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -40,31 +53,77 @@ export default function ProfileScreen({ navigation, route }) {
   const [newPassword, setNewPassword] = useState('');
   const [confirmNewPassword, setConfirmNewPassword] = useState('');
 
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  const loadBlocked = useCallback(async (uid) => {
+    try {
+      const { data: blocked } = await withTimeout(
+        supabase.from('blocked_users').select('id, blocked_id, reason, created_at').eq('blocker_id', uid),
+        5000
+      );
+      if (!blocked || !mountedRef.current) return;
+      const ids = blocked.map((b) => b.blocked_id).filter(Boolean);
+      let nameMap = {};
+      if (ids.length) {
+        const { data: names } = await withTimeout(
+          supabase.from('profiles').select('id, name').in('id', ids),
+          5000
+        );
+        (names || []).forEach((n) => { nameMap[n.id] = n.name; });
+      }
+      if (mountedRef.current) {
+        setBlockedUsers(blocked.map((b) => ({
+          id: b.id,
+          blocked_id: b.blocked_id,
+          name: nameMap[b.blocked_id] || 'User',
+          reason: b.reason || '',
+        })));
+      }
+    } catch {
+      if (mountedRef.current) setBlockedUsers([]);
+    }
+  }, []);
+
   const loadProfile = useCallback(async () => {
     setLoading(true);
     try {
-      const { data: { user } } = await supabase.auth.getUser();
-      if (!user) { navigation.reset({ index: 0, routes: [{ name: 'AuthPortal' }] }); return; }
-      setUserId(user.id);
-      setEmail(user.email || '');
+      const user = session?.user;
+      if (!user) {
+        navigation.reset({ index: 0, routes: [{ name: 'AuthPortal' }] });
+        return;
+      }
+      if (mountedRef.current) {
+        setUserId(user.id);
+        setEmail(user.email || '');
+      }
 
-      // FIX: Use select('*') fallback — if 1 new column is missing, old query threw and profile never loaded.
-      // Try full select first, fall back to core columns only.
       let profile = null;
-      const { data: full, error: fullError } = await supabase.from('profiles')
-        .select('name, bio, intent, location, age, photos, notifications, show_on_discovery')
-        .eq('id', user.id).maybeSingle();
+      const { data: full, error: fullError } = await withTimeout(
+        supabase.from('profiles')
+          .select('name, bio, intent, location, age, photos, notifications, show_on_discovery')
+          .eq('id', user.id)
+          .maybeSingle(),
+        8000
+      );
       if (fullError) {
-        const { data: core, error: coreError } = await supabase.from('profiles')
-          .select('name, bio, intent, location, age, photos')
-          .eq('id', user.id).maybeSingle();
+        const { data: core, error: coreError } = await withTimeout(
+          supabase.from('profiles')
+            .select('name, bio, intent, location, age, photos')
+            .eq('id', user.id)
+            .maybeSingle(),
+          8000
+        );
         if (coreError) throw coreError;
         profile = core;
       } else {
         profile = full;
       }
 
-      if (profile) {
+      if (profile && mountedRef.current) {
         setName(profile.name || '');
         setBio(profile.bio || '');
         if (profile.intent) setIntent(profile.intent);
@@ -74,22 +133,14 @@ export default function ProfileScreen({ navigation, route }) {
         if (typeof profile.notifications === 'boolean') setNotifications(profile.notifications);
         if (typeof profile.show_on_discovery === 'boolean') setShowOnDiscovery(profile.show_on_discovery);
       }
-
-      try {
-        const { data: blocked } = await supabase.from('blocked_users').select('id, blocked_id, reason, created_at').eq('blocker_id', user.id);
-        if (blocked) {
-          const ids = blocked.map(b => b.blocked_id).filter(Boolean);
-          let nameMap = {};
-          if (ids.length) {
-            const { data: names } = await supabase.from('profiles').select('id, name').in('id', ids);
-            (names || []).forEach(n => nameMap[n.id] = n.name);
-          }
-          setBlockedUsers(blocked.map(b => ({ id: b.id, blocked_id: b.blocked_id, name: nameMap[b.blocked_id] || 'User', reason: b.reason || '' })));
-        }
-      } catch { setBlockedUsers([]); }
-    } catch (e) { Alert.alert('Could not load profile', e.message || 'Check connection and try again.'); }
-    finally { setLoading(false); }
-  }, [navigation]);
+      if (mountedRef.current) setLoading(false);
+      loadBlocked(user.id);
+      return;
+    } catch (e) {
+      Alert.alert('Could not load profile', e.message || 'Check connection and try again.');
+    }
+    if (mountedRef.current) setLoading(false);
+  }, [navigation, session, loadBlocked]);
 
   useEffect(() => { loadProfile(); }, [loadProfile]);
 
@@ -116,381 +167,369 @@ export default function ProfileScreen({ navigation, route }) {
     navigation.reset({ index: 0, routes: [{ name: 'AuthPortal' }] });
   };
 
-  // FIX: Use update(), not upsert() with only 3 fields. Upsert with partial fields can null out name/bio.
   const saveToggle = async (column, value, setFn) => {
     if (!userId) return;
-    const prev = value === notifications ? notifications : showOnDiscovery;
     setFn(value);
-    const { error } = await supabase.from('profiles').update({ [column]: value }).eq('id', userId);
-    if (error) { setFn(!value); Alert.alert('Could not save', error.message || 'Setting not saved.'); }
+    try {
+      const { error } = await withTimeout(
+        supabase.from('profiles').update({ [column]: value }).eq('id', userId),
+        8000
+      );
+      if (error) throw error;
+    } catch (e) {
+      setFn(!value);
+      Alert.alert('Could not save', e.message || 'Try again.');
+    }
   };
 
-  const handleSaveProfile = async () => {
+  const saveProfile = async () => {
     if (!userId) return;
-    if (!name.trim()) { Alert.alert('Name required', 'Enter your name.'); return; }
-    if (bio.trim().length > 0 && bio.trim().length < 10) { Alert.alert('Bio too short', 'Write at least 10 characters so people know your intent.'); return; }
-    // FIX: Warn if bio contradicts intent — this is what made Vio look fake in your video
-    const bioLower = bio.toLowerCase();
-    if (intent.includes('Long-term') && (bioLower.includes('good time') || bioLower.includes('hookup') || bioLower.includes('fun only'))) {
-      Alert.alert(
-        'Bio vs Intent mismatch',
-        'Your intent is Long-term Relationship but your bio says "good time". Matches will skip you. Fix your bio to match your intent?',
-        [
-          { text: 'Keep it anyway', onPress: () => doSave() },
-          { text: 'Fix bio first', style: 'cancel' },
-        ]
-      );
+    if (!name.trim()) {
+      Alert.alert('Name required', 'Please enter your name.');
       return;
     }
-    doSave();
-  };
-
-  const doSave = async () => {
     setSaving(true);
     try {
-      const { error } = await supabase.from('profiles').update({
-        name: name.trim(), bio: bio.trim(), intent,
-        location: location.trim(), age: age ? parseInt(age, 10) : null,
-        photos, notifications, show_on_discovery: showOnDiscovery,
-        updated_at: new Date().toISOString(),
-      }).eq('id', userId);
+      const payload = {
+        name: name.trim(),
+        bio: bio.trim(),
+        intent,
+        location: location.trim(),
+        age: age ? parseInt(age, 10) : null,
+        photos,
+      };
+      const { error } = await withTimeout(
+        supabase.from('profiles').update(payload).eq('id', userId),
+        8000
+      );
       if (error) throw error;
       Alert.alert('Saved', 'Your profile has been updated.');
-    } catch (e) { Alert.alert('Save failed', e.message || 'Could not save profile.'); }
-    finally { setSaving(false); }
-  };
-
-  const persistPhotos = async (newPhotos) => {
-    if (!userId) return;
-    const { error } = await supabase.from('profiles').update({ photos: newPhotos }).eq('id', userId);
-    if (error) throw error;
+    } catch (e) {
+      Alert.alert('Could not save profile', e.message || 'Check connection and try again.');
+    }
+    setSaving(false);
   };
 
   const addPhotoFromUrl = async () => {
     const url = photoUrlInput.trim();
-    if (!url.startsWith('http')) { Alert.alert('Photo URL', 'Paste a valid https:// image URL.'); return; }
-    if (photos.length >= 6) { Alert.alert('Limit', 'You can upload up to 6 photos.'); return; }
+    if (!url) return;
+    if (!url.startsWith('http')) {
+      Alert.alert('Invalid URL', 'Please paste a full image URL starting with http.');
+      return;
+    }
+    if (photos.length >= 6) {
+      Alert.alert('Limit reached', 'You can have up to 6 photos.');
+      return;
+    }
     const newPhotos = [...photos, url];
     setPhotos(newPhotos);
     setPhotoUrlInput('');
-    try { await persistPhotos(newPhotos); } catch (e) { Alert.alert('Save failed', e.message || 'Photo added locally but not saved. Tap Save Profile.'); }
-  };
-
-  const pickAndUploadPhoto = async () => {
-    if (photos.length >= 6) { Alert.alert('Limit', 'You can upload up to 6 photos.'); return; }
-    if (!userId) return;
-    const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
-    if (status !== 'granted') { Alert.alert('Permission', 'Allow photo access to upload a photo.'); return; }
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ['images'],
-      allowsEditing: true,
-      aspect: [3, 4],
-      quality: 0.8,
-    });
-    if (result.canceled) return;
-    const asset = result.assets[0];
-    setUploadingPhoto(true);
-    try {
-      const response = await fetch(asset.uri);
-      const blob = await response.blob();
-      const ext = asset.fileName?.split('.').pop()?.toLowerCase() || 'jpg';
-      const fileName = `${userId}/${Date.now()}.${ext}`;
-      const { error: uploadError } = await supabase.storage
-        .from('profile-photos')
-        .upload(fileName, blob, { contentType: blob.type || 'image/jpeg', upsert: false });
-      if (uploadError) throw uploadError;
-      const { data } = supabase.storage.from('profile-photos').getPublicUrl(fileName);
-      if (!data?.publicUrl) throw new Error('Could not get photo URL');
-      const newPhotos = [...photos, data.publicUrl];
-      setPhotos(newPhotos);
-      await persistPhotos(newPhotos);
-    } catch (e) {
-      Alert.alert('Upload failed', e.message || 'Could not upload photo. Try a smaller image.');
-    } finally { setUploadingPhoto(false); }
-  };
-
-  const removePhoto = async (idx) => {
-    const removed = photos[idx];
-    const newPhotos = photos.filter((_, i) => i !== idx);
-    setPhotos(newPhotos);
-    try {
-      await persistPhotos(newPhotos);
-      if (removed && removed.includes('profile-photos/')) {
-        const path = removed.split('profile-photos/')[1];
-        if (path) await supabase.storage.from('profile-photos').remove([path]);
+    if (userId) {
+      try {
+        await withTimeout(
+          supabase.from('profiles').update({ photos: newPhotos }).eq('id', userId),
+          8000
+        );
+      } catch (e) {
+        Alert.alert('Could not save photo', e.message || 'Try again.');
       }
-    } catch {}
+    }
   };
 
-  const setAsMainPhoto = async (idx) => {
-    if (idx === 0) return;
-    const newPhotos = [photos[idx], ...photos.filter((_, i) => i !== idx)];
+  const pickPhoto = async () => {
+    try {
+      const { status } = await ImagePicker.requestMediaLibraryPermissionsAsync();
+      if (status !== 'granted') {
+        Alert.alert('Permission needed', 'Allow photo access to upload a photo.');
+        return;
+      }
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ImagePicker.MediaTypeOptions.Images,
+        allowsEditing: true,
+        aspect: [3, 4],
+        quality: 0.8,
+      });
+      if (result.canceled || !result.assets?.[0]?.uri) return;
+      const uri = result.assets[0].uri;
+      if (photos.length >= 6) {
+        Alert.alert('Limit reached', 'You can have up to 6 photos.');
+        return;
+      }
+      setUploadingPhoto(true);
+      const newPhotos = [...photos, uri];
+      setPhotos(newPhotos);
+      if (userId) {
+        try {
+          await withTimeout(
+            supabase.from('profiles').update({ photos: newPhotos }).eq('id', userId),
+            8000
+          );
+        } catch (e) {
+          Alert.alert('Could not save photo', e.message || 'Try again.');
+        }
+      }
+      setUploadingPhoto(false);
+    } catch (e) {
+      setUploadingPhoto(false);
+      Alert.alert('Could not pick photo', e.message || 'Try again.');
+    }
+  };
+
+  const removePhoto = async (index) => {
+    const newPhotos = photos.filter((_, i) => i !== index);
     setPhotos(newPhotos);
-    try { await persistPhotos(newPhotos); } catch {}
+    if (userId) {
+      try {
+        await withTimeout(
+          supabase.from('profiles').update({ photos: newPhotos }).eq('id', userId),
+          8000
+        );
+      } catch {}
+    }
   };
 
-  const handleUnblock = async (blockedId, blockedRowId, nameLabel) => {
+  const unblockUser = async (blockedId) => {
+    if (!userId) return;
     try {
-      const { error } = await supabase.from('blocked_users').delete().eq('id', blockedRowId);
+      const { error } = await withTimeout(
+        supabase.from('blocked_users').delete().eq('blocker_id', userId).eq('blocked_id', blockedId),
+        8000
+      );
       if (error) throw error;
-      setBlockedUsers(prev => prev.filter(b => b.id !== blockedRowId));
-      Alert.alert('Unblocked', `${nameLabel} unblocked.`);
-    } catch { Alert.alert('Failed', 'Could not unblock.'); }
+      setBlockedUsers((prev) => prev.filter((b) => b.blocked_id !== blockedId));
+    } catch (e) {
+      Alert.alert('Could not unblock', e.message || 'Try again.');
+    }
   };
 
-  const handleChangePassword = async () => {
-    if (!newPassword || newPassword.length < 6) { Alert.alert('Password', 'New password must be at least 6 characters.'); return; }
-    if (newPassword !== confirmNewPassword) { Alert.alert('Password', 'Passwords do not match.'); return; }
+  const changePassword = async () => {
+    if (!newPassword || newPassword.length < 6) {
+      Alert.alert('Password too short', 'New password must be at least 6 characters.');
+      return;
+    }
+    if (newPassword !== confirmNewPassword) {
+      Alert.alert('Passwords do not match', 'Please re-enter the same password.');
+      return;
+    }
+    setSaving(true);
     try {
-      const { error } = await supabase.auth.updateUser({ password: newPassword });
+      const { error } = await withTimeout(
+        supabase.auth.updateUser({ password: newPassword }),
+        8000
+      );
       if (error) throw error;
-      Alert.alert('Done', 'Password updated.'); setNewPassword(''); setConfirmNewPassword('');
-    } catch (e) { Alert.alert('Failed', e.message || 'Could not update password. If you signed in a while ago, log out and log in again, then retry.'); }
+      setNewPassword('');
+      setConfirmNewPassword('');
+      Alert.alert('Password updated', 'Your password has been changed.');
+    } catch (e) {
+      Alert.alert('Could not change password', e.message || 'Try again.');
+    }
+    setSaving(false);
   };
 
-  // FIX: Same delete flow as SettingsPortal — try Edge Function first, fall back to direct delete.
-  // Before: only Edge Function, which does not exist yet, so delete always failed.
-  const handleDeleteAccount = async () => {
-    if (deleteText.trim().toUpperCase() !== 'DELETE') { Alert.alert('Confirm', 'Type DELETE to confirm.'); return; }
+  const deleteAccount = async () => {
+    if (deleteText.trim().toUpperCase() !== 'DELETE') {
+      Alert.alert('Type DELETE', 'Type DELETE in the box to confirm.');
+      return;
+    }
+    if (!userId) return;
     setDeleting(true);
     try {
-      let deletedViaFunction = false;
-      try {
-        const { data, error } = await supabase.functions.invoke('delete-account', { body: { confirm: 'DELETE' } });
-        if (!error && data?.ok) deletedViaFunction = true;
-      } catch {}
-      if (!deletedViaFunction) {
-        const { data: myMatches } = await supabase.from('matches').select('id').or(`user_a.eq.${userId},user_b.eq.${userId}`);
-        const matchIds = (myMatches || []).map((m) => m.id);
-        if (matchIds.length > 0) await supabase.from('messages').delete().in('match_id', matchIds);
-        await supabase.from('messages').delete().eq('sender_id', userId);
-        await supabase.from('likes').delete().or(`liker_id.eq.${userId},liked_id.eq.${userId}`);
-        await supabase.from('matches').delete().or(`user_a.eq.${userId},user_b.eq.${userId}`);
-        try { await supabase.from('dates').delete().or(`user_a.eq.${userId},user_b.eq.${userId}`); } catch {}
-        try { await supabase.from('support_tickets').delete().eq('user_id', userId); } catch {}
-        await supabase.from('profiles').delete().eq('id', userId);
-      }
-      try { await supabase.auth.signOut(); } catch {}
-      setShowDeleteConfirm(false);
+      const { error } = await withTimeout(
+        supabase.from('profiles').delete().eq('id', userId),
+        8000
+      );
+      if (error) throw error;
+      await supabase.auth.signOut();
       navigation.reset({ index: 0, routes: [{ name: 'AuthPortal' }] });
-    } catch (e) { Alert.alert('Delete failed', e.message || 'Could not delete account. Contact support.'); }
-    finally { setDeleting(false); }
+    } catch (e) {
+      Alert.alert('Could not delete account', e.message || 'Try again.');
+      setDeleting(false);
+    }
   };
 
   if (loading) {
     return (
-      <View style={[styles.center, { backgroundColor: '#0F172A' }]}>
-        <ActivityIndicator color="#F97316" size="large" />
+      <View style={styles.loadingWrap}>
+        <ActivityIndicator size="large" color="#F97316" />
         <Text style={{ color: '#94A3B8', marginTop: 12 }}>Loading profile...</Text>
+        <TouchableOpacity style={styles.secondaryBtn} onPress={handleBack}>
+          <Text style={styles.secondaryText}>Back</Text>
+        </TouchableOpacity>
       </View>
     );
   }
 
-  const mainPhoto = photos[0] || null;
-
   return (
-    <View style={{ flex: 1, backgroundColor: '#0F172A' }}>
-      <ScrollView style={styles.scroll} contentContainerStyle={styles.c} showsVerticalScrollIndicator={true}>
-        <View style={styles.header}>
-          <TouchableOpacity style={styles.backBtn} onPress={handleBack}><Text style={styles.backText}>← Back</Text></TouchableOpacity>
-          <Text style={styles.title}>PROFILE</Text>
-          <TouchableOpacity style={styles.settingsBtn} onPress={() => navigation.navigate('SettingsPortal')}><Text style={styles.settingsText}>⚙️ Settings</Text></TouchableOpacity>
-        </View>
+    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+      <View style={styles.header}>
+        <TouchableOpacity onPress={handleBack}>
+          <Text style={styles.backText}>Back</Text>
+        </TouchableOpacity>
+        <Text style={styles.title}>Profile</Text>
+        <TouchableOpacity onPress={handleLogout} disabled={loggingOut}>
+          <Text style={styles.logoutText}>{loggingOut ? 'Logging out...' : 'Log Out'}</Text>
+        </TouchableOpacity>
+      </View>
 
-        <View style={styles.section}>
-          {mainPhoto ? (
-            <Image source={{ uri: mainPhoto }} style={styles.avatar} contentFit="cover" />
-          ) : (
-            <View style={[styles.avatar, styles.avatarPlaceholder]}><Text style={styles.avatarPlaceholderText}>{name ? name[0].toUpperCase() : '?'}</Text></View>
-          )}
-          <Text style={styles.name}>{name || 'Your Name'} ✓</Text>
-          <Text style={styles.intent}>{intent}</Text>
-          <Text style={styles.meta}>{age ? `${age} • ` : ''}{location || 'Add location'}</Text>
-          <View style={styles.completeBox}>
-            <View style={{ flexDirection: 'row', justifyContent: 'space-between' }}><Text style={styles.completeLabel}>Profile Completeness</Text><Text style={styles.completePct}>{completeness}%</Text></View>
-            <View style={styles.progressTrack}><View style={[styles.progressFill, { width: `${completeness}%` }]} /></View>
-            <Text style={styles.completeHint}>{completeness >= 100 ? '🎉 Complete — you show up more on Discovery.' : photos.length < 3 ? `Add ${3 - photos.length} more photo${3 - photos.length === 1 ? '' : 's'} to reach 100% and get more matches.` : 'Almost there — finish your bio to reach 100%.'}</Text>
-          </View>
-          <View style={styles.card}><Text style={styles.label}>BIO</Text><Text style={styles.value}>{bio || 'No bio yet — add one below.'}</Text></View>
-          {/* FIXED: Masked email + Show/Hide, same as Settings */}
-          <View style={styles.card}>
-            <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
-              <Text style={styles.label}>EMAIL</Text>
-              <TouchableOpacity onPress={() => setShowEmail((v) => !v)}><Text style={{ color: '#FBBF24', fontWeight: '700', fontSize: 12 }}>{showEmail ? 'Hide' : 'Show'}</Text></TouchableOpacity>
+      <View style={styles.card}>
+        <Text style={styles.sectionTitle}>Profile completeness: {completeness}%</Text>
+        <View style={styles.progressBg}>
+          <View style={[styles.progressFill, { width: `${completeness}%` }]} />
+        </View>
+        {completeness < 100 && (
+          <Text style={styles.hint}>Add a bio and at least 3 photos to reach 100%.</Text>
+        )}
+      </View>
+
+      <View style={styles.card}>
+        <Text style={styles.label}>Name</Text>
+        <TextInput style={styles.input} value={name} onChangeText={setName} placeholder="Your name" placeholderTextColor="#64748B" />
+        <Text style={styles.label}>Bio</Text>
+        <TextInput style={[styles.input, styles.bioInput]} value={bio} onChangeText={setBio} placeholder="Tell people about you..." placeholderTextColor="#64748B" multiline numberOfLines={4} />
+        <Text style={styles.label}>Intent</Text>
+        <View style={styles.chipWrap}>
+          {INTENTS.map((item) => (
+            <TouchableOpacity key={item} style={[styles.chip, intent === item && styles.chipActive]} onPress={() => setIntent(item)}>
+              <Text style={[styles.chipText, intent === item && styles.chipTextActive]}>{item}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+        <Text style={styles.label}>Location</Text>
+        <TextInput style={styles.input} value={location} onChangeText={setLocation} placeholder="e.g. Accra" placeholderTextColor="#64748B" />
+        <Text style={styles.label}>Age</Text>
+        <TextInput style={styles.input} value={age} onChangeText={setAge} placeholder="e.g. 28" placeholderTextColor="#64748B" keyboardType="numeric" />
+        <TouchableOpacity onPress={() => setShowEmail((v) => !v)}>
+          <Text style={styles.emailToggle}>{showEmail ? maskEmail(email) : 'Show my email'} </Text>
+        </TouchableOpacity>
+      </View>
+
+      <View style={styles.card}>
+        <Text style={styles.sectionTitle}>Photos ({photos.length}/6)</Text>
+        <View style={styles.photoGrid}>
+          {photos.map((uri, i) => (
+            <View key={`${uri}-${i}`} style={styles.photoBox}>
+              <Image source={{ uri }} style={styles.photo} contentFit="cover" />
+              <TouchableOpacity style={styles.removeBtn} onPress={() => removePhoto(i)}>
+                <Text style={styles.removeText}>x</Text>
+              </TouchableOpacity>
             </View>
-            <Text style={styles.value}>{showEmail ? email : maskEmail(email)}</Text>
-            <Text style={{ color: '#94A3B8', fontSize: 11, marginTop: 4 }}>Only you can see this. Never shown to matches.</Text>
-          </View>
-          <View style={styles.card}><Text style={styles.label}>GLOBAL RULE</Text><Text style={styles.value}>✅ 3 active chats max worldwide</Text></View>
-          <View style={{ flexDirection: 'row', gap: 10, marginTop: 14, width: '100%' }}>
-            <TouchableOpacity style={[styles.miniBtn, { flex: 1 }]} onPress={() => Alert.alert('Verification', 'Verification is coming soon. You will be notified when it opens.')}><Text style={styles.miniBtnText}>✓ Get Verified</Text></TouchableOpacity>
-            <TouchableOpacity style={[styles.miniBtn, { flex: 1 }]} onPress={() => navigation.navigate('CustomerSupport')}><Text style={styles.miniBtnText}>💬 Help & Support</Text></TouchableOpacity>
-          </View>
+          ))}
         </View>
+        <TouchableOpacity style={styles.secondaryBtn} onPress={pickPhoto} disabled={uploadingPhoto}>
+          <Text style={styles.secondaryText}>{uploadingPhoto ? 'Adding...' : 'Add Photo from Gallery'}</Text>
+        </TouchableOpacity>
+        <TextInput style={styles.input} value={photoUrlInput} onChangeText={setPhotoUrlInput} placeholder="Or paste image URL" placeholderTextColor="#64748B" autoCapitalize="none" />
+        <TouchableOpacity style={styles.secondaryBtn} onPress={addPhotoFromUrl}>
+          <Text style={styles.secondaryText}>Add Photo from URL</Text>
+        </TouchableOpacity>
+      </View>
 
-        <View style={styles.section}>
-          <Text style={[styles.label, { alignSelf: 'flex-start' }]}>PHOTOS ({photos.length}/6)</Text>
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} style={styles.photoRow}>
-            {photos.map((p, i) => (
-              // FIXED: View wrapper, not nested Touchable — Remove no longer also triggers Set as Main
-              <View key={`${p}-${i}`} style={styles.photoWrap}>
-                <TouchableOpacity onPress={() => setAsMainPhoto(i)}>
-                  <Image source={{ uri: p }} style={styles.photoThumb} contentFit="cover" />
-                  {i === 0 && <Text style={styles.mainBadge}>MAIN</Text>}
-                </TouchableOpacity>
-                <TouchableOpacity style={styles.removePhoto} onPress={() => removePhoto(i)}><Text style={{ color: '#FFF', fontSize: 12, fontWeight: '800' }}>✕</Text></TouchableOpacity>
-              </View>
-            ))}
-          </ScrollView>
+      <View style={styles.card}>
+        <View style={styles.row}>
+          <Text style={styles.rowLabel}>Notifications</Text>
+          <Switch value={notifications} onValueChange={(v) => saveToggle('notifications', v, setNotifications)} trackColor={{ false: '#334155', true: '#F97316' }} />
+        </View>
+        <View style={styles.row}>
+          <Text style={styles.rowLabel}>Show me on Discovery</Text>
+          <Switch value={showOnDiscovery} onValueChange={(v) => saveToggle('show_on_discovery', v, setShowOnDiscovery)} trackColor={{ false: '#334155', true: '#F97316' }} />
+        </View>
+      </View>
 
-          <TouchableOpacity style={styles.uploadBtn} onPress={pickAndUploadPhoto} disabled={uploadingPhoto}>
-            {uploadingPhoto ? <ActivityIndicator color="#FFF" /> : <Text style={styles.uploadBtnText}>📸 Upload Photo from Device</Text>}
+      <View style={styles.card}>
+        <Text style={styles.sectionTitle}>Blocked users ({blockedUsers.length})</Text>
+        {!showBlocked ? (
+          <TouchableOpacity style={styles.secondaryBtn} onPress={() => setShowBlocked(true)}>
+            <Text style={styles.secondaryText}>View blocked users</Text>
           </TouchableOpacity>
-          <Text style={styles.uploadHint}>Tap a photo to make it your main photo. Max 6 photos.</Text>
-
-          <View style={{ gap: 8, width: '100%' }}>
-            <Text style={[styles.inputLabel, { marginTop: 8 }]}>Or paste photo URL</Text>
-            <View style={{ flexDirection: 'row', gap: 8 }}>
-              <TextInput style={[styles.input, { flex: 1, minWidth: 180 }]} value={photoUrlInput} onChangeText={setPhotoUrlInput} placeholder="https://..." placeholderTextColor="#64748B" autoCapitalize="none" />
-              <TouchableOpacity style={[styles.secondaryBtn, { height: 48, paddingHorizontal: 14, marginTop: 0, width: 60 }]} onPress={addPhotoFromUrl}><Text style={styles.secondaryBtnText}>Add</Text></TouchableOpacity>
+        ) : blockedUsers.length === 0 ? (
+          <Text style={styles.muted}>No blocked users.</Text>
+        ) : (
+          blockedUsers.map((b) => (
+            <View key={b.id} style={styles.row}>
+              <Text style={styles.rowLabel}>{b.name}</Text>
+              <TouchableOpacity onPress={() => unblockUser(b.blocked_id)}>
+                <Text style={styles.unblockText}>Unblock</Text>
+              </TouchableOpacity>
             </View>
-          </View>
-          {photos.length === 0 && <Text style={{ color: '#94A3B8', fontSize: 12, marginTop: 8, alignSelf: 'flex-start' }}>No photos yet. Upload one from your device above.</Text>}
-        </View>
+          ))
+        )}
+      </View>
 
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Edit Details</Text>
-          <Text style={styles.inputLabel}>Name</Text>
-          <TextInput style={styles.input} value={name} onChangeText={setName} placeholder="Your name" placeholderTextColor="#64748B" />
-          <Text style={styles.inputLabel}>Bio</Text>
-          <TextInput style={[styles.input, { height: 72, textAlignVertical: 'top' }]} value={bio} onChangeText={setBio} multiline placeholder="Tell your intent..." placeholderTextColor="#64748B" />
-          <View style={styles.row2}>
-            <View style={{ flex: 1 }}><Text style={styles.inputLabel}>Age</Text><TextInput style={styles.input} value={age} onChangeText={setAge} keyboardType="number-pad" placeholder="28" placeholderTextColor="#64748B" /></View>
-            <View style={{ flex: 2, marginLeft: 10 }}><Text style={styles.inputLabel}>Location</Text><TextInput style={styles.input} value={location} onChangeText={setLocation} placeholder="Accra, Ghana" placeholderTextColor="#64748B" /></View>
-          </View>
-          <Text style={styles.inputLabel}>Intent</Text>
-          <View style={styles.intentWrap}>
-            {INTENTS.map((it) => (
-              <TouchableOpacity key={it} style={[styles.intentChip, intent === it && styles.intentChipActive]} onPress={() => setIntent(it)}><Text style={[styles.intentChipText, intent === it && styles.intentChipTextActive]}>{it}</Text></TouchableOpacity>
-            ))}
-          </View>
-          <TouchableOpacity style={styles.saveBtn} onPress={handleSaveProfile} disabled={saving}>{saving ? <ActivityIndicator color="#FFF" /> : <Text style={styles.saveBtnText}>Save Profile</Text>}</TouchableOpacity>
-        </View>
+      <View style={styles.card}>
+        <Text style={styles.sectionTitle}>Change password</Text>
+        <TextInput style={styles.input} value={newPassword} onChangeText={setNewPassword} placeholder="New password" placeholderTextColor="#64748B" secureTextEntry />
+        <TextInput style={styles.input} value={confirmNewPassword} onChangeText={setConfirmNewPassword} placeholder="Confirm new password" placeholderTextColor="#64748B" secureTextEntry />
+        <TouchableOpacity style={styles.secondaryBtn} onPress={changePassword} disabled={saving}>
+          <Text style={styles.secondaryText}>Update password</Text>
+        </TouchableOpacity>
+      </View>
 
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Preferences</Text>
-          <View style={styles.toggleRow}><Text style={styles.toggleLabel}>🔔 Notifications</Text><Switch value={notifications} onValueChange={(v) => saveToggle('notifications', v, setNotifications)} trackColor={{ false: '#334155', true: '#F97316' }} thumbColor="#FFF" /></View>
-          <View style={styles.toggleRow}><Text style={styles.toggleLabel}>🌍 Show me on Discovery</Text><Switch value={showOnDiscovery} onValueChange={(v) => saveToggle('show_on_discovery', v, setShowOnDiscovery)} trackColor={{ false: '#334155', true: '#F97316' }} thumbColor="#FFF" /></View>
-          <TouchableOpacity style={styles.secondaryBtn} onPress={() => setShowBlocked(true)}><Text style={styles.secondaryBtnText}>🚫 Blocked Users ({blockedUsers.length})</Text></TouchableOpacity>
-          <TouchableOpacity style={styles.secondaryBtn} onPress={() => navigation.navigate('SettingsPortal')}><Text style={styles.secondaryBtnText}>⚙️ Open Full Settings Portal →</Text></TouchableOpacity>
-        </View>
+      <TouchableOpacity style={styles.saveBtn} onPress={saveProfile} disabled={saving}>
+        <Text style={styles.saveText}>{saving ? 'Saving...' : 'Save Profile'}</Text>
+      </TouchableOpacity>
 
-        <View style={styles.section}>
-          <Text style={styles.sectionTitle}>Security</Text>
-          <TextInput style={styles.input} value={newPassword} onChangeText={setNewPassword} placeholder="New password (6+ chars)" placeholderTextColor="#64748B" secureTextEntry autoComplete="new-password" textContentType="newPassword" />
-          <TextInput style={[styles.input, { marginTop: 10 }]} value={confirmNewPassword} onChangeText={setConfirmNewPassword} placeholder="Confirm new password" placeholderTextColor="#64748B" secureTextEntry autoComplete="new-password" textContentType="newPassword" />
-          <TouchableOpacity style={styles.secondaryBtn} onPress={handleChangePassword}><Text style={styles.secondaryBtnText}>Update Password</Text></TouchableOpacity>
-          <TouchableOpacity style={styles.secondaryBtn} onPress={() => Alert.alert('Export Data', 'Export is not available yet. Contact support if you need a copy of your data.')}><Text style={styles.secondaryBtnText}>📥 Export My Data</Text></TouchableOpacity>
-        </View>
+      <TouchableOpacity style={styles.deleteBtn} onPress={() => setShowDeleteConfirm(true)}>
+        <Text style={styles.deleteText}>Delete Account</Text>
+      </TouchableOpacity>
 
-        <View style={styles.section}>
-          <Text style={[styles.sectionTitle, { color: '#FCA5A5' }]}>Danger Zone</Text>
-          <View style={styles.dangerBox}>
-            <Text style={styles.dangerText}>Delete Account — this permanently removes your profile, photos, chats and dates. This cannot be undone.</Text>
-            <TouchableOpacity style={styles.deleteBtn} onPress={() => setShowDeleteConfirm(true)}><Text style={styles.deleteBtnText}>🗑️ Delete My Account</Text></TouchableOpacity>
-          </View>
-          <TouchableOpacity style={styles.logout} onPress={handleLogout} disabled={loggingOut}>
-            {loggingOut ? <ActivityIndicator color="#FFF" /> : <Text style={{ color: '#FFF', fontWeight: '800' }}>Log Out</Text>}
-          </TouchableOpacity>
-        </View>
-      </ScrollView>
-
-      <Modal visible={showBlocked} transparent animationType="fade">
-        <View style={styles.modalOverlay}>
-          <View style={[styles.modalCard, { maxHeight: 380 }]}>
-            <Text style={styles.modalTitle}>🚫 Blocked Users</Text>
-            {blockedUsers.length === 0 ? <Text style={{ color: '#94A3B8', marginTop: 12 }}>No blocked users.</Text> : blockedUsers.map((u) => (
-              <View key={u.id} style={styles.toggleRow}><View><Text style={{ color: '#FFF', fontWeight: '700' }}>{u.name}</Text><Text style={{ color: '#94A3B8', fontSize: 12 }}>{u.reason}</Text></View><TouchableOpacity onPress={() => handleUnblock(u.blocked_id, u.id, u.name)}><Text style={{ color: '#FBBF24', fontWeight: '700' }}>Unblock</Text></TouchableOpacity></View>
-            ))}
-            <TouchableOpacity style={styles.cancelBtn} onPress={() => setShowBlocked(false)}><Text style={styles.cancelText}>Close</Text></TouchableOpacity>
+      <Modal visible={showDeleteConfirm} transparent animationType="slide">
+        <View style={styles.modalBg}>
+          <View style={styles.modalCard}>
+            <Text style={styles.modalTitle}>Delete account?</Text>
+            <Text style={styles.muted}>This removes your profile. Type DELETE to confirm.</Text>
+            <TextInput style={styles.input} value={deleteText} onChangeText={setDeleteText} placeholder="DELETE" placeholderTextColor="#64748B" autoCapitalize="characters" />
+            <TouchableOpacity style={styles.deleteBtn} onPress={deleteAccount} disabled={deleting}>
+              <Text style={styles.deleteText}>{deleting ? 'Deleting...' : 'Delete my account'}</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.secondaryBtn} onPress={() => { setShowDeleteConfirm(false); setDeleteText(''); }}>
+              <Text style={styles.secondaryText}>Cancel</Text>
+            </TouchableOpacity>
           </View>
         </View>
       </Modal>
-
-      <Modal visible={showDeleteConfirm} transparent animationType="fade">
-        <View style={styles.modalOverlay}>
-          <View style={[styles.modalCard, { maxHeight: 380 }]}>
-            <Text style={styles.modalTitle}>Delete Account?</Text>
-            <Text style={{ color: '#CBD5E1', marginTop: 8, lineHeight: 20 }}>Type <Text style={{ fontWeight: '800', color: '#FFF' }}>DELETE</Text> to confirm. Your profile, photos, chats and dates will be permanently removed.</Text>
-            <TextInput style={[styles.input, { marginTop: 16 }]} value={deleteText} onChangeText={setDeleteText} placeholder="Type DELETE" placeholderTextColor="#64748B" autoCapitalize="characters" />
-            <TouchableOpacity style={[styles.deleteBtn, { marginTop: 16 }]} onPress={handleDeleteAccount} disabled={deleting}>{deleting ? <ActivityIndicator color="#FFF" /> : <Text style={styles.deleteBtnText}>Yes, Delete Forever</Text>}</TouchableOpacity>
-            <TouchableOpacity style={styles.cancelBtn} onPress={() => { setShowDeleteConfirm(false); setDeleteText(''); }}><Text style={styles.cancelText}>Cancel</Text></TouchableOpacity>
-          </View>
-        </View>
-      </Modal>
-    </View>
+    </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
-  center: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  scroll: { flex: 1, backgroundColor: '#0F172A' },
-  c: { backgroundColor: '#0F172A', padding: 20, alignItems: 'center', width: '100%', maxWidth: 480, alignSelf: 'center', paddingBottom: 40 },
-  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', width: '100%', marginBottom: 8 },
-  backBtn: { backgroundColor: '#1E293B', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 12, borderWidth: 1, borderColor: '#334155' },
-  backText: { color: '#FBBF24', fontWeight: '800', fontSize: 13 },
-  title: { color: '#F8FAFC', fontWeight: '900', letterSpacing: 3 },
-  settingsBtn: { backgroundColor: '#1E293B', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 12, borderWidth: 1, borderColor: '#334155' },
-  settingsText: { color: '#FBBF24', fontWeight: '800', fontSize: 13 },
-  section: { width: '100%', alignItems: 'center', marginBottom: 24 },
-  avatar: { width: 110, height: 110, borderRadius: 55, marginTop: 8, borderWidth: 3, borderColor: '#F97316' },
-  avatarPlaceholder: { backgroundColor: '#1E293B', justifyContent: 'center', alignItems: 'center' },
-  avatarPlaceholderText: { color: '#FBBF24', fontSize: 44, fontWeight: '800' },
-  name: { color: '#FFF', fontSize: 22, fontWeight: '800', marginTop: 12 },
-  intent: { color: '#FBBF24', marginTop: 4 },
-  meta: { color: '#94A3B8', marginTop: 4, fontSize: 13 },
-  completeBox: { width: '100%', backgroundColor: '#1E293B', borderRadius: 14, padding: 14, marginTop: 14 },
-  completeLabel: { color: '#FFF', fontWeight: '700', fontSize: 13 },
-  completePct: { color: '#FBBF24', fontWeight: '800' },
-  progressTrack: { height: 8, backgroundColor: '#0F172A', borderRadius: 4, marginTop: 8, overflow: 'hidden' },
-  progressFill: { height: 8, backgroundColor: '#F97316', borderRadius: 4 },
-  completeHint: { color: '#94A3B8', fontSize: 12, marginTop: 8 },
-  card: { width: '100%', backgroundColor: '#1E293B', borderRadius: 14, padding: 14, marginTop: 14 },
-  label: { color: '#94A3B8', fontSize: 10, fontWeight: '700' },
-  value: { color: '#FFF', marginTop: 4 },
-  miniBtn: { backgroundColor: '#1E293B', paddingVertical: 10, borderRadius: 12, alignItems: 'center', borderWidth: 1, borderColor: '#334155' },
-  miniBtnText: { color: '#FBBF24', fontWeight: '700', fontSize: 12 },
-  photoRow: { marginTop: 10, alignSelf: 'flex-start', maxWidth: '100%' },
-  photoWrap: { position: 'relative', marginRight: 10 },
-  photoThumb: { width: 72, height: 96, borderRadius: 12 },
-  mainBadge: { position: 'absolute', bottom: 4, left: 4, backgroundColor: '#F97316', color: '#FFF', fontSize: 9, fontWeight: '800', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 6, overflow: 'hidden' },
-  removePhoto: { position: 'absolute', top: -6, right: -6, backgroundColor: '#EF4444', width: 22, height: 22, borderRadius: 11, justifyContent: 'center', alignItems: 'center', zIndex: 2 },
-  uploadBtn: { backgroundColor: '#F97316', height: 48, borderRadius: 12, justifyContent: 'center', alignItems: 'center', marginTop: 12, width: '100%' },
-  uploadBtnText: { color: '#FFF', fontWeight: '800' },
-  uploadHint: { color: '#94A3B8', fontSize: 11, marginTop: 8, textAlign: 'center' },
-  logout: { backgroundColor: '#EF4444', paddingHorizontal: 24, paddingVertical: 12, borderRadius: 12, marginTop: 12, minWidth: 120, alignItems: 'center', justifyContent: 'center', width: '100%' },
-  modalOverlay: { flex: 1, backgroundColor: 'rgba(2,6,23,0.85)', justifyContent: 'center', alignItems: 'center', padding: 20 },
-  modalCard: { backgroundColor: '#1E293B', borderRadius: 24, padding: 20, width: '100%', maxWidth: 440, maxHeight: '88%', borderWidth: 1, borderColor: '#334155' },
-  modalTitle: { fontSize: 18, fontWeight: '800', color: '#F8FAFC' },
-  sectionTitle: { color: '#FBBF24', fontSize: 13, fontWeight: '800', textTransform: 'uppercase', letterSpacing: 1, marginBottom: 10, alignSelf: 'flex-start' },
-  inputLabel: { color: '#CBD5E1', fontSize: 12, fontWeight: '600', marginBottom: 6, marginTop: 8, alignSelf: 'flex-start' },
-  input: { backgroundColor: '#0F172A', borderRadius: 12, borderWidth: 1, borderColor: '#334155', color: '#F8FAFC', paddingHorizontal: 14, height: 48, width: '100%' },
-  row2: { flexDirection: 'row', width: '100%' },
-  intentWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, alignSelf: 'flex-start' },
-  intentChip: { backgroundColor: '#0F172A', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 16, borderWidth: 1, borderColor: '#334155' },
-  intentChipActive: { borderColor: '#F97316', backgroundColor: 'rgba(249,115,22,0.15)' },
-  intentChipText: { color: '#94A3B8', fontSize: 12, fontWeight: '600' },
-  intentChipTextActive: { color: '#FBBF24', fontWeight: '700' },
-  saveBtn: { backgroundColor: '#F97316', height: 48, borderRadius: 12, justifyContent: 'center', alignItems: 'center', marginTop: 16, width: '100%' },
-  saveBtnText: { color: '#FFF', fontWeight: '800' },
-  toggleRow: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#0F172A', padding: 14, borderRadius: 12, borderWidth: 1, borderColor: '#334155', marginBottom: 8, width: '100%' },
-  toggleLabel: { color: '#F8FAFC', fontSize: 14, fontWeight: '600' },
-  secondaryBtn: { backgroundColor: '#1E293B', height: 48, borderRadius: 12, justifyContent: 'center', alignItems: 'center', borderWidth: 1, borderColor: '#334155', marginTop: 10, width: '100%' },
-  secondaryBtnText: { color: '#FBBF24', fontWeight: '700' },
-  dangerBox: { backgroundColor: 'rgba(239,68,68,0.1)', borderWidth: 1, borderColor: '#EF4444', borderRadius: 14, padding: 14, width: '100%' },
-  dangerText: { color: '#FCA5A5', fontSize: 13, lineHeight: 18 },
-  deleteBtn: { backgroundColor: '#EF4444', height: 48, borderRadius: 12, justifyContent: 'center', alignItems: 'center', marginTop: 12, width: '100%' },
-  deleteBtnText: { color: '#FFF', fontWeight: '800' },
-  cancelBtn: { height: 44, justifyContent: 'center', alignItems: 'center', marginTop: 10 },
-  cancelText: { color: '#94A3B8', fontWeight: '600' },
+  container: { flex: 1, backgroundColor: '#0F172A' },
+  content: { padding: 16, paddingBottom: 40 },
+  loadingWrap: { flex: 1, backgroundColor: '#0F172A', justifyContent: 'center', alignItems: 'center' },
+  header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 },
+  backText: { color: '#FBBF24', fontWeight: '700' },
+  title: { color: '#F8FAFC', fontSize: 20, fontWeight: '800' },
+  logoutText: { color: '#F87171', fontWeight: '700' },
+  card: { backgroundColor: '#1E293B', borderRadius: 16, padding: 16, marginBottom: 16 },
+  sectionTitle: { color: '#F8FAFC', fontSize: 16, fontWeight: '800', marginBottom: 12 },
+  label: { color: '#CBD5E1', fontWeight: '700', marginTop: 12, marginBottom: 6 },
+  input: { backgroundColor: '#0F172A', color: '#F8FAFC', borderRadius: 12, paddingHorizontal: 12, paddingVertical: 12, borderWidth: 1, borderColor: '#334155' },
+  bioInput: { minHeight: 90, textAlignVertical: 'top' },
+  chipWrap: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  chip: { backgroundColor: '#0F172A', borderWidth: 1, borderColor: '#334155', borderRadius: 20, paddingHorizontal: 12, paddingVertical: 8 },
+  chipActive: { backgroundColor: '#F97316', borderColor: '#F97316' },
+  chipText: { color: '#CBD5E1', fontWeight: '700' },
+  chipTextActive: { color: '#fff' },
+  hint: { color: '#94A3B8', fontSize: 13, marginTop: 8 },
+  emailToggle: { color: '#FBBF24', fontWeight: '700', marginTop: 12 },
+  progressBg: { height: 8, backgroundColor: '#334155', borderRadius: 4, overflow: 'hidden' },
+  progressFill: { height: 8, backgroundColor: '#F97316' },
+  photoGrid: { flexDirection: 'row', flexWrap: 'wrap', gap: 8 },
+  photoBox: { width: 100, height: 130, borderRadius: 12, overflow: 'hidden', backgroundColor: '#0F172A' },
+  photo: { width: '100%', height: '100%' },
+  removeBtn: { position: 'absolute', top: 4, right: 4, backgroundColor: '#EF4444', width: 24, height: 24, borderRadius: 12, justifyContent: 'center', alignItems: 'center' },
+  removeText: { color: '#fff', fontWeight: '900' },
+  row: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', paddingVertical: 10 },
+  rowLabel: { color: '#F8FAFC', fontWeight: '700' },
+  muted: { color: '#94A3B8' },
+  unblockText: { color: '#FBBF24', fontWeight: '700' },
+  saveBtn: { backgroundColor: '#F97316', paddingVertical: 14, borderRadius: 12, alignItems: 'center', marginBottom: 12 },
+  saveText: { color: '#fff', fontWeight: '800' },
+  secondaryBtn: { backgroundColor: '#0F172A', borderWidth: 1, borderColor: '#334155', paddingVertical: 12, borderRadius: 12, alignItems: 'center', marginTop: 10 },
+  secondaryText: { color: '#FBBF24', fontWeight: '700' },
+  deleteBtn: { backgroundColor: '#7F1D1D', paddingVertical: 14, borderRadius: 12, alignItems: 'center', marginBottom: 12 },
+  deleteText: { color: '#FECACA', fontWeight: '800' },
+  modalBg: { flex: 1, backgroundColor: 'rgba(0,0,0,0.7)', justifyContent: 'flex-end' },
+  modalCard: { backgroundColor: '#1E293B', borderTopLeftRadius: 20, borderTopRightRadius: 20, padding: 20 },
+  modalTitle: { color: '#F8FAFC', fontSize: 18, fontWeight: '800', marginBottom: 8 },
 });
