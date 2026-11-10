@@ -6,13 +6,9 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import { useP2PCall } from '../hooks/useP2PCall';
 import CallOverlay from '../components/CallOverlay';
 
-const IS_WEB = Platform.OS === 'web';
 const FALLBACK_PHOTO = 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80';
 const getMessageText = (mm) => mm?.body ?? '';
 const isUuidLike = (v) => typeof v === 'string' && v.length > 20 && v.includes('-');
-
-// --- FIX: Call-log spam ---
-// 0-second calls are failed / cancelled attempts, not real calls. Never save / show them.
 const isCallLogText = (text = '') => /Call Ended|Missed.*call|Video Call|Voice Call/i.test(String(text));
 const parseCallSeconds = (text = '') => {
   const m = String(text).match(/\((\d+):(\d+)\)/) || String(text).match(/(\d+):(\d+)/);
@@ -58,14 +54,7 @@ const getWebParams = () => {
   } catch { return {}; }
 };
 const mapSpotRow = (row) => ({
-  id: String(row.id),
-  name: row.name,
-  address: row.address || 'Custom spot',
-  perk: row.perk || '✨ My pick',
-  vibe: 'Your Pick',
-  category: row.category || 'coffee',
-  rating: '—',
-  isCustom: true,
+  id: String(row.id), name: row.name, address: row.address || 'Custom spot', perk: row.perk || '✨ My pick', vibe: 'Your Pick', category: row.category || 'coffee', rating: '—', isCustom: true,
 });
 
 export default function ChatDetailScreen({ route, navigation }) {
@@ -137,7 +126,6 @@ export default function ChatDetailScreen({ route, navigation }) {
       const { data: msgs, error } = await supabase.from('messages').select('id, match_id, sender_id, body, created_at').eq('match_id', mid).order('created_at', { ascending: true }).limit(200);
       if (error) return;
       if (Array.isArray(msgs) && mountedRef.current) {
-        // FIX: drop 0-sec spam + collapse consecutive identical call logs
         const cleaned = [];
         msgs.forEach((mm) => {
           const text = getMessageText(mm);
@@ -163,18 +151,9 @@ export default function ChatDetailScreen({ route, navigation }) {
   const call = useP2PCall({
     matchId, userId, userIdRef, otherUserIdRef, ensureMatchId,
     onCallEnded: async (logText) => {
-      // FIX: never save / show a call that never connected
-      if (isZeroSecondCall(logText)) {
-        console.log('[ChatDetail] Ignored 0-sec call log:', logText);
-        return;
-      }
-      // FIX: don't double-add if same log is already last message
+      if (isZeroSecondCall(logText)) return;
       let isDup = false;
-      setMessages((prev) => {
-        const last = prev[prev.length - 1];
-        if (last?.isCallLog && last?.text === logText) isDup = true;
-        return prev;
-      });
+      setMessages((prev) => { const last = prev[prev.length - 1]; if (last?.isCallLog && last?.text === logText) isDup = true; return prev; });
       if (isDup) return;
       const mid = await ensureMatchId();
       if (mid && userIdRef.current) await persistMessage(logText);
@@ -284,17 +263,9 @@ export default function ChatDetailScreen({ route, navigation }) {
     Alert.alert('Report Received 🛡️', `Thank you. Your report against ${chat?.name || 'this user'} has been submitted.`);
   };
 
-  const resetCustomForm = () => {
-    setCustomName(''); setCustomAddress(''); setCustomPerk(''); setCustomCategory('coffee'); setEditingSpotId(null);
-  };
+  const resetCustomForm = () => { setCustomName(''); setCustomAddress(''); setCustomPerk(''); setCustomCategory('coffee'); setEditingSpotId(null); };
   const handleStartEditSpot = (spot) => {
-    setCustomName(spot?.name || '');
-    setCustomAddress(spot?.address || '');
-    setCustomPerk(String(spot?.perk || '').replace(/^✨\s*/, '').replace(/^🎁\s*/, ''));
-    setCustomCategory(spot?.category || 'coffee');
-    setEditingSpotId(spot?.id);
-    setShowCustomVenue(true);
-    setSelectedVibeCategory('all');
+    setCustomName(spot?.name || ''); setCustomAddress(spot?.address || ''); setCustomPerk(String(spot?.perk || '').replace(/^✨\s*/, '').replace(/^🎁\s*/, '')); setCustomCategory(spot?.category || 'coffee'); setEditingSpotId(spot?.id); setShowCustomVenue(true); setSelectedVibeCategory('all');
   };
   const handleSaveCustomSpot = async () => {
     if (!customName.trim()) { Alert.alert('Add a spot', 'Type the spot name first'); return; }
@@ -313,36 +284,23 @@ export default function ChatDetailScreen({ route, navigation }) {
         const { data, error } = await supabase.from('custom_spots').insert(payload).select().single();
         if (error) { Alert.alert('Could not save', error.message + '\n\nDid you run the SQL to create custom_spots table?'); return; }
         const newSpot = mapSpotRow(data);
-        setCustomSpots((prev) => [newSpot, ...prev]);
-        setSelectedVenue(newSpot);
-        setSelectedVibeCategory('all');
+        setCustomSpots((prev) => [newSpot, ...prev]); setSelectedVenue(newSpot); setSelectedVibeCategory('all');
       }
-      resetCustomForm();
-      setShowCustomVenue(false);
+      resetCustomForm(); setShowCustomVenue(false);
     } catch (e) { Alert.alert('Could not save', e?.message || 'Try again'); }
     finally { setSavingSpot(false); }
   };
-
   const handleDeleteCustomSpot = async (spot) => {
     if (!spot?.id) return;
     const uid = userIdRef.current;
-    const prevSpots = customSpots;
-    const prevSelected = selectedVenue;
+    const prevSpots = customSpots; const prevSelected = selectedVenue;
     setCustomSpots((prev) => prev.filter((s) => s.id !== spot.id));
     if (selectedVenue?.id === spot.id) setSelectedVenue(FALLBACK_VENUE);
     if (editingSpotId === spot.id) { resetCustomForm(); setShowCustomVenue(false); }
     try {
       const { error } = await supabase.from('custom_spots').delete().eq('id', spot.id).eq('user_id', uid);
-      if (error) {
-        setCustomSpots(prevSpots);
-        setSelectedVenue(prevSelected);
-        Alert.alert('Could not delete', error.message + '\n\nCheck RLS DELETE policy on custom_spots in Supabase.');
-      }
-    } catch (e) {
-      setCustomSpots(prevSpots);
-      setSelectedVenue(prevSelected);
-      Alert.alert('Could not delete', e?.message || 'Try again');
-    }
+      if (error) { setCustomSpots(prevSpots); setSelectedVenue(prevSelected); Alert.alert('Could not delete', error.message + '\n\nCheck RLS DELETE policy on custom_spots in Supabase.'); }
+    } catch (e) { setCustomSpots(prevSpots); setSelectedVenue(prevSelected); Alert.alert('Could not delete', e?.message || 'Try again'); }
   };
 
   const allVenues = [...customSpots, ...RECOMMENDED_DATE_SPOTS];
@@ -397,95 +355,105 @@ export default function ChatDetailScreen({ route, navigation }) {
 
       <CallOverlay call={call} chat={chat} avatarUri={avatarUri} />
 
-      <Modal visible={showDateModal} transparent animationType="slide">
-        <View style={styles.modalBg}><SafeAreaView style={styles.dateModalCard}>
-          <View style={styles.recommenderHeader}><View style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}><Ionicons name="location" size={20} color="#FBBF24" /><Text style={styles.modalTitle}>Date Venue & Vibe Recommender</Text></View><TouchableOpacity onPress={() => setShowShowDateModal(false)} style={{ padding: 4 }}><Ionicons name="close" size={20} color="#94A3B8" /></TouchableOpacity></View>
-          <Text style={styles.modalSub}>Pick a top-rated date spot and time to invite {chat?.name || 'them'}.</Text>
-          <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.vibeChipsRow}>
-            {['all', 'coffee', 'dining', 'art', 'parks'].map((c) => (<TouchableOpacity key={c} style={[styles.vibeChip, selectedVibeCategory === c && styles.vibeChipActive]} onPress={() => setSelectedVibeCategory(c)}><Text style={[styles.vibeChipText, selectedVibeCategory === c && styles.vibeChipTextActive]}>{c === 'all' ? '✨ All Vibes' : c === 'coffee' ? '☕ Coffee & Tea' : c === 'dining' ? '🍷 Fine Dining' : c === 'art' ? '🎨 Art Galleries' : '🌳 Parks & Walks'}</Text></TouchableOpacity>))}
-          </ScrollView>
-
-          <TouchableOpacity style={styles.addCustomBtn} onPress={() => { if (showCustomVenue) { resetCustomForm(); setShowCustomVenue(false); } else setShowCustomVenue(true); }}>
-            <Ionicons name="add-circle-outline" size={18} color="#FFF" />
-            <Text style={styles.addCustomBtnText}>{showCustomVenue ? 'Close Custom Spot' : '+ Add Custom Spot'}</Text>
-          </TouchableOpacity>
-
-          {showCustomVenue && (
-            <View style={styles.customForm}>
-              <Text style={styles.customFormTitle}>{editingSpotId ? 'Edit your spot' : 'Your own spot'}</Text>
-              <Text style={styles.fieldLabel}>Spot Name</Text>
-              <TextInput style={styles.customInput} placeholder="Spot name - e.g. Cape Coast Castle" placeholderTextColor="#64748B" value={customName} onChangeText={setCustomName} />
-              <Text style={styles.fieldLabel}>Town / Address</Text>
-              <TextInput style={styles.customInput} placeholder="Town - e.g. Cape Coast" placeholderTextColor="#64748B" value={customAddress} onChangeText={setCustomAddress} />
-              <Text style={styles.fieldLabel}>Why this spot?</Text>
-              <TextInput style={styles.customInput} placeholder="Why this spot? - e.g. Historical, quiet" placeholderTextColor="#64748B" value={customPerk} onChangeText={setCustomPerk} />
-              <Text style={styles.fieldLabel}>Vibe for this spot</Text>
-              <View style={styles.customVibeRow}>
-                {['coffee', 'dining', 'art', 'parks'].map((c) => (
-                  <TouchableOpacity key={c} style={[styles.vibeChip, customCategory === c && styles.vibeChipActive]} onPress={() => setCustomCategory(c)}>
-                    <Text style={[styles.vibeChipText, customCategory === c && styles.vibeChipTextActive]}>{c === 'coffee' ? '☕ Coffee' : c === 'dining' ? '🍷 Dining' : c === 'art' ? '🎨 Art' : '🌳 Parks'}</Text>
-                  </TouchableOpacity>
-                ))}
-              </View>
-              <View style={{ flexDirection: 'row', gap: 8 }}>
-                <TouchableOpacity style={[styles.useCustomBtn, { flex: 1, opacity: savingSpot ? 0.6 : 1 }]} onPress={handleSaveCustomSpot} disabled={savingSpot}>
-                  <Text style={styles.useCustomBtnText}>{savingSpot ? 'Saving...' : editingSpotId ? 'Save Changes' : 'Use This Spot'}</Text>
-                </TouchableOpacity>
-                {editingSpotId && (
-                  <TouchableOpacity style={[styles.cancelEditBtn, { flex: 1 }]} onPress={() => { resetCustomForm(); setShowCustomVenue(false); }}>
-                    <Text style={styles.cancelEditBtnText}>Cancel Edit</Text>
-                  </TouchableOpacity>
-                )}
-              </View>
-            </View>
-          )}
-
-          <ScrollView style={{ maxHeight: 220 }} showsVerticalScrollIndicator>
-            {customSpotsLoading && <Text style={{ color: '#94A3B8', fontSize: 12, textAlign: 'center', paddingVertical: 8 }}>Loading your spots...</Text>}
-            {filteredVenues.map((spot) => (
-              <View key={spot?.id} style={[styles.spotCard, selectedVenue?.id === spot?.id && styles.spotCardSelected]}>
-                <View style={{ flex: 1 }}>
-                  <Pressable onPress={() => setSelectedVenue(spot)}>
-                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
-                      <Text style={styles.spotName}>{spot?.name}</Text>
-                      <Text style={styles.spotRating}>⭐ {spot?.rating}</Text>
-                      {spot?.isCustom && <Text style={styles.customBadge}>YOUR PICK</Text>}
-                    </View>
-                    <Text style={styles.spotAddress}>📍 {spot?.address}</Text>
-                    <Text style={styles.spotPerk}>{spot?.perk}</Text>
-                  </Pressable>
-                  {spot?.isCustom && (
-                    <View style={styles.editDeleteRow}>
-                      <TouchableOpacity style={styles.editBtn} onPress={() => handleStartEditSpot(spot)} activeOpacity={0.7}>
-                        <Ionicons name="pencil-outline" size={13} color="#FBBF24" />
-                        <Text style={styles.editBtnText}>Edit</Text>
-                      </TouchableOpacity>
-                      <TouchableOpacity style={styles.deleteBtn} onPress={() => handleDeleteCustomSpot(spot)} activeOpacity={0.7}>
-                        <Ionicons name="trash-outline" size={13} color="#FFFFFF" />
-                        <Text style={styles.deleteBtnText}>Delete</Text>
-                      </TouchableOpacity>
-                    </View>
-                  )}
+      {/* DATE VENUE MODAL - CENTRE-JUSTIFIED */}
+      <Modal visible={showDateModal} transparent animationType="fade" onRequestClose={() => setShowShowDateModal(false)}>
+        <Pressable style={styles.centeredView} onPress={() => setShowShowDateModal(false)}>
+          <Pressable style={styles.dateModalCard} onPress={(e) => e.stopPropagation()}>
+            <ScrollView showsVerticalScrollIndicator={false} contentContainerStyle={styles.dateModalScroll}>
+              <View style={styles.recommenderHeader}>
+                <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flex: 1 }}>
+                  <Ionicons name="location" size={20} color="#FBBF24" />
+                  <Text style={styles.modalTitle}>Date Venue & Vibe Recommender</Text>
                 </View>
-                <TouchableOpacity style={styles.mapsBtn} onPress={() => openGoogleMaps(spot?.address)}><Ionicons name="navigate-outline" size={16} color="#FBBF24" /></TouchableOpacity>
+                <TouchableOpacity onPress={() => setShowShowDateModal(false)} style={{ padding: 4 }}><Ionicons name="close" size={20} color="#94A3B8" /></TouchableOpacity>
               </View>
-            ))}
-            {filteredVenues.length === 0 && !customSpotsLoading && <Text style={{ color: '#94A3B8', fontSize: 12, textAlign: 'center', paddingVertical: 12 }}>No spots for this vibe yet — add a custom one above.</Text>}
-          </ScrollView>
-          <Text style={[styles.fieldLabel, { marginTop: 12 }]}>Date & Time Suggestion</Text>
-          <TextInput style={styles.modalInput} value={dateTimeInput} onChangeText={setDateTimeInput} />
-          {selectedVenue?.isCustom && <Text style={{ color: '#FBBF24', fontSize: 12, marginTop: 6, fontWeight: '700' }}>Selected: {selectedVenue?.name} — your custom spot</Text>}
-          <View style={{ flexDirection: 'row', gap: 10, marginTop: 10 }}><TouchableOpacity style={styles.uberBtn} onPress={openUber}><Ionicons name="car-outline" size={18} color="#FFF" /><Text style={styles.uberBtnText}>Uber</Text></TouchableOpacity><TouchableOpacity style={styles.confirmDateBtn} onPress={handleProposeDate}><Text style={styles.confirmDateText}>Send Proposal</Text></TouchableOpacity></View>
-        </SafeAreaView></View>
+              <Text style={styles.modalSub}>Pick a top-rated date spot and time to invite {chat?.name || 'them'}.</Text>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.vibeChipsRow}>
+                {['all', 'coffee', 'dining', 'art', 'parks'].map((c) => (<TouchableOpacity key={c} style={[styles.vibeChip, selectedVibeCategory === c && styles.vibeChipActive]} onPress={() => setSelectedVibeCategory(c)}><Text style={[styles.vibeChipText, selectedVibeCategory === c && styles.vibeChipTextActive]}>{c === 'all' ? '✨ All Vibes' : c === 'coffee' ? '☕ Coffee & Tea' : c === 'dining' ? '🍷 Fine Dining' : c === 'art' ? '🎨 Art Galleries' : '🌳 Parks & Walks'}</Text></TouchableOpacity>))}
+              </ScrollView>
+              <TouchableOpacity style={styles.addCustomBtn} onPress={() => { if (showCustomVenue) { resetCustomForm(); setShowCustomVenue(false); } else setShowCustomVenue(true); }}>
+                <Ionicons name="add-circle-outline" size={18} color="#FFF" />
+                <Text style={styles.addCustomBtnText}>{showCustomVenue ? 'Close Custom Spot' : '+ Add Custom Spot'}</Text>
+              </TouchableOpacity>
+              {showCustomVenue && (
+                <View style={styles.customForm}>
+                  <Text style={styles.customFormTitle}>{editingSpotId ? 'Edit your spot' : 'Your own spot'}</Text>
+                  <Text style={styles.fieldLabel}>Spot Name</Text>
+                  <TextInput style={styles.customInput} placeholder="Spot name - e.g. Cape Coast Castle" placeholderTextColor="#64748B" value={customName} onChangeText={setCustomName} />
+                  <Text style={styles.fieldLabel}>Town / Address</Text>
+                  <TextInput style={styles.customInput} placeholder="Town - e.g. Cape Coast" placeholderTextColor="#64748B" value={customAddress} onChangeText={setCustomAddress} />
+                  <Text style={styles.fieldLabel}>Why this spot?</Text>
+                  <TextInput style={styles.customInput} placeholder="Why this spot? - e.g. Historical, quiet" placeholderTextColor="#64748B" value={customPerk} onChangeText={setCustomPerk} />
+                  <Text style={styles.fieldLabel}>Vibe for this spot</Text>
+                  <View style={styles.customVibeRow}>
+                    {['coffee', 'dining', 'art', 'parks'].map((c) => (
+                      <TouchableOpacity key={c} style={[styles.vibeChip, customCategory === c && styles.vibeChipActive]} onPress={() => setCustomCategory(c)}>
+                        <Text style={[styles.vibeChipText, customCategory === c && styles.vibeChipTextActive]}>{c === 'coffee' ? '☕ Coffee' : c === 'dining' ? '🍷 Dining' : c === 'art' ? '🎨 Art' : '🌳 Parks'}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                  <View style={{ flexDirection: 'row', gap: 8 }}>
+                    <TouchableOpacity style={[styles.useCustomBtn, { flex: 1, opacity: savingSpot ? 0.6 : 1 }]} onPress={handleSaveCustomSpot} disabled={savingSpot}>
+                      <Text style={styles.useCustomBtnText}>{savingSpot ? 'Saving...' : editingSpotId ? 'Save Changes' : 'Use This Spot'}</Text>
+                    </TouchableOpacity>
+                    {editingSpotId && (
+                      <TouchableOpacity style={[styles.cancelEditBtn, { flex: 1 }]} onPress={() => { resetCustomForm(); setShowCustomVenue(false); }}>
+                        <Text style={styles.cancelEditBtnText}>Cancel Edit</Text>
+                      </TouchableOpacity>
+                    )}
+                  </View>
+                </View>
+              )}
+              {customSpotsLoading && <Text style={{ color: '#94A3B8', fontSize: 12, textAlign: 'center', paddingVertical: 8 }}>Loading your spots...</Text>}
+              {filteredVenues.map((spot) => (
+                <View key={spot?.id} style={[styles.spotCard, selectedVenue?.id === spot?.id && styles.spotCardSelected]}>
+                  <View style={{ flex: 1 }}>
+                    <Pressable onPress={() => setSelectedVenue(spot)}>
+                      <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
+                        <Text style={styles.spotName}>{spot?.name}</Text>
+                        <Text style={styles.spotRating}>⭐ {spot?.rating}</Text>
+                        {spot?.isCustom && <Text style={styles.customBadge}>YOUR PICK</Text>}
+                      </View>
+                      <Text style={styles.spotAddress}>📍 {spot?.address}</Text>
+                      <Text style={styles.spotPerk}>{spot?.perk}</Text>
+                    </Pressable>
+                    {spot?.isCustom && (
+                      <View style={styles.editDeleteRow}>
+                        <TouchableOpacity style={styles.editBtn} onPress={() => handleStartEditSpot(spot)} activeOpacity={0.7}>
+                          <Ionicons name="pencil-outline" size={13} color="#FBBF24" />
+                          <Text style={styles.editBtnText}>Edit</Text>
+                        </TouchableOpacity>
+                        <TouchableOpacity style={styles.deleteBtn} onPress={() => handleDeleteCustomSpot(spot)} activeOpacity={0.7}>
+                          <Ionicons name="trash-outline" size={13} color="#FFFFFF" />
+                          <Text style={styles.deleteBtnText}>Delete</Text>
+                        </TouchableOpacity>
+                      </View>
+                    )}
+                  </View>
+                  <TouchableOpacity style={styles.mapsBtn} onPress={() => openGoogleMaps(spot?.address)}><Ionicons name="navigate-outline" size={16} color="#FBBF24" /></TouchableOpacity>
+                </View>
+              ))}
+              {filteredVenues.length === 0 && !customSpotsLoading && <Text style={{ color: '#94A3B8', fontSize: 12, textAlign: 'center', paddingVertical: 12 }}>No spots for this vibe yet — add a custom one above.</Text>}
+              <Text style={[styles.fieldLabel, { marginTop: 12 }]}>Date & Time Suggestion</Text>
+              <TextInput style={styles.modalInput} value={dateTimeInput} onChangeText={setDateTimeInput} />
+              {selectedVenue?.isCustom && <Text style={{ color: '#FBBF24', fontSize: 12, marginTop: 6, fontWeight: '700' }}>Selected: {selectedVenue?.name} — your custom spot</Text>}
+              <View style={{ flexDirection: 'row', gap: 10, marginTop: 12 }}><TouchableOpacity style={styles.uberBtn} onPress={openUber}><Ionicons name="car-outline" size={18} color="#FFF" /><Text style={styles.uberBtnText}>Uber</Text></TouchableOpacity><TouchableOpacity style={styles.confirmDateBtn} onPress={handleProposeDate}><Text style={styles.confirmDateText}>Send Proposal</Text></TouchableOpacity></View>
+            </ScrollView>
+          </Pressable>
+        </Pressable>
       </Modal>
-      <Modal visible={showReportModal} transparent animationType="fade">
-        <View style={styles.modalBg}><View style={styles.dateModalCard}>
-          <Text style={styles.modalTitle}>Report Member</Text><Text style={styles.modalSub}>Reports are strictly confidential and reviewed by the App Manager within 24 hours.</Text>
-          <Text style={styles.fieldLabel}>Reason for Report</Text>
-          {['Harassment or disrespectful behavior', 'Fake profile / Misrepresentation', 'Inappropriate messages', 'Spam / Commercial solicitation'].map((r) => (<TouchableOpacity key={r} style={[styles.vibeChip, reportReason === r && styles.vibeChipActive, { marginBottom: 6 }]} onPress={() => setReportReason(r)}><Text style={[styles.vibeChipText, reportReason === r && styles.vibeChipTextActive]}>{r}</Text></TouchableOpacity>))}
-          <TouchableOpacity style={[styles.confirmDateBtn, { backgroundColor: '#EF4444', marginTop: 12 }]} onPress={handleSubmitReport}><Text style={styles.confirmDateText}>Submit Report to Manager</Text></TouchableOpacity>
-          <TouchableOpacity style={styles.cancelBtn} onPress={() => setShowReportModal(false)}><Text style={styles.cancelText}>Cancel</Text></TouchableOpacity>
-        </View></View>
+
+      {/* REPORT MODAL - SAME CENTRE-JUSTIFIED PATTERN */}
+      <Modal visible={showReportModal} transparent animationType="fade" onRequestClose={() => setShowReportModal(false)}>
+        <Pressable style={styles.centeredView} onPress={() => setShowReportModal(false)}>
+          <Pressable style={styles.dateModalCard} onPress={(e) => e.stopPropagation()}>
+            <Text style={styles.modalTitle}>Report Member</Text><Text style={styles.modalSub}>Reports are strictly confidential and reviewed by the App Manager within 24 hours.</Text>
+            <Text style={styles.fieldLabel}>Reason for Report</Text>
+            {['Harassment or disrespectful behavior', 'Fake profile / Misrepresentation', 'Inappropriate messages', 'Spam / Commercial solicitation'].map((r) => (<TouchableOpacity key={r} style={[styles.vibeChip, reportReason === r && styles.vibeChipActive, { marginBottom: 6, alignSelf: 'flex-start' }]} onPress={() => setReportReason(r)}><Text style={[styles.vibeChipText, reportReason === r && styles.vibeChipTextActive]}>{r}</Text></TouchableOpacity>))}
+            <TouchableOpacity style={[styles.confirmDateBtn, { backgroundColor: '#EF4444', marginTop: 12 }]} onPress={handleSubmitReport}><Text style={styles.confirmDateText}>Submit Report to Manager</Text></TouchableOpacity>
+            <TouchableOpacity style={styles.cancelBtn} onPress={() => setShowReportModal(false)}><Text style={styles.cancelText}>Cancel</Text></TouchableOpacity>
+          </Pressable>
+        </Pressable>
       </Modal>
     </SafeAreaView>
   );
@@ -535,12 +503,14 @@ const styles = StyleSheet.create({
   input: { flex: 1, backgroundColor: '#1E293B', borderRadius: 20, paddingHorizontal: 16, paddingVertical: 10, color: '#F8FAFC', minHeight: 44, maxHeight: 100, fontSize: 14 },
   sendBtn: { width: 44, height: 44, borderRadius: 22, backgroundColor: '#F97316', justifyContent: 'center', alignItems: 'center', flexShrink: 0 },
   sendBtnDisabled: { opacity: 0.5 },
-  modalBg: { flex: 1, backgroundColor: 'rgba(2, 6, 23, 0.85)', justifyContent: 'center', padding: 20 },
-  dateModalCard: { backgroundColor: '#1E293B', borderRadius: 20, padding: 20, borderWidth: 1, borderColor: '#334155', maxHeight: '90%' },
+  // FIX: Centre-justify - outer Pressable centres, inner card is capped width
+  centeredView: { flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: 'rgba(2,6,23,0.85)', paddingHorizontal: 16, paddingVertical: 20 },
+  dateModalCard: { width: '100%', maxWidth: 480, alignSelf: 'center', backgroundColor: '#1E293B', borderRadius: 20, padding: 20, borderWidth: 1, borderColor: '#334155', maxHeight: '88%', shadowColor: '#000', shadowOffset: { width: 0, height: 10 }, shadowOpacity: 0.4, shadowRadius: 20, elevation: 10 },
+  dateModalScroll: { paddingBottom: 4 },
   recommenderHeader: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' },
-  modalTitle: { fontSize: 16, fontWeight: '800', color: '#F8FAFC' },
-  modalSub: { fontSize: 12, color: '#94A3B8', marginTop: 4, marginBottom: 12 },
-  vibeChipsRow: { gap: 8, marginBottom: 12 },
+  modalTitle: { fontSize: 16, fontWeight: '800', color: '#F8FAFC', flexShrink: 1 },
+  modalSub: { fontSize: 12, color: '#94A3B8', marginTop: 4, marginBottom: 12, textAlign: 'center' },
+  vibeChipsRow: { gap: 8, marginBottom: 12, justifyContent: 'center' },
   vibeChip: { backgroundColor: '#0F172A', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 14, borderWidth: 1, borderColor: '#334155' },
   vibeChipActive: { borderColor: '#F97316', backgroundColor: 'rgba(249, 115, 22, 0.2)' },
   vibeChipText: { color: '#94A3B8', fontSize: 12, fontWeight: '600' },
@@ -552,8 +522,8 @@ const styles = StyleSheet.create({
   spotAddress: { fontSize: 11, color: '#94A3B8', marginTop: 2 },
   spotPerk: { fontSize: 11, color: '#FBBF24', fontWeight: '700', marginTop: 2 },
   mapsBtn: { padding: 8, backgroundColor: '#1E293B', borderRadius: 10, borderWidth: 1, borderColor: '#334155' },
-  fieldLabel: { fontSize: 12, color: '#CBD5E1', marginBottom: 6, fontWeight: '600' },
-  modalInput: { backgroundColor: '#0F172A', height: 44, borderRadius: 10, paddingHorizontal: 14, color: '#F8FAFC', borderWidth: 1, borderColor: '#334155' },
+  fieldLabel: { fontSize: 12, color: '#CBD5E1', marginBottom: 6, fontWeight: '600', textAlign: 'center' },
+  modalInput: { backgroundColor: '#0F172A', height: 44, borderRadius: 10, paddingHorizontal: 14, color: '#F8FAFC', borderWidth: 1, borderColor: '#334155', textAlign: 'center' },
   uberBtn: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#000000', paddingHorizontal: 16, height: 48, borderRadius: 12, gap: 6, borderWidth: 1, borderColor: '#334155' },
   uberBtnText: { color: '#FFFFFF', fontWeight: '700', fontSize: 14 },
   confirmDateBtn: { flex: 1, backgroundColor: '#F97316', height: 48, borderRadius: 12, justifyContent: 'center', alignItems: 'center' },
@@ -563,13 +533,13 @@ const styles = StyleSheet.create({
   addCustomBtn: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 6, backgroundColor: '#F97316', paddingVertical: 11, borderRadius: 12, marginBottom: 10 },
   addCustomBtnText: { color: '#FFF', fontWeight: '700', fontSize: 14 },
   customForm: { backgroundColor: '#0F172A', borderWidth: 1, borderColor: '#F97316', borderRadius: 14, padding: 12, marginBottom: 12 },
-  customFormTitle: { color: '#F8FAFC', fontWeight: '800', fontSize: 14, marginBottom: 8 },
-  customInput: { backgroundColor: '#1E293B', height: 44, borderRadius: 10, paddingHorizontal: 12, color: '#F8FAFC', borderWidth: 1, borderColor: '#334155', marginBottom: 8, fontSize: 13 },
-  customVibeRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 10 },
+  customFormTitle: { color: '#F8FAFC', fontWeight: '800', fontSize: 14, marginBottom: 8, textAlign: 'center' },
+  customInput: { backgroundColor: '#1E293B', height: 44, borderRadius: 10, paddingHorizontal: 12, color: '#F8FAFC', borderWidth: 1, borderColor: '#334155', marginBottom: 8, fontSize: 13, textAlign: 'center' },
+  customVibeRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginBottom: 10, justifyContent: 'center' },
   useCustomBtn: { backgroundColor: '#F8FAFC', paddingVertical: 11, borderRadius: 10, alignItems: 'center' },
   useCustomBtnText: { color: '#0F172A', fontWeight: '800', fontSize: 14 },
   customBadge: { fontSize: 9, fontWeight: '800', color: '#0F172A', backgroundColor: '#FBBF24', paddingHorizontal: 6, paddingVertical: 2, borderRadius: 8, overflow: 'hidden' },
-  editDeleteRow: { flexDirection: 'row', gap: 12, marginTop: 8 },
+  editDeleteRow: { flexDirection: 'row', gap: 12, marginTop: 8, justifyContent: 'center' },
   editBtn: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: '#1E293B', paddingHorizontal: 10, paddingVertical: 5, borderRadius: 12, borderWidth: 1, borderColor: '#334155' },
   editBtnText: { color: '#FBBF24', fontSize: 12, fontWeight: '700' },
   deleteBtn: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: '#EF4444', paddingHorizontal: 12, paddingVertical: 6, borderRadius: 12 },
