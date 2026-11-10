@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
-import { View, Text, Image, TouchableOpacity, StyleSheet, SafeAreaView, FlatList, TextInput, Modal, ScrollView, Linking, Alert, ActivityIndicator, Platform, AppState, KeyboardAvoidingView, Pressable } from 'react-native';
+import { View, Text, Image, TouchableOpacity, StyleSheet, SafeAreaView, FlatList, TextInput, Modal, ScrollView, Linking, Alert, ActivityIndicator, Platform, KeyboardAvoidingView, Pressable } from 'react-native';
 import { Ionicons } from '@expo/vector-icons';
 import { supabase } from '../lib/supabase';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -10,6 +10,29 @@ const IS_WEB = Platform.OS === 'web';
 const FALLBACK_PHOTO = 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?w=400&auto=format&fit=crop&q=80';
 const getMessageText = (mm) => mm?.body ?? '';
 const isUuidLike = (v) => typeof v === 'string' && v.length > 20 && v.includes('-');
+
+// --- FIX: Call-log spam ---
+// 0-second calls are failed / cancelled attempts, not real calls. Never save / show them.
+const isCallLogText = (text = '') => /Call Ended|Missed.*call|Video Call|Voice Call/i.test(String(text));
+const parseCallSeconds = (text = '') => {
+  const m = String(text).match(/\((\d+):(\d+)\)/) || String(text).match(/(\d+):(\d+)/);
+  if (!m) return null;
+  return Number(m[1]) * 60 + Number(m[2]);
+};
+const isZeroSecondCall = (text = '') => {
+  const s = parseCallSeconds(text);
+  return s !== null && s <= 0;
+};
+const formatCallLog = (text = '') => {
+  const s = parseCallSeconds(text);
+  const label = /Video/i.test(text) ? '📹 Video call' : /Voice/i.test(text) ? '📞 Voice call' : '📞 Call';
+  if (/Missed/i.test(text)) return '📞 Missed call';
+  if (s === null) return text;
+  const mm = String(Math.floor(s / 60)).padStart(2, '0');
+  const ss = String(s % 60).padStart(2, '0');
+  return `${label} • ${mm}:${ss}`;
+};
+
 const ICEBREAKER_CARDS = ['☕ Suggest a 20-min coffee meetup', '🎨 Ask about their favorite weekend spot', '🎲 Play 2 Truths & 1 Lie', '🎵 What song is on repeat for you right now?'];
 const RECOMMENDED_DATE_SPOTS = [
   { id: 'v1', name: 'Devoción Coffee & Vinyl Lounge', vibe: 'Cozy & Casual', category: 'coffee', rating: '4.9', address: '69 Grand St, Williamsburg', perk: '🎁 15% off with Intent' },
@@ -113,7 +136,18 @@ export default function ChatDetailScreen({ route, navigation }) {
     try {
       const { data: msgs, error } = await supabase.from('messages').select('id, match_id, sender_id, body, created_at').eq('match_id', mid).order('created_at', { ascending: true }).limit(200);
       if (error) return;
-      if (Array.isArray(msgs) && mountedRef.current) setMessages(msgs.map(mm => ({ id: String(mm.id), text: getMessageText(mm), sender: mm.sender_id === uid ? 'me' : 'them', time: mm.created_at ? new Date(mm.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '', isProposal: String(getMessageText(mm)).startsWith('📍 PROPOSED DATE'), isCallLog: String(getMessageText(mm)).includes('Call Ended') })));
+      if (Array.isArray(msgs) && mountedRef.current) {
+        // FIX: drop 0-sec spam + collapse consecutive identical call logs
+        const cleaned = [];
+        msgs.forEach((mm) => {
+          const text = getMessageText(mm);
+          if (isZeroSecondCall(text)) return;
+          const prev = cleaned[cleaned.length - 1];
+          if (prev && isCallLogText(text) && isCallLogText(prev.text) && prev.text === text) return;
+          cleaned.push({ id: String(mm.id), text, sender: mm.sender_id === uid ? 'me' : 'them', time: mm.created_at ? new Date(mm.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '', isProposal: String(text).startsWith('📍 PROPOSED DATE'), isCallLog: isCallLogText(text) });
+        });
+        setMessages(cleaned);
+      }
     } catch {}
   }, [ensureMatchId]);
 
@@ -129,9 +163,22 @@ export default function ChatDetailScreen({ route, navigation }) {
   const call = useP2PCall({
     matchId, userId, userIdRef, otherUserIdRef, ensureMatchId,
     onCallEnded: async (logText) => {
+      // FIX: never save / show a call that never connected
+      if (isZeroSecondCall(logText)) {
+        console.log('[ChatDetail] Ignored 0-sec call log:', logText);
+        return;
+      }
+      // FIX: don't double-add if same log is already last message
+      let isDup = false;
+      setMessages((prev) => {
+        const last = prev[prev.length - 1];
+        if (last?.isCallLog && last?.text === logText) isDup = true;
+        return prev;
+      });
+      if (isDup) return;
       const mid = await ensureMatchId();
       if (mid && userIdRef.current) await persistMessage(logText);
-      setMessages(prev => [...prev, { id: Date.now().toString(), text: logText, sender: 'me', isCallLog: true, time: 'Just now' }]);
+      setMessages((prev) => [...prev, { id: Date.now().toString(), text: logText, sender: 'me', isCallLog: true, time: 'Just now' }]);
     },
   });
 
@@ -171,7 +218,7 @@ export default function ChatDetailScreen({ route, navigation }) {
       }
       if (resolvedOtherId && isUuidLike(String(resolvedOtherId))) {
         const { data: p } = await supabase.from('profiles').select('id, name, bio, intent, location, photos').eq('id', resolvedOtherId).maybeSingle();
-        if (p) setChat(prev => ({ ...prev, name: p.name || prev.name, intent: p.intent || prev.intent, location: p.location || prev.location, avatar: (Array.isArray(p.photos) && p.photos[0]) || prev.avatar || FALLBACK_PHOTO }));
+        if (p) setChat((prev) => ({ ...prev, name: p.name || prev.name, intent: p.intent || prev.intent, location: p.location || prev.location, avatar: (Array.isArray(p.photos) && p.photos[0]) || prev.avatar || FALLBACK_PHOTO }));
       }
       if (resolvedMatchId) await refetchMessages(); else setMessages([]);
     } catch (e) { console.log('[ChatDetail] load error', e?.message); }
@@ -191,14 +238,14 @@ export default function ChatDetailScreen({ route, navigation }) {
     if (!inputText.trim() || sending) return;
     const text = inputText.trim(); setInputText('');
     const optimisticId = `local-${Date.now()}`;
-    setMessages(prev => [...prev, { id: optimisticId, text, sender: 'me', time: 'Just now' }]);
+    setMessages((prev) => [...prev, { id: optimisticId, text, sender: 'me', time: 'Just now' }]);
     setSending(true);
-    try { const ok = await persistMessage(text); if (!ok) setMessages(prev => prev.filter(x => x.id !== optimisticId)); } finally { setSending(false); }
+    try { const ok = await persistMessage(text); if (!ok) setMessages((prev) => prev.filter((x) => x.id !== optimisticId)); } finally { setSending(false); }
   };
   const handleSendIcebreaker = async (t) => {
     const optimisticId = `local-${Date.now()}`;
-    setMessages(prev => [...prev, { id: optimisticId, text: t, sender: 'me', time: 'Just now' }]);
-    const ok = await persistMessage(t); if (!ok) setMessages(prev => prev.filter(x => x.id !== optimisticId));
+    setMessages((prev) => [...prev, { id: optimisticId, text: t, sender: 'me', time: 'Just now' }]);
+    const ok = await persistMessage(t); if (!ok) setMessages((prev) => prev.filter((x) => x.id !== optimisticId));
   };
   const persistDateProposal = async ({ venueName, venueAddr, dateTimeInput }) => {
     const mid = matchIdRef.current || await ensureMatchId(); const uid = userIdRef.current; const other = otherUserIdRef.current;
@@ -224,8 +271,8 @@ export default function ChatDetailScreen({ route, navigation }) {
     const res = await persistDateProposal({ venueName, venueAddr, dateTimeInput });
     if (!res.ok) { Alert.alert('Date not saved', res.error); return; }
     const optimisticId = `local-${Date.now()}`;
-    setMessages(prev => [...prev, { id: optimisticId, text, sender: 'me', isProposal: true, time: 'Just now' }]);
-    const ok = await persistMessage(text); if (!ok) setMessages(prev => prev.filter(x => x.id !== optimisticId));
+    setMessages((prev) => [...prev, { id: optimisticId, text, sender: 'me', isProposal: true, time: 'Just now' }]);
+    const ok = await persistMessage(text); if (!ok) setMessages((prev) => prev.filter((x) => x.id !== optimisticId));
     else Alert.alert('Date Proposed 📍', `${venueName} — ${dateTimeInput}`);
   };
   const handleSubmitReport = async () => {
@@ -254,25 +301,19 @@ export default function ChatDetailScreen({ route, navigation }) {
     const uid = userIdRef.current;
     if (!uid) { Alert.alert('Not signed in', 'Please log in again'); return; }
     setSavingSpot(true);
-    const payload = {
-      user_id: uid,
-      name: customName.trim(),
-      address: customAddress.trim() || 'Custom spot',
-      perk: customPerk.trim() || '✨ My pick',
-      category: customCategory,
-    };
+    const payload = { user_id: uid, name: customName.trim(), address: customAddress.trim() || 'Custom spot', perk: customPerk.trim() || '✨ My pick', category: customCategory };
     try {
       if (editingSpotId) {
         const { data, error } = await supabase.from('custom_spots').update(payload).eq('id', editingSpotId).eq('user_id', uid).select().single();
         if (error) { Alert.alert('Could not update', error.message); return; }
         const updated = mapSpotRow(data);
-        setCustomSpots(prev => prev.map(s => s.id === editingSpotId ? updated : s));
+        setCustomSpots((prev) => prev.map((s) => s.id === editingSpotId ? updated : s));
         if (selectedVenue?.id === editingSpotId) setSelectedVenue(updated);
       } else {
         const { data, error } = await supabase.from('custom_spots').insert(payload).select().single();
         if (error) { Alert.alert('Could not save', error.message + '\n\nDid you run the SQL to create custom_spots table?'); return; }
         const newSpot = mapSpotRow(data);
-        setCustomSpots(prev => [newSpot, ...prev]);
+        setCustomSpots((prev) => [newSpot, ...prev]);
         setSelectedVenue(newSpot);
         setSelectedVibeCategory('all');
       }
@@ -282,20 +323,17 @@ export default function ChatDetailScreen({ route, navigation }) {
     finally { setSavingSpot(false); }
   };
 
-  // FIXED: No deletingSpotId, no Alert confirm that blocks on web. Direct delete, always enabled.
   const handleDeleteCustomSpot = async (spot) => {
     if (!spot?.id) return;
     const uid = userIdRef.current;
-    // Remove from UI instantly so it never looks stuck/greyed
     const prevSpots = customSpots;
     const prevSelected = selectedVenue;
-    setCustomSpots(prev => prev.filter(s => s.id !== spot.id));
+    setCustomSpots((prev) => prev.filter((s) => s.id !== spot.id));
     if (selectedVenue?.id === spot.id) setSelectedVenue(FALLBACK_VENUE);
     if (editingSpotId === spot.id) { resetCustomForm(); setShowCustomVenue(false); }
     try {
       const { error } = await supabase.from('custom_spots').delete().eq('id', spot.id).eq('user_id', uid);
       if (error) {
-        // Put it back if Supabase failed, and show real reason
         setCustomSpots(prevSpots);
         setSelectedVenue(prevSelected);
         Alert.alert('Could not delete', error.message + '\n\nCheck RLS DELETE policy on custom_spots in Supabase.');
@@ -308,7 +346,7 @@ export default function ChatDetailScreen({ route, navigation }) {
   };
 
   const allVenues = [...customSpots, ...RECOMMENDED_DATE_SPOTS];
-  const filteredVenues = allVenues.filter(v => selectedVibeCategory === 'all' || v?.category === selectedVibeCategory);
+  const filteredVenues = allVenues.filter((v) => selectedVibeCategory === 'all' || v?.category === selectedVibeCategory);
   const avatarUri = chat?.avatar || FALLBACK_PHOTO;
   const avatarInitial = String(chat?.name || 'I').trim().charAt(0).toUpperCase();
 
@@ -332,7 +370,7 @@ export default function ChatDetailScreen({ route, navigation }) {
         onContentSizeChange={() => listRef.current?.scrollToEnd?.({ animated: true })}
         renderItem={({ item }) => {
           const isMe = item?.sender === 'me';
-          if (item?.isCallLog) return (<View style={styles.callLogCard}><Ionicons name="call" size={16} color="#FBBF24" /><Text style={styles.callLogText}>{item?.text || ''}</Text></View>);
+          if (item?.isCallLog) return (<View style={styles.callLogCard}><Ionicons name="call" size={16} color="#FBBF24" /><Text style={styles.callLogText}>{formatCallLog(item?.text || '')}</Text></View>);
           return (<View style={[styles.msgBubble, isMe ? styles.myMsg : styles.theirMsg, item?.isProposal && styles.proposalMsg]}><Text style={[styles.msgText, isMe ? styles.myMsgText : styles.theirMsgText]}>{item?.text || ''}</Text><Text style={styles.timeText}>{item?.time || ''}</Text></View>);
         }} />
       <View style={[styles.icebreakerBar, { paddingBottom: Math.max(8, insets.bottom / 2) }]}>
