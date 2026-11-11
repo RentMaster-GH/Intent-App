@@ -63,7 +63,7 @@
       "expo-location",
       "expo-notifications",
       "expo-image-picker",
-      "expo-audio"
+      "expo-audio",
     ],
     "extra": {
       "eas": {
