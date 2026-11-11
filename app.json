@@ -70,6 +70,9 @@
         "projectId": "b7b52a59-419f-4e56-b8df-cc92d685bdb7"
       }
     },
-    "owner": "intent-app-production"
+    "owner": "intent-app-production",
+    "cli": {
+      "appVersionSource": "local"
+    }
   }
 }
