@@ -60,10 +60,12 @@
     },
     "plugins": [
       "./plugins/with-gradle-dist.js",
+      "./plugins/with-livekit-proguard.js",
+      "expo-router",
       "expo-location",
       "expo-notifications",
       "expo-image-picker",
-      "expo-audio",
+      "expo-audio"
     ],
     "extra": {
       "eas": {
