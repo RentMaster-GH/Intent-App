@@ -23,14 +23,11 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Install dependencies
-        run: npm install
+        run: npm install --legacy-peer-deps
 
       - name: Prebuild Android
-        run: npx expo prebuild --platform android --clean
+        run: npx expo prebuild --platform android --clean --non-interactive
 
       - name: Build APK
         run: |
