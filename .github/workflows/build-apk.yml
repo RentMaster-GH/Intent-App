@@ -21,7 +21,7 @@ jobs:
         uses: actions/setup-java@v5
         with:
           distribution: temurin
-          java-version: 17
+          java-version: '17'
 
       - name: Install dependencies
         run: npm install --legacy-peer-deps
@@ -29,24 +29,7 @@ jobs:
       - name: Prebuild Android
         run: npx expo prebuild --platform android --clean --non-interactive
 
-      - name: Optimize APK Size (arm64-only + R8 Minify)
-        run: |
-          sed -i 's/^reactNativeArchitectures=.*/reactNativeArchitectures=arm64-v8a/' android/gradle.properties
-          grep -q '^reactNativeArchitectures=' android/gradle.properties || echo "reactNativeArchitectures=arm64-v8a" >> android/gradle.properties
-          sed -i 's/^android.enableMinifyInReleaseBuilds=.*/android.enableMinifyInReleaseBuilds=true/' android/gradle.properties
-          grep -q '^android.enableMinifyInReleaseBuilds=' android/gradle.properties || echo "android.enableMinifyInReleaseBuilds=true" >> android/gradle.properties
-          sed -i 's/^android.enableShrinkResourcesInReleaseBuilds=.*/android.enableShrinkResourcesInReleaseBuilds=true/' android/gradle.properties
-          grep -q '^android.enableShrinkResourcesInReleaseBuilds=' android/gradle.properties || echo "android.enableShrinkResourcesInReleaseBuilds=true" >> android/gradle.properties
-
-      - name: Test JS Bundle
-        env:
-          NODE_OPTIONS: --max-old-space-size=8192
-          EXPO_PUBLIC_SUPABASE_URL: https://supabase.co
-          EXPO_PUBLIC_SUPABASE_ANON_KEY: placeholder-key
-          CI: true
-        run: npx expo export --platform android --output-dir /tmp/test-export
-
-      - name: Build APK
+      - name: Build Optimized APK
         env:
           NODE_OPTIONS: --max-old-space-size=8192
           EXPO_PUBLIC_SUPABASE_URL: https://supabase.co
@@ -54,7 +37,10 @@ jobs:
           CI: true
         run: |
           cd android
-          ./gradlew assembleRelease --no-daemon
+          ./gradlew assembleRelease --no-daemon \
+            -PreactNativeArchitectures=arm64-v8a \
+            -Pandroid.enableMinifyInReleaseBuilds=true \
+            -Pandroid.enableShrinkResourcesInReleaseBuilds=true
 
       - name: Rename APK
         run: |
