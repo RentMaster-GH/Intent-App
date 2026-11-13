@@ -29,7 +29,35 @@ jobs:
       - name: Prebuild Android
         run: npx expo prebuild --platform android --clean --non-interactive
 
-      - name: Build Optimized APK
+      - name: Decode Keystore and Configure Release Signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 --decode > android/app/intent-release.keystore
+          node -e '
+            const fs = require("fs");
+            const props = [
+              "storeFile=intent-release.keystore",
+              `storePassword=${process.env.STORE_PASSWORD}`,
+              `keyAlias=${process.env.KEY_ALIAS}`,
+              `keyPassword=${process.env.KEY_PASSWORD}`
+            ].join("\n") + "\n";
+            fs.writeFileSync("android/keystore.properties", props);
+
+            let gradle = fs.readFileSync("android/app/build.gradle", "utf8");
+            const propsHeader = `def keystorePropertiesFile = rootProject.file("keystore.properties")\ndef keystoreProperties = new Properties()\nif (keystorePropertiesFile.exists()) {\n    keystoreProperties.load(new FileInputStream(keystorePropertiesFile))\n}\n\nandroid {`;
+            gradle = gradle.replace("android {", propsHeader);
+
+            const releaseSigning = `signingConfigs {\n        debug {\n            storeFile file(\x27debug.keystore\x27)\n            storePassword \x27android\x27\n            keyAlias \x27androiddebugkey\x27\n            keyPassword \x27android\x27\n        }\n        release {\n            if (keystorePropertiesFile.exists()) {\n                storeFile file(keystoreProperties[\x27storeFile\x27])\n                storePassword keystoreProperties[\x27storePassword\x27]\n                keyAlias keystoreProperties[\x27keyAlias\x27]\n                keyPassword keystoreProperties[\x27keyPassword\x27]\n            }\n        }`;
+            gradle = gradle.replace(/signingConfigs\s*\{[\s\S]*?keyPassword\s*[\x27"]android[\x27"]\s*\}/, releaseSigning);
+            gradle = gradle.replace(/(release\s*\{[\s\S]*?)signingConfig\s+signingConfigs\.debug/, "$1signingConfig signingConfigs.release");
+            fs.writeFileSync("android/app/build.gradle", gradle);
+          '
+
+      - name: Build Optimized Signed APK
         env:
           NODE_OPTIONS: --max-old-space-size=8192
           EXPO_PUBLIC_SUPABASE_URL: https://supabase.co
@@ -41,6 +69,10 @@ jobs:
             -PreactNativeArchitectures=arm64-v8a \
             -Pandroid.enableMinifyInReleaseBuilds=true \
             -Pandroid.enableShrinkResourcesInReleaseBuilds=true
+
+      - name: Verify APK Signature
+        run: |
+          $ANDROID_HOME/build-tools/$(ls $ANDROID_HOME/build-tools | tail -n 1)/apksigner verify --print-certs android/app/build/outputs/apk/release/app-release.apk
 
       - name: Rename APK
         run: |
