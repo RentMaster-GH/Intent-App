@@ -94,7 +94,14 @@ export default function DiscoveryScreen({ navigation, route }) {
   }, [isDemo]);
 
   useEffect(() => { loadPeople(); }, [loadPeople]);
-  const onRefresh = useCallback(() => { setRefreshing(true); setIndex(0); loadPeople(); }, [loadPeople]);
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    setIndex(0);
+    await loadPeople();
+    if (Platform.OS === 'web' && typeof window !== 'undefined') {
+      try { window.alert('Discovery feed refreshed!'); } catch {}
+    }
+  }, [loadPeople]);
 
   const filtered = useMemo(() => people.filter((p) => {
     if (cityFilter !== 'All' && p.city !== cityFilter) return false;
@@ -145,7 +152,9 @@ export default function DiscoveryScreen({ navigation, route }) {
     try {
       if (Platform.OS === 'web' && typeof navigator !== 'undefined' && navigator.share) { await navigator.share({ title: 'Intent', text: message, url: INTENT_WEB_URL }); return; }
       if (Platform.OS === 'web' && typeof navigator !== 'undefined' && navigator.clipboard) { await navigator.clipboard.writeText(INTENT_WEB_URL); Alert.alert('Link copied', 'Share it with a friend — they will appear here when they join.'); return; }
-      await Share.share({ message });
+      await (Platform.OS === 'web' && typeof navigator !== 'undefined' && navigator.clipboard
+      ? navigator.clipboard.writeText('https://vercel.app').then(() => window.alert('Invite link copied to clipboard: https://vercel.app'))
+      : Share.share({ message }));
     } catch (e) {}
   };
 
