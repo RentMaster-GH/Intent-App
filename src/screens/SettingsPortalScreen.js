@@ -11,6 +11,7 @@ import {
   ActivityIndicator,
   TextInput,
 } from 'react-native';
+import { Ionicons } from '@expo/vector-icons';
 import { supabase } from '../lib/supabase';
 
 // Never render a full email. v***@gmail.com only.
@@ -299,12 +300,12 @@ export default function SettingsPortalScreen({ navigation }) {
             </View>
             <Text style={styles.rowArrow}>›</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.row} onPress={() => navigation.navigate('ManagerPortal')}>
-            <View style={styles.rowLeft}>
-              <Ionicons name="shield-checkmark-outline" size={20} color="#FBBF24" />
-              <Text style={styles.rowText}>App Manager Verification Portal</Text>
+          <TouchableOpacity style={[styles.rowItem, { borderTopWidth: 1, borderTopColor: '#334155', borderBottomWidth: 0 }]} onPress={() => navigation.navigate('ManagerPortal')}>
+            <View style={{ flex: 1 }}>
+              <Text style={[styles.rowLabel, { color: '#FBBF24' }]}>App Manager Verification Portal</Text>
+              <Text style={styles.rowSub}>Review member photos & assign Verified Intent badges</Text>
             </View>
-            <Ionicons name="chevron-forward" size={18} color="#64748B" />
+            <Text style={styles.rowArrow}>›</Text>
           </TouchableOpacity>
         </View>
 
