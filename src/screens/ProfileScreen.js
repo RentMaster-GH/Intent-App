@@ -104,7 +104,7 @@ export default function ProfileScreen({ navigation, route, session }) {
       let profile = null;
       const { data: full, error: fullError } = await withTimeout(
         supabase.from('profiles')
-          .select('name, bio, intent, location, age, photos, notifications, show_on_discovery')
+          .select('*')
           .eq('id', user.id)
           .maybeSingle(),
         8000
@@ -112,7 +112,7 @@ export default function ProfileScreen({ navigation, route, session }) {
       if (fullError) {
         const { data: core, error: coreError } = await withTimeout(
           supabase.from('profiles')
-            .select('name, bio, intent, location, age, photos')
+            .select('*')
             .eq('id', user.id)
             .maybeSingle(),
           8000
@@ -124,10 +124,10 @@ export default function ProfileScreen({ navigation, route, session }) {
       }
 
       if (profile && mountedRef.current) {
-        setName(profile.name || '');
+        setName(profile.name || profile.full_name || '');
         setBio(profile.bio || '');
         if (profile.intent) setIntent(profile.intent);
-        setLocation(profile.location || '');
+        setLocation(profile.location || [profile.city, profile.country].filter(Boolean).join(', ') || '');
         setAge(profile.age ? String(profile.age) : '');
         setPhotos(Array.isArray(profile.photos) ? profile.photos.filter(Boolean) : []);
         if (typeof profile.notifications === 'boolean') setNotifications(profile.notifications);
@@ -190,13 +190,18 @@ export default function ProfileScreen({ navigation, route, session }) {
     }
     setSaving(true);
     try {
+      const locParts = location.split(',').map((x) => x.trim()).filter(Boolean);
       const payload = {
         name: name.trim(),
+        full_name: name.trim(),
         bio: bio.trim(),
         intent,
         location: location.trim(),
+        city: locParts.at(0) || '',
+        country: locParts.at(1) || '',
         age: age ? parseInt(age, 10) : null,
         photos,
+        avatar_url: photos.at(0) || '',
       };
       const { error } = await withTimeout(
         supabase.from('profiles').update(payload).eq('id', userId),
@@ -204,6 +209,7 @@ export default function ProfileScreen({ navigation, route, session }) {
       );
       if (error) throw error;
       Alert.alert('Saved', 'Your profile has been updated.');
+      if (typeof window !== 'undefined' && window.alert) { try { window.alert('Your profile has been updated.'); } catch {} }
     } catch (e) {
       Alert.alert('Could not save profile', e.message || 'Check connection and try again.');
     }
