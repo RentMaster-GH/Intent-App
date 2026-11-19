@@ -75,7 +75,8 @@ const pathToRoute = (pathname) => {
   if (p === '/dates') return { name: 'Dates', params: {} };
   if (p === '/profile') return { name: 'Profile', params: {} };
   if (p === '/settings') return { name: 'SettingsPortal', params: {} };
-  if (p === '/support') return { name: 'CustomerSupport', 'ManagerPortal', params: {} };
+  if (p === '/support') return { name: 'CustomerSupport', params: {} };
+  if (p === '/manager') return { name: 'ManagerPortal', params: {} };
   return null;
 };
 
