@@ -16,7 +16,6 @@ import { Ionicons } from '@expo/vector-icons';
 import { getAgeCategory } from '../utils/ageGroups';
 import { supabase } from '../lib/supabase';
 import { COUNTRY_CITIES, COUNTRY_LIST } from '../data/locations';
-import { Picker } from '@react-native-picker/picker';
 
 const FRESH_SIGNUP_KEY = 'intent_fresh_signup';
 const GENDER_OPTIONS = ['Woman', 'Man', 'Non-Binary'];
