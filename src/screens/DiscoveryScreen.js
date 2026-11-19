@@ -13,10 +13,26 @@ const INTENT_FILTERS = ['All Intents', 'Long-term Relationship 💛', 'Marriage 
 const INTENT_WEB_URL = 'https://intent-app-zeta.vercel.app';
 
 const normalizeProfile = (p) => {
-  const photos = (Array.isArray(p.photos) ? p.photos.filter(Boolean) : []).slice(0, 6);
-  const location = p.location || '';
-  const city = location.split(',')[0]?.trim() || null;
-  return { id: p.id, name: p.name || null, age: p.age ?? null, city, location: location || null, intent: p.intent || null, bio: p.bio || '', img: photos[0] || null, photos, isDemo: false };
+  const rawPhotos = Array.isArray(p.photos) ? p.photos.filter(Boolean) : [];
+  if (!rawPhotos.length && p.avatar_url) rawPhotos.push(p.avatar_url);
+  if (!rawPhotos.length) rawPhotos.push('https://unsplash.com');
+  const photos = rawPhotos.slice(0, 6);
+  const location = p.location || [p.city, p.country].filter(Boolean).join(', ') || '';
+  const city = p.city || location.split(',').at(0)?.trim() || null;
+  const resolvedName = p.name || p.full_name || p.email?.split('@').at(0) || 'Intent Member';
+  return {
+    id: p.id,
+    name: resolvedName,
+    age: p.age ?? null,
+    city,
+    location: location || null,
+    intent: p.intent || null,
+    bio: p.bio || '',
+    verified: Boolean(p.verified),
+    img: photos.at(0) || null,
+    photos,
+    isDemo: false,
+  };
 };
 
 export default function DiscoveryScreen({ navigation, route }) {
