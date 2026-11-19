@@ -1,3 +1,4 @@
+import ManagerPortalScreen from './src/screens/ManagerPortalScreen';
 import 'react-native-gesture-handler';
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { View, StyleSheet, ActivityIndicator, Text, TouchableOpacity, Platform } from 'react-native';
@@ -28,8 +29,8 @@ const UpdateChecker = typeof UpdateCheckerRaw === 'function'
 const FRESH_SIGNUP_KEY = 'intent_fresh_signup';
 
 const ROUTE_ALIASES = {
-  Support: 'CustomerSupport',
-  CustomerSupportPortal: 'CustomerSupport',
+  Support: 'CustomerSupport', 'ManagerPortal',
+  CustomerSupportPortal: 'CustomerSupport', 'ManagerPortal',
   Chats: 'ActiveChats',
   ActiveChatsScreen: 'ActiveChats',
   Deck: 'Discovery',
@@ -57,9 +58,10 @@ const ROUTE_TO_PATH = {
   Profile: '/profile',
   SettingsPortal: '/settings',
   CustomerSupport: '/support',
+  ManagerPortal: '/manager',
 };
 
-const PROTECTED_ROUTES = ['Discovery', 'ActiveChats', 'ChatDetail', 'Dates', 'Profile', 'SettingsPortal', 'CustomerSupport'];
+const PROTECTED_ROUTES = ['Discovery', 'ActiveChats', 'ChatDetail', 'Dates', 'Profile', 'SettingsPortal', 'CustomerSupport', 'ManagerPortal'];
 const AUTH_REQUIRED_ROUTES = [...PROTECTED_ROUTES, 'SignupOnboarding'];
 
 const pathToRoute = (pathname) => {
@@ -73,7 +75,7 @@ const pathToRoute = (pathname) => {
   if (p === '/dates') return { name: 'Dates', params: {} };
   if (p === '/profile') return { name: 'Profile', params: {} };
   if (p === '/settings') return { name: 'SettingsPortal', params: {} };
-  if (p === '/support') return { name: 'CustomerSupport', params: {} };
+  if (p === '/support') return { name: 'CustomerSupport', 'ManagerPortal', params: {} };
   return null;
 };
 
@@ -482,7 +484,8 @@ export default function App() {
               {currentRoute === 'Dates' && <DatesScreen {...screenProps} session={session} />}
               {currentRoute === 'Profile' && <ProfileScreen {...screenProps} session={session} />}
               {currentRoute === 'SettingsPortal' && <SettingsPortalScreen {...screenProps} session={session} />}
-              {currentRoute === 'CustomerSupport' && <CustomerSupportScreen {...screenProps} session={session} />}
+              {currentRoute === 'ManagerPortal' && <ManagerPortalScreen navigation={navigation} route={{ params: routeParams }} />}
+        {currentRoute === 'CustomerSupport', 'ManagerPortal' && <CustomerSupportScreen {...screenProps} session={session} />}
             </View>
           </View>
         </ErrorBoundary>
