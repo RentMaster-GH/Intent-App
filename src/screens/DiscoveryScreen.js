@@ -61,12 +61,12 @@ export default function DiscoveryScreen({ navigation, route }) {
       setSeenCount(alreadyLiked.size + matched.size);
 
       const { data, error } = await supabase.from('profiles')
-        .select('id, name, age, location, intent, bio, photos, show_on_discovery, created_at')
+        .select('*')
         .neq('id', user.id).order('created_at', { ascending: false }).limit(50);
       if (error) throw error;
       setTotalOnIntent((data || []).length);
       const real = (data || []).map(normalizeProfile)
-        .filter((p) => p.id && p.name && p.img)
+        .filter((p) => p.id && (p.name || p.full_name))
         .filter((p) => !alreadyLiked.has(p.id) && !matched.has(p.id))
         .filter((p) => { const raw = (data || []).find(d => d.id === p.id); return raw?.show_on_discovery !== false; });
       if (!mountedRef.current) return;

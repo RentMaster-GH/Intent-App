@@ -462,23 +462,52 @@ export const supabase = {
     },
     async signUp({ email, password, options }) {
       const cleanEmail = String(email || '').trim().toLowerCase();
-      const userId = deterministicUuid(cleanEmail || String(Date.now()));
+      if (!cleanEmail || !cleanEmail.includes('@')) {
+        return { data: { user: null, session: null }, error: { message: 'Enter a valid email address.' } };
+      }
+      if (!password || String(password).length < 6) {
+        return { data: { user: null, session: null }, error: { message: 'Password must be at least 6 characters.' } };
+      }
+      const existingRes = await fetch(BASE + '/auth_accounts', { cache: 'no-store' });
+      const existingJson = existingRes.ok ? await existingRes.json() : { records: [] };
+      const already = (existingJson.records || []).find((a) => String(a.email || '').toLowerCase() === cleanEmail);
+      if (already) {
+        return { data: { user: null, session: null }, error: { message: 'An account with this email already exists. Please Sign In.' } };
+      }
+      const userId = deterministicUuid(cleanEmail);
       const user = {
         id: userId,
         email: cleanEmail,
         user_metadata: options?.data || { full_name: cleanEmail.split('@').at(0) || 'Intent User' },
       };
+      await fetch(BASE + '/auth_accounts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: userId, email: cleanEmail, password: String(password), user_metadata: user.user_metadata }),
+      });
       const session = { access_token: 'hp_' + userId, user };
       await writeSession(session, 'SIGNED_IN');
       return { data: { user, session }, error: null };
     },
     async signInWithPassword({ email, password }) {
       const cleanEmail = String(email || '').trim().toLowerCase();
-      const userId = deterministicUuid(cleanEmail || String(Date.now()));
+      if (!cleanEmail) {
+        return { data: { user: null, session: null }, error: { message: 'Please enter your email.' } };
+      }
+      const listRes = await fetch(BASE + '/auth_accounts', { cache: 'no-store' });
+      const listJson = listRes.ok ? await listRes.json() : { records: [] };
+      const account = (listJson.records || []).find((a) => String(a.email || '').toLowerCase() === cleanEmail);
+      if (!account) {
+        return { data: { user: null, session: null }, error: { message: 'No account found for this email. Tap Create Account first.' } };
+      }
+      if (account.password && String(account.password) !== String(password || '')) {
+        return { data: { user: null, session: null }, error: { message: 'Incorrect password.' } };
+      }
+      const userId = account.id || deterministicUuid(cleanEmail);
       const user = {
         id: userId,
         email: cleanEmail,
-        user_metadata: { full_name: cleanEmail.split('@').at(0) || 'Intent User' },
+        user_metadata: account.user_metadata || { full_name: cleanEmail.split('@').at(0) || 'Intent User' },
       };
       const session = { access_token: 'hp_' + userId, user };
       await writeSession(session, 'SIGNED_IN');

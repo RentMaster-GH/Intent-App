@@ -396,6 +396,9 @@ export default function App() {
     const canonical = resolveRouteName(first.name);
     const known = Object.keys(ROUTE_TO_PATH).includes(canonical);
     const target = known ? canonical : 'Discovery';
+    if ((target === 'Profile' || target === 'Discovery') && sessionRef.current?.user?.id) {
+      profileCacheRef.current[sessionRef.current.user.id] = true;
+    }
     if (guardProtected(target, first.params || {})) {
       if (!sessionRef.current) setStack([{ name: 'AuthPortal', params: {} }]);
       else setStack([{ name: 'SignupOnboarding', params: {} }]);
