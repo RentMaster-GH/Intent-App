@@ -201,7 +201,7 @@ export default function SignupOnboardingScreen({ navigation, route }) {
           seeking,
           intent: selectedIntent,
           bio: bio.trim(),
-          city: (city === '__custom__' ? customCity.trim() || 'Accra' : city.trim()),
+          city: (city === 'custom' ? (customCity.trim() || (COUNTRY_CITIES[country]?.at(0) || 'Accra')) : city.trim()),
           country: country.trim(),
           photo: mainPhoto,
           avatar_url: mainPhoto,
@@ -428,7 +428,21 @@ export default function SignupOnboardingScreen({ navigation, route }) {
                 {COUNTRY_LIST.map((c) => React.createElement('option', { key: c, value: c, style: { backgroundColor: '#0F172A' } }, c))}
               </select>
             ) : (
-              <></>
+              <TextInput
+                style={styles.input}
+                placeholder="e.g. Ghana"
+                placeholderTextColor="#64748B"
+                value={country}
+                onChangeText={(nextCountry) => {
+                  setCountry(nextCountry);
+                  const citiesForCountry = COUNTRY_CITIES[nextCountry] || [];
+                  if (citiesForCountry.length > 0) {
+                    setCity(citiesForCountry.at(0) || '');
+                    setCustomCity('');
+                  }
+                }}
+                autoCapitalize="words"
+              />
             )}
 
             <Text style={[styles.label, { marginTop: 16 }]}>City</Text>
@@ -473,7 +487,22 @@ export default function SignupOnboardingScreen({ navigation, route }) {
                 )}
               </>
             ) : (
-              <></>
+              <>
+                <TextInput
+                  style={styles.input}
+                  placeholder="e.g. Accra"
+                  placeholderTextColor="#64748B"
+                  value={city === 'custom' ? customCity : city}
+                  onChangeText={(nextCity) => {
+                    setCity(nextCity);
+                    setCustomCity(nextCity);
+                  }}
+                  autoCapitalize="words"
+                />
+                <Text style={[styles.label, { marginTop: 8, fontSize: 12, color: '#94A3B8' }]}>
+                  Tip: type a city from the list for your country, or any city.
+                </Text>
+              </>
             )}
 
             <Text style={[styles.label, { marginTop: 16 }]}>I Identify As</Text>
