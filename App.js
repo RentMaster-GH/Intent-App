@@ -485,8 +485,8 @@ export default function App() {
               {currentRoute === 'Dates' && <DatesScreen {...screenProps} session={session} />}
               {currentRoute === 'Profile' && <ProfileScreen {...screenProps} session={session} />}
               {currentRoute === 'SettingsPortal' && <SettingsPortalScreen {...screenProps} session={session} />}
-              {currentRoute === 'ManagerPortal' && <ManagerPortalScreen navigation={navigation} route={{ params: routeParams }} />}
-        {currentRoute === 'CustomerSupport', 'ManagerPortal' && <CustomerSupportScreen {...screenProps} session={session} />}
+              {currentRoute === 'ManagerPortal' && <ManagerPortalScreen {...screenProps} session={session} />}
+        {currentRoute === 'CustomerSupport' && <CustomerSupportScreen {...screenProps} session={session} />}
             </View>
           </View>
         </ErrorBoundary>
