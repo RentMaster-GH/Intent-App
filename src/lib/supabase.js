@@ -325,12 +325,30 @@ async function fileInputToDataUrl(file) {
   if (typeof file === 'string') return file;
   if (file.uri) return file.uri;
   if (typeof FileReader !== 'undefined') {
-    return new Promise((resolve) => {
+    const rawDataUrl = await new Promise((resolve) => {
       const reader = new FileReader();
       reader.onload = () => resolve(String(reader.result || ''));
       reader.onerror = () => resolve('');
       reader.readAsDataURL(file);
     });
+    if (typeof document !== 'undefined' && rawDataUrl.startsWith('data:image/')) {
+      return new Promise((resolve) => {
+        const img = new window.Image();
+        img.onload = () => {
+          const maxW = 480;
+          const scale = img.width > maxW ? maxW / img.width : 1;
+          const canvas = document.createElement('canvas');
+          canvas.width = Math.round(img.width * scale);
+          canvas.height = Math.round(img.height * scale);
+          const ctx = canvas.getContext('2d');
+          ctx?.drawImage(img, 0, 0, canvas.width, canvas.height);
+          resolve(canvas.toDataURL('image/jpeg', 0.72));
+        };
+        img.onerror = () => resolve(rawDataUrl);
+        img.src = rawDataUrl;
+      });
+    }
+    return rawDataUrl;
   }
   return '';
 }
