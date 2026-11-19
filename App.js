@@ -29,8 +29,8 @@ const UpdateChecker = typeof UpdateCheckerRaw === 'function'
 const FRESH_SIGNUP_KEY = 'intent_fresh_signup';
 
 const ROUTE_ALIASES = {
-  Support: 'CustomerSupport', 'ManagerPortal',
-  CustomerSupportPortal: 'CustomerSupport', 'ManagerPortal',
+  Support: 'CustomerSupport',
+  CustomerSupportPortal: 'CustomerSupport',
   Chats: 'ActiveChats',
   ActiveChatsScreen: 'ActiveChats',
   Deck: 'Discovery',
