@@ -16,6 +16,7 @@ import { Ionicons } from '@expo/vector-icons';
 import { getAgeCategory } from '../utils/ageGroups';
 import { supabase } from '../lib/supabase';
 import { COUNTRY_CITIES, COUNTRY_LIST } from '../data/locations';
+import { Picker } from '@react-native-picker/picker';
 
 const FRESH_SIGNUP_KEY = 'intent_fresh_signup';
 const GENDER_OPTIONS = ['Woman', 'Man', 'Non-Binary'];
@@ -428,21 +429,23 @@ export default function SignupOnboardingScreen({ navigation, route }) {
                 {COUNTRY_LIST.map((c) => React.createElement('option', { key: c, value: c, style: { backgroundColor: '#0F172A' } }, c))}
               </select>
             ) : (
-              <TextInput
-                style={styles.input}
-                placeholder="e.g. Ghana"
-                placeholderTextColor="#64748B"
-                value={country}
-                onChangeText={(nextCountry) => {
-                  setCountry(nextCountry);
-                  const citiesForCountry = COUNTRY_CITIES[nextCountry] || [];
-                  if (citiesForCountry.length > 0) {
+              <View style={styles.pickerWrap}>
+                <Picker
+                  selectedValue={COUNTRY_LIST.includes(country) ? country : 'Other'}
+                  onValueChange={(nextCountry) => {
+                    setCountry(nextCountry);
+                    const citiesForCountry = COUNTRY_CITIES[nextCountry] || ['Other City'];
                     setCity(citiesForCountry.at(0) || '');
                     setCustomCity('');
-                  }
-                }}
-                autoCapitalize="words"
-              />
+                  }}
+                  style={styles.picker}
+                  dropdownIconColor="#F8FAFC"
+                >
+                  {COUNTRY_LIST.map((c) => (
+                    <Picker.Item key={c} label={c} value={c} color="#F8FAFC" />
+                  ))}
+                </Picker>
+              </View>
             )}
 
             <Text style={[styles.label, { marginTop: 16 }]}>City</Text>
@@ -488,20 +491,36 @@ export default function SignupOnboardingScreen({ navigation, route }) {
               </>
             ) : (
               <>
-                <TextInput
-                  style={styles.input}
-                  placeholder="e.g. Accra"
-                  placeholderTextColor="#64748B"
-                  value={city === 'custom' ? customCity : city}
-                  onChangeText={(nextCity) => {
-                    setCity(nextCity);
-                    setCustomCity(nextCity);
-                  }}
-                  autoCapitalize="words"
-                />
-                <Text style={[styles.label, { marginTop: 8, fontSize: 12, color: '#94A3B8' }]}>
-                  Tip: type a city from the list for your country, or any city.
-                </Text>
+                <View style={styles.pickerWrap}>
+                  <Picker
+                    selectedValue={(COUNTRY_CITIES[country] || []).includes(city) ? city : 'custom'}
+                    onValueChange={(val) => {
+                      if (val === 'custom') {
+                        setCity('custom');
+                      } else {
+                        setCity(val);
+                        setCustomCity('');
+                      }
+                    }}
+                    style={styles.picker}
+                    dropdownIconColor="#F8FAFC"
+                  >
+                    {(COUNTRY_CITIES[country] || []).map((ct) => (
+                      <Picker.Item key={ct} label={ct} value={ct} color="#F8FAFC" />
+                    ))}
+                    <Picker.Item label="Other / Enter Custom City..." value="custom" color="#F8FAFC" />
+                  </Picker>
+                </View>
+                {city === 'custom' && (
+                  <TextInput
+                    style={[styles.input, { marginTop: 10 }]}
+                    placeholder="Type your city name"
+                    placeholderTextColor="#64748B"
+                    value={customCity}
+                    onChangeText={setCustomCity}
+                    autoCapitalize="words"
+                  />
+                )}
               </>
             )}
 
@@ -623,6 +642,8 @@ const styles = StyleSheet.create({
   loadingText: { color: '#94A3B8', marginTop: 12, fontSize: 14 },
   topHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingVertical: 12 },
   backButton: { padding: 4 },
+  pickerWrap: { backgroundColor: '#1E293B', borderWidth: 1, borderColor: '#334155', borderRadius: 12, overflow: 'hidden' },
+  picker: { height: 50, color: '#F8FAFC', backgroundColor: '#1E293B' },
   navPillBtn: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: '#1E293B', borderWidth: 1, borderColor: '#334155', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999 },
   navPillText: { color: '#F8FAFC', fontSize: 12, fontWeight: '600' },
   successBanner: { backgroundColor: 'rgba(16, 185, 129, 0.16)', borderWidth: 1, borderColor: 'rgba(16, 185, 129, 0.4)', borderRadius: 12, padding: 12, marginTop: 14 },
