@@ -299,6 +299,13 @@ export default function SettingsPortalScreen({ navigation }) {
             </View>
             <Text style={styles.rowArrow}>›</Text>
           </TouchableOpacity>
+          <TouchableOpacity style={styles.row} onPress={() => navigation.navigate('ManagerPortal')}>
+            <View style={styles.rowLeft}>
+              <Ionicons name="shield-checkmark-outline" size={20} color="#FBBF24" />
+              <Text style={styles.rowText}>App Manager Verification Portal</Text>
+            </View>
+            <Ionicons name="chevron-forward" size={18} color="#64748B" />
+          </TouchableOpacity>
         </View>
 
         <Text style={styles.sectionHeader}>Privacy & Visibility</Text>
