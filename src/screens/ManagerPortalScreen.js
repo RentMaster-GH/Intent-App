@@ -23,6 +23,7 @@ export default function ManagerPortalScreen({ navigation }) {
 
   const [loading, setLoading] = useState(true);
   const [profiles, setProfiles] = useState([]);
+  const [tickets, setTickets] = useState([]);
   const [stats, setStats] = useState({ total: 0, verified: 0, pending: 0, matches: 0, messages: 0 });
   const [filter, setFilter] = useState('pending');
   const [search, setSearch] = useState('');
@@ -42,11 +43,13 @@ export default function ManagerPortalScreen({ navigation }) {
   const loadData = useCallback(async () => {
     setLoading(true);
     try {
-      const [profRes, matchRes, msgRes] = await Promise.all([
+      const [profRes, matchRes, msgRes, ticketRes] = await Promise.all([
         supabase.from('profiles').select('*').order('created_at', { ascending: false }),
         supabase.from('matches').select('id'),
         supabase.from('messages').select('id'),
+        supabase.from('support_tickets').select('*').order('created_at', { ascending: false }),
       ]);
+      setTickets(ticketRes.data || []);
       const list = profRes.data || [];
       setProfiles(list);
       const verifiedCount = list.filter((p) => Boolean(p.verified)).length;
@@ -228,6 +231,7 @@ export default function ManagerPortalScreen({ navigation }) {
             { id: 'pending', label: `Pending Review (${stats.pending})` },
             { id: 'verified', label: `Verified (${stats.verified})` },
             { id: 'all', label: `All (${stats.total})` },
+            { id: 'tickets', label: `Tickets (${tickets.length})` },
           ].map((tab) => (
             <TouchableOpacity
               key={tab.id}
@@ -260,7 +264,40 @@ export default function ManagerPortalScreen({ navigation }) {
           </View>
         ) : null}
 
-        {loading ? (
+        {filter === 'tickets' ? (
+          tickets.length === 0 ? (
+            <View style={styles.emptyBox}>
+              <Text style={styles.emptyText}>No support tickets or reports submitted yet.</Text>
+            </View>
+          ) : (
+            tickets.map((t) => (
+              <View key={t.id} style={styles.memberCard}>
+                <View style={{ flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <Text style={styles.memberName}>{t.subject || t.category || 'Support Ticket'}</Text>
+                  <View style={t.status === 'resolved' ? styles.verifiedPill : styles.pendingPill}>
+                    <Text style={t.status === 'resolved' ? styles.verifiedPillText : styles.pendingPillText}>
+                      {t.status || 'open'}
+                    </Text>
+                  </View>
+                </View>
+                <Text style={styles.memberMeta}>{t.category || 'General'} • {t.user_email || t.user_id || 'Member'}</Text>
+                <Text style={styles.memberBio}>{t.message || t.description || ''}</Text>
+                {t.status !== 'resolved' ? (
+                  <TouchableOpacity
+                    style={[styles.approveBtn, { marginTop: 12 }]}
+                    onPress={async () => {
+                      await supabase.from('support_tickets').update({ status: 'resolved' }).eq('id', t.id);
+                      setTickets((prev) => prev.map((x) => (x.id === t.id ? { ...x, status: 'resolved' } : x)));
+                      setStatusBanner('Ticket marked resolved.');
+                    }}
+                  >
+                    <Text style={styles.approveBtnText}>Mark Resolved</Text>
+                  </TouchableOpacity>
+                ) : null}
+              </View>
+            ))
+          )
+        ) : loading ? (
           <ActivityIndicator color="#F97316" size="large" style={{ marginTop: 30 }} />
         ) : filtered.length === 0 ? (
           <View style={styles.emptyBox}>

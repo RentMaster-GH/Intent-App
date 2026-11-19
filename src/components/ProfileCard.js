@@ -86,7 +86,15 @@ export default function ProfileCard({ profile, onLike, onPass }) {
 
         {/* Info overlay */}
         <View style={styles.infoOverlay} pointerEvents="none">
-          <Text style={styles.name}>{profile.name}{profile.age ? `, ${profile.age}` : ''} ✓</Text>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <Text style={styles.name}>{profile.name}{profile.age ? `, ${profile.age}` : ''}</Text>
+            {profile.verified ? (
+              <View style={styles.verifiedBadge}>
+                <Ionicons name="checkmark-circle" size={14} color="#34D399" />
+                <Text style={styles.verifiedBadgeText}>Verified</Text>
+              </View>
+            ) : null}
+          </View>
           {profile.intent ? <Text style={styles.intent}>{profile.intent}</Text> : null}
           {profile.bio ? <Text style={styles.bio} numberOfLines={2}>{profile.bio}</Text> : null}
           <Text style={styles.location}>📍 {profile.location || 'Ghana'} • {photos.length} photo{photos.length === 1 ? '' : 's'}</Text>
@@ -124,6 +132,8 @@ const styles = StyleSheet.create({
   zoomBtn: { position: 'absolute', bottom: 118, right: 12, flexDirection: 'row', alignItems: 'center', gap: 5, backgroundColor: '#F97316', paddingHorizontal: 12, paddingVertical: 8, borderRadius: 20, zIndex: 10, elevation: 10 },
   zoomText: { color: '#FFF', fontSize: 12, fontWeight: '800' },
   infoOverlay: { position: 'absolute', bottom: 0, left: 0, right: 0, padding: 16, paddingTop: 48, backgroundColor: 'rgba(0,0,0,0.35)', zIndex: 5 },
+  verifiedBadge: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: 'rgba(16, 185, 129, 0.22)', borderWidth: 1, borderColor: 'rgba(52, 211, 153, 0.5)', paddingHorizontal: 8, paddingVertical: 3, borderRadius: 999 },
+  verifiedBadgeText: { color: '#6EE7B7', fontSize: 11, fontWeight: '800' },
   name: { color: '#FFF', fontSize: 24, fontWeight: '900', textShadowColor: 'rgba(0,0,0,0.6)', textShadowOffset: { width: 0, height: 1 }, textShadowRadius: 4 },
   intent: { color: '#FBBF24', fontSize: 13, fontWeight: '700', marginTop: 4 },
   bio: { color: '#E2E8F0', fontSize: 14, marginTop: 4, lineHeight: 19 },
