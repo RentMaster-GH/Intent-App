@@ -15,6 +15,7 @@ import {
 import { Ionicons } from '@expo/vector-icons';
 import { getAgeCategory } from '../utils/ageGroups';
 import { supabase } from '../lib/supabase';
+import { COUNTRY_CITIES, COUNTRY_LIST } from '../data/locations';
 
 const FRESH_SIGNUP_KEY = 'intent_fresh_signup';
 const GENDER_OPTIONS = ['Woman', 'Man', 'Non-Binary'];
@@ -41,6 +42,8 @@ export default function SignupOnboardingScreen({ navigation, route }) {
   const [saving, setSaving] = useState(false);
   const [loadingProfile, setLoadingProfile] = useState(true);
   const [saveError, setSaveError] = useState('');
+  const [saveSuccess, setSaveSuccess] = useState('');
+  const [customCity, setCustomCity] = useState('');
   const [hasExistingProfile, setHasExistingProfile] = useState(false);
   const [noSession, setNoSession] = useState(false);
 
@@ -198,7 +201,7 @@ export default function SignupOnboardingScreen({ navigation, route }) {
           seeking,
           intent: selectedIntent,
           bio: bio.trim(),
-          city: city.trim(),
+          city: (city === '__custom__' ? customCity.trim() || 'Accra' : city.trim()),
           country: country.trim(),
           photo: mainPhoto,
           avatar_url: mainPhoto,
@@ -215,7 +218,7 @@ export default function SignupOnboardingScreen({ navigation, route }) {
             email: user.email,
             full_name: fullName.trim(),
             age: ageNum,
-            city: city.trim(),
+            city: (city === '__custom__' ? customCity.trim() || 'Accra' : city.trim()),
             country: country.trim(),
             bio: bio.trim(),
             intent: selectedIntent,
@@ -228,13 +231,18 @@ export default function SignupOnboardingScreen({ navigation, route }) {
         );
       if (profileError) throw profileError;
 
-      // 3. Clear fresh-signup flag so refresh goes to Discovery, not Onboarding
+      // 3. Clear fresh-signup flag and show saved confirmation before opening Profile for review
       clearFreshSignupFlag();
-
-      navigation.reset({
-        index: 0,
-        routes: [{ name: 'Discovery', params: { isDemo: false } }],
-      });
+      setSaveSuccess('Profile saved! Opening your Profile for review...');
+      if (Platform.OS === 'web' && typeof window !== 'undefined') {
+        try { window.alert('Profile saved! Taking you to your Profile for review.'); } catch {}
+      }
+      setTimeout(() => {
+        navigation.reset({
+          index: 0,
+          routes: [{ name: 'Profile', params: { fromOnboarding: true } }],
+        });
+      }, 450);
     } catch (e) {
       console.error('[Onboarding] save failed:', e);
       setSaveError(e.message || 'Could not save profile. Check internet / Supabase tables exist.');
@@ -252,6 +260,15 @@ export default function SignupOnboardingScreen({ navigation, route }) {
       return;
     }
     // Fresh signup, no profile yet -> confirm leave, sign out, clear flag
+    if (Platform.OS === 'web' && typeof window !== 'undefined') {
+      if (window.confirm('Your profile is not saved yet. Go back to Sign In?')) {
+        clearFreshSignupFlag();
+        supabase.auth.signOut().finally(() => {
+          navigation.reset({ index: 0, routes: [{ name: 'AuthPortal', params: {} }] });
+        });
+      }
+      return;
+    }
     Alert.alert('Leave setup?', 'Your profile is not saved yet. Go back to Sign In?', [
       { text: 'Stay', style: 'cancel' },
       {
@@ -348,11 +365,18 @@ export default function SignupOnboardingScreen({ navigation, route }) {
       )}
 
       <View style={styles.topHeader}>
-        <TouchableOpacity onPress={handleBack} style={styles.backButton}>
-          <Ionicons name="arrow-back" size={22} color="#F8FAFC" />
+        <TouchableOpacity onPress={handleBack} style={styles.navPillBtn}>
+          <Ionicons name="arrow-back" size={16} color="#F8FAFC" />
+          <Text style={styles.navPillText}>{step > 1 ? 'Previous' : hasExistingProfile ? 'Discovery' : 'Sign In'}</Text>
         </TouchableOpacity>
         <Text style={styles.headerTitle}>Step {step} of 3 {hasExistingProfile ? '• Edit' : ''}</Text>
-        <View style={{ width: 30 }} />
+        {hasExistingProfile ? (
+          <TouchableOpacity onPress={() => navigation.reset({ index: 0, routes: [{ name: 'Profile', params: {} }] })} style={styles.navPillBtn}>
+            <Text style={styles.navPillText}>Profile</Text>
+          </TouchableOpacity>
+        ) : (
+          <View style={{ width: 68 }} />
+        )}
       </View>
 
       <View style={styles.progressBarRow}>
@@ -380,11 +404,77 @@ export default function SignupOnboardingScreen({ navigation, route }) {
               </View>
             ) : null}
 
-            <Text style={[styles.label, { marginTop: 16 }]}>City</Text>
-            <TextInput style={styles.input} placeholder="e.g. Accra" placeholderTextColor="#64748B" value={city} onChangeText={setCity} autoCapitalize="words" />
-
             <Text style={[styles.label, { marginTop: 16 }]}>Country</Text>
-            <TextInput style={styles.input} placeholder="e.g. Ghana" placeholderTextColor="#64748B" value={country} onChangeText={setCountry} autoCapitalize="words" />
+            {Platform.OS === 'web' ? (
+              <select
+                value={COUNTRY_LIST.includes(country) ? country : 'Other'}
+                onChange={(e) => {
+                  const nextCountry = e.target.value;
+                  setCountry(nextCountry);
+                  const citiesForCountry = COUNTRY_CITIES[nextCountry] || ['Other City'];
+                  setCity(citiesForCountry.at(0) || '');
+                }}
+                style={{
+                  backgroundColor: '#1E293B',
+                  borderRadius: 12,
+                  border: '1px solid #334155',
+                  color: '#F8FAFC',
+                  padding: '0 14px',
+                  height: 50,
+                  fontSize: 14,
+                  width: '100%',
+                }}
+              >
+                {COUNTRY_LIST.map((c) => React.createElement('option', { key: c, value: c, style: { backgroundColor: '#0F172A' } }, c))}
+              </select>
+            ) : (
+              <></>
+            )}
+
+            <Text style={[styles.label, { marginTop: 16 }]}>City</Text>
+            {Platform.OS === 'web' ? (
+              <>
+                <select
+                  value={(COUNTRY_CITIES[country] || []).includes(city) ? city : 'custom'}
+                  onChange={(e) => {
+                    const val = e.target.value;
+                    if (val === 'custom') {
+                      setCity('custom');
+                    } else {
+                      setCity(val);
+                      setCustomCity('');
+                    }
+                  }}
+                  style={{
+                    backgroundColor: '#1E293B',
+                    borderRadius: 12,
+                    border: '1px solid #334155',
+                    color: '#F8FAFC',
+                    padding: '0 14px',
+                    height: 50,
+                    fontSize: 14,
+                    width: '100%',
+                  }}
+                >
+                  {(COUNTRY_CITIES[country] || []).map((ct) =>
+                    React.createElement('option', { key: ct, value: ct, style: { backgroundColor: '#0F172A' } }, ct)
+                  )}
+                  {React.createElement('option', { value: 'custom', style: { backgroundColor: '#0F172A' } }, 'Other / Enter Custom City...')}
+                </select>
+                {city === 'custom' && (
+                  <TextInput
+                    style={[styles.input, { marginTop: 10 }]}
+                    placeholder="Type your city name"
+                    placeholderTextColor="#64748B"
+                    value={customCity}
+                    onChangeText={setCustomCity}
+                    autoCapitalize="words"
+                  />
+                )}
+              </>
+            ) : (
+              <></>
+            )}
 
             <Text style={[styles.label, { marginTop: 16 }]}>I Identify As</Text>
             <View style={styles.chipRow}>
@@ -473,7 +563,12 @@ export default function SignupOnboardingScreen({ navigation, route }) {
           </View>
         )}
 
-        {saveError ? (
+        {saveSuccess ? (
+              <View style={styles.successBanner}>
+                <Text style={styles.successText}>{saveSuccess}</Text>
+              </View>
+            ) : null}
+            {saveError ? (
           <View style={styles.errorBanner}>
             <Text style={styles.errorText}>⚠️ {saveError}</Text>
           </View>
@@ -499,6 +594,10 @@ const styles = StyleSheet.create({
   loadingText: { color: '#94A3B8', marginTop: 12, fontSize: 14 },
   topHeader: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 20, paddingVertical: 12 },
   backButton: { padding: 4 },
+  navPillBtn: { flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: '#1E293B', borderWidth: 1, borderColor: '#334155', paddingHorizontal: 10, paddingVertical: 6, borderRadius: 999 },
+  navPillText: { color: '#F8FAFC', fontSize: 12, fontWeight: '600' },
+  successBanner: { backgroundColor: 'rgba(16, 185, 129, 0.16)', borderWidth: 1, borderColor: 'rgba(16, 185, 129, 0.4)', borderRadius: 12, padding: 12, marginTop: 14 },
+  successText: { color: '#6EE7B7', fontSize: 13, fontWeight: '700', textAlign: 'center' },
   headerTitle: { color: '#FBBF24', fontSize: 14, fontWeight: '700' },
   progressBarRow: { flexDirection: 'row', paddingHorizontal: 24, paddingBottom: 10 },
   progressSegment: { flex: 1, height: 4, backgroundColor: '#1E293B', borderRadius: 2, marginRight: 6 },
